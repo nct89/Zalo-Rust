@@ -1330,8 +1330,16 @@ impl ShellView {
         self.has_session = false;
         self.dialog = None;
         self.menu = None;
-        crate::replace_shell_with_login(cx);
-        let _ = window;
+        self.selected = None;
+        self.convs.clear();
+        self.messages.clear();
+        zalo_shell::set_unread_badge(0);
+        // Open login window first so the app never hits zero windows on Wayland,
+        // then close this currently borrowed shell window directly and defer-close
+        // any remaining solo/auxiliary shell windows.
+        crate::open_login_window(cx);
+        window.remove_window();
+        cx.defer(crate::close_all_shell_windows);
     }
 
     /// Start background batches for everything in [`Self::media_queue`].
@@ -4181,7 +4189,13 @@ pub(crate) fn open_thread_into(
     has_session: bool,
     mine: &HashSet<String>,
 ) -> Option<u64> {
-    let tid = thread_id.trim();
+    let raw_tid = thread_id.trim();
+    let normalized_tid = if is_group && !raw_tid.is_empty() && !raw_tid.starts_with("preview:") {
+        format!("g_{}", raw_tid.strip_prefix("g_").unwrap_or(raw_tid))
+    } else {
+        raw_tid.to_owned()
+    };
+    let tid = normalized_tid.as_str();
     let existing = if !tid.is_empty() {
         convs.iter().find(|c| c.thread_id == tid).map(|c| c.id)
     } else {
@@ -4196,7 +4210,13 @@ pub(crate) fn open_thread_into(
     if !can_open_new_thread(has_session, tid, is_group, mine) {
         return None;
     }
-    let next_id = convs.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+    let mut next_id = data::hash_id(tid);
+    while convs.iter().any(|c| c.id == next_id) {
+        next_id = next_id.wrapping_add(1);
+        if next_id <= 4 {
+            next_id = 5;
+        }
+    }
     let display = resolve_thread_title(tid, name, profiles);
     convs.insert(
         0,
@@ -4435,7 +4455,8 @@ mod tests {
             &mine,
         )
         .unwrap();
-        assert_eq!(id, 1);
+        let expected_id = data::hash_id("100000000000000004");
+        assert_eq!(id, expected_id);
         assert_eq!(convs[0].name, "Minh");
         assert!(convs[0].live);
         assert_eq!(
@@ -4449,9 +4470,36 @@ mod tests {
                 true,
                 &mine,
             ),
-            Some(1)
+            Some(expected_id)
         );
         assert_eq!(convs.len(), 1);
+        // Group id without `g_` prefix normalizes and matches existing `g_` group.
+        let gid = open_thread_into(
+            &mut convs,
+            &mut messages,
+            &profiles,
+            "200000000000000002",
+            "Team",
+            true,
+            true,
+            &mine,
+        )
+        .unwrap();
+        assert_eq!(gid, data::hash_id("g_200000000000000002"));
+        assert_eq!(
+            open_thread_into(
+                &mut convs,
+                &mut messages,
+                &profiles,
+                "g_200000000000000002",
+                "Team",
+                true,
+                true,
+                &mine,
+            ),
+            Some(gid)
+        );
+        assert_eq!(convs.len(), 2);
 
         // Kick permissions: creator can kick admins/members; admin only regular members.
         let admins = vec!["200".into()];

@@ -632,6 +632,19 @@ fn split_messages(cmd: u16, event: &Value) -> (bool, Vec<Value>) {
     if !group_msgs.is_empty() && msgs.is_empty() {
         return (true, group_msgs);
     }
+    if !group_msgs.is_empty() && !msgs.is_empty() {
+        // Mixed offline/preload frame carrying both 1-1 `msgs` and `groupMsgs`.
+        // Mark group items explicitly so downstream parsers route them to `g_<id>`.
+        let mut combined = msgs;
+        for mut item in group_msgs {
+            if let Some(obj) = item.as_object_mut() {
+                obj.entry("isGroup".to_owned())
+                    .or_insert_with(|| Value::from(1));
+            }
+            combined.push(item);
+        }
+        return (false, combined);
+    }
     (false, msgs)
 }
 

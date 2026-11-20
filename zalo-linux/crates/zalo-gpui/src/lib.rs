@@ -107,12 +107,20 @@ use gpui::{
 /// renderer to the login page. GPUI has two view types, so the equivalent
 /// is: login window only, no chat chrome behind it.
 pub fn replace_shell_with_login(cx: &mut App) {
+    open_login_window(cx);
+    close_all_shell_windows(cx);
+    // If called from inside an active `ShellView` window callback, `handle.update`
+    // cannot borrow that window synchronously; defer one tick to close any straggler.
+    cx.defer(close_all_shell_windows);
+}
+
+/// Closes all open [`ShellView`] windows (main and solo) and activates the login window.
+pub fn close_all_shell_windows(cx: &mut App) {
     let shells: Vec<_> = cx
         .windows()
         .into_iter()
         .filter_map(|w| w.downcast::<ShellView>())
         .collect();
-    open_login_window(cx);
     for handle in shells {
         let _ = handle.update(cx, |_, window, _| {
             window.remove_window();
@@ -125,11 +133,19 @@ pub fn replace_shell_with_login(cx: &mut App) {
     }
 }
 
-/// Open the 420×644 QR login window.
+/// Open the 420×644 QR login window (or focus it if already open).
 pub fn open_login_window(cx: &mut App) {
+    if let Some(existing) = cx
+        .windows()
+        .into_iter()
+        .find_map(|w| w.downcast::<LoginView>())
+    {
+        let _ = existing.update(cx, |_, window, _| window.activate_window());
+        return;
+    }
     let (width, height) = crate::login_window_size();
     let outer = crate::window_frame::outer_size(width, height);
-    let bounds = Bounds::centered(None, outer, cx);
+    let bounds = bounds_in_work_area(outer);
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),

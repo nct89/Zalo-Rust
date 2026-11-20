@@ -602,13 +602,16 @@ fn json_flag(value: &Value, key: &str) -> bool {
 pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incoming> {
     let uid_from = json_str(value, "uidFrom").unwrap_or_default();
     let id_to = json_str(value, "idTo").unwrap_or_default();
+    let explicit_group_id = json_str(value, "groupId")
+        .or_else(|| json_str(value, "grid"))
+        .filter(|s| !s.is_empty() && s != "0");
+    let is_group = is_group || json_flag(value, "isGroup") || explicit_group_id.is_some();
     let from_me = uid_from == "0" || (!self_uin.is_empty() && uid_from == self_uin);
     let thread_id = if is_group {
-        let raw = if !id_to.is_empty() && id_to != "0" {
-            &id_to
-        } else {
-            &uid_from
-        };
+        let raw = explicit_group_id.as_deref().or_else(|| {
+            (!id_to.is_empty() && id_to != "0" && (self_uin.is_empty() || id_to != self_uin))
+                .then_some(id_to.as_str())
+        })?;
         let clean = raw.strip_prefix("g_").unwrap_or(raw);
         if clean.is_empty() {
             return None;
@@ -1484,5 +1487,27 @@ mod tests {
         assert_eq!(p.quote_sender, "Lan");
         assert_eq!(p.quote_text, "[Hình ảnh]");
         assert_eq!((p.quote_global_id, p.quote_cli_id), (Some(333), Some(444)));
+    }
+
+    #[test]
+    fn mixed_group_item_routes_by_group_id_and_never_creates_fake_sender_group() {
+        let mixed_group = serde_json::json!({
+            "uidFrom": "555",
+            "idTo": "7777",
+            "isGroup": 1,
+            "msgType": "webchat",
+            "content": "hello group"
+        });
+        let m = parse_item(&mixed_group, false, "999").expect("group msg");
+        assert!(m.is_group);
+        assert_eq!(m.thread_id, "g_7777");
+
+        let bad_group = serde_json::json!({
+            "uidFrom": "555",
+            "idTo": "0",
+            "msgType": "webchat",
+            "content": "orphan"
+        });
+        assert!(parse_item(&bad_group, true, "999").is_none());
     }
 }

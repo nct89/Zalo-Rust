@@ -339,7 +339,7 @@ impl ShellView {
         let mut items: Vec<gpui::AnyElement> = Vec::new();
         let mut letter = String::new();
         let lettered = !groups || self.contacts_by_name;
-        for (i, (uid, name, members)) in rows.into_iter().enumerate() {
+        for (uid, name, members) in rows {
             if lettered {
                 let l = section_letter(&name);
                 if l != letter {
@@ -372,10 +372,12 @@ impl ShellView {
                 name.clone(),
                 uid.clone(),
             );
+            let row_key = crate::data::hash_id(&uid);
+            let row_group = gpui::SharedString::from(format!("contact-row-{row_key}"));
             items.push(
                 div()
-                    .id(("contact-row", i as u64))
-                    .group("contact-row")
+                    .id(("contact-row", row_key))
+                    .group(row_group)
                     .flex()
                     .flex_none()
                     .flex_row()
@@ -449,7 +451,7 @@ impl ShellView {
                     )
                     .child(
                         div()
-                            .id(("contact-more", i as u64))
+                            .id(("contact-more", row_key))
                             .flex_none()
                             .size(px(28.))
                             .rounded(px(4.))
