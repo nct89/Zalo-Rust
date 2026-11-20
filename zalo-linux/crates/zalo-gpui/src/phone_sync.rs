@@ -183,7 +183,7 @@ pub(crate) fn find_wasm() -> Option<PathBuf> {
             dirs.push(xdg.data_home().join("zalo-rust"));
         }
     }
-    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/wasm"));
+    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/wasm"));
     dirs.into_iter().find_map(|dir| {
         std::fs::read_dir(&dir)
             .ok()?

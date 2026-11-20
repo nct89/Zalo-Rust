@@ -30,10 +30,11 @@ path = "src/main.rs"
 
 [dependencies]
 gpui = "0.2.2"
-zalo-design = { path = "../zalo-design" }
+zalo-design = { workspace = true }
 zalo-client = { workspace = true }
 zalo-core = { workspace = true }
-zalo-storage = { path = "../zalo-storage" }
+zalo-protocol = { workspace = true }
+zalo-storage = { workspace = true }
 zalo-shell = { path = "../zalo-shell" }
 qrcode = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
@@ -42,13 +43,13 @@ tokio = { workspace = true }
 unicode-segmentation = "1.12"
 futures = "0.3"
 md-5 = { workspace = true }
-zjxl = { path = "../zjxl" }
-zimage = { path = "../zimage" }
-zcall-core = { path = "../zcall-core" }
+zjxl = { workspace = true }
+zimage = { workspace = true }
+zcall-core = { workspace = true }
 zcall-audio = { path = "../zcall-audio" }
 zcall-engine = { path = "../zcall-engine" }
-zalo-sync2 = { path = "../zalo-sync2" }
-zocr = { path = "../zocr" }
+zalo-sync2 = { workspace = true }
+zocr = { workspace = true }
 openh264 = "0.8"
 libc = "0.2"
 raw-window-handle = "0.6"

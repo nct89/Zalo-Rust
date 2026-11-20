@@ -44,11 +44,11 @@ const HIDDEN: &[&str] = &[":-|", ":+", ";8", "/-jj", "/-JJ"];
 
 const EMOJI_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/emoji"
+    "/../../../assets/emoji"
 );
 const SPRITE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/emoji/emoji.1e7786c93c8a0c1773f165e2de2fd129.png"
+    "/../../../assets/emoji/emoji.1e7786c93c8a0c1773f165e2de2fd129.png"
 );
 
 /// Sprite is 51 × 41 cells of 64 px (CSS `background-size: 5100% 4100%`).

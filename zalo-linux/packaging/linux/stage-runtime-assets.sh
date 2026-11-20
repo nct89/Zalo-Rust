@@ -2,7 +2,7 @@
 # Stage minimal runtime fonts (~1.4 MiB) and call ringtones (~72 KiB) for packages.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 DST_DIR="${1:?usage: stage-runtime-assets.sh <dest-zalo-rust-dir>}"
 FONTS_SRC="$ROOT/assets/fonts"
 SOUNDS_SRC="$ROOT/assets/sounds"

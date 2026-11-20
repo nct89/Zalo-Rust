@@ -33,7 +33,7 @@ use thiserror::Error;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-use zalo_protocol::{base64_decode, API_TYPE, CLIENT_VERSION};
+use zalo_protocol::{api_type, base64_decode, client_version};
 
 /// Endpoint used when neither getLoginInfo nor getServerInfo lists one.
 pub const DEFAULT_WS_ENDPOINT: &str = "wss://ws1-msg.chat.zalo.me";
@@ -971,8 +971,8 @@ impl std::fmt::Debug for ListenerConfig {
 pub fn socket_url(endpoint: &str, now_ms: i64) -> Result<String, ListenerError> {
     let mut url = Url::parse(endpoint).map_err(|e| ListenerError::Url(e.to_string()))?;
     url.query_pairs_mut()
-        .append_pair("zpw_ver", CLIENT_VERSION)
-        .append_pair("zpw_type", &API_TYPE.to_string())
+        .append_pair("zpw_ver", &client_version())
+        .append_pair("zpw_type", &api_type().to_string())
         .append_pair("t", &now_ms.to_string());
     Ok(url.to_string())
 }
@@ -1461,7 +1461,9 @@ mod tests {
         assert_eq!(
             url,
             format!(
-                "wss://ws2-msg.chat.zalo.me/?zpw_ver={CLIENT_VERSION}&zpw_type={API_TYPE}&t=99"
+                "wss://ws2-msg.chat.zalo.me/?zpw_ver={}&zpw_type={}&t=99",
+                client_version(),
+                api_type()
             )
         );
     }

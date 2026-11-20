@@ -8036,6 +8036,7 @@ dependencies = [
  "zalo-client",
  "zalo-core",
  "zalo-design",
+ "zalo-protocol",
  "zalo-shell",
  "zalo-storage",
  "zalo-sync2",

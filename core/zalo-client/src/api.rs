@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use zalo_protocol::{
-    aes_cbc_decrypt, aes_cbc_encrypt, base64_decode, base64_encode, sign_key_map, ParamCipher,
-    API_TYPE, CLIENT_VERSION,
+    aes_cbc_decrypt, aes_cbc_encrypt, api_type, base64_decode, base64_encode, client_version,
+    sign_key_map, user_agent, ParamCipher,
 };
 
 /// Production authentication host.
@@ -19,9 +19,6 @@ pub const AUTH_BASE: &str = "https://wpa.zaloapp.com";
 
 /// Production session host (getLoginInfo).
 pub const WPA_BASE: &str = "https://wpa.chat.zalo.me";
-
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-                         (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
 
 /// A request or response failed before the chat layer is reached.
 #[derive(Debug, Error)]
@@ -781,7 +778,7 @@ impl ZaloApi {
         let http = Client::builder()
             .cookie_provider(Arc::clone(&jar))
             .default_headers(headers)
-            .user_agent(USER_AGENT)
+            .user_agent(user_agent())
             .timeout(Duration::from_secs(40))
             .build()?;
         Ok(Self {
@@ -1059,7 +1056,7 @@ impl ZaloApi {
 
     async fn get_login_info_encrypted(&self) -> Result<Value, ClientError> {
         let cipher =
-            ParamCipher::random(&self.device.imei, self.device.first_launch_time, API_TYPE)
+            ParamCipher::random(&self.device.imei, self.device.first_launch_time, api_type())
                 .map_err(|e| ClientError::Unexpected(format!("ParamCipher: {e}")))?;
         let params = self.login_info_request(&cipher)?;
         let url = format!("{WPA_BASE}/api/login/getLoginInfo");
@@ -3281,7 +3278,7 @@ impl ZaloApi {
         crate::ListenerConfig {
             endpoints,
             cookie,
-            user_agent: USER_AGENT.to_owned(),
+            user_agent: user_agent(),
             ping_interval: server_info
                 .and_then(ping_interval_from)
                 .unwrap_or(DEFAULT_PING_INTERVAL),
@@ -3293,8 +3290,8 @@ impl ZaloApi {
 
     fn common_params(&self) -> BTreeMap<String, String> {
         let mut params = BTreeMap::new();
-        params.insert("zpw_ver".to_owned(), CLIENT_VERSION.to_owned());
-        params.insert("zpw_type".to_owned(), API_TYPE.to_string());
+        params.insert("zpw_ver".to_owned(), client_version());
+        params.insert("zpw_type".to_owned(), api_type().to_string());
         params.insert("imei".to_owned(), self.device.imei.clone());
         params
     }
@@ -3328,8 +3325,8 @@ impl ZaloApi {
     fn base_params(&self) -> BTreeMap<String, String> {
         let mut params = BTreeMap::new();
         params.insert("imei".to_owned(), self.device.imei.clone());
-        params.insert("type".to_owned(), API_TYPE.to_string());
-        params.insert("client_version".to_owned(), CLIENT_VERSION.to_owned());
+        params.insert("type".to_owned(), api_type().to_string());
+        params.insert("client_version".to_owned(), client_version());
         params.insert(
             "computer_name".to_owned(),
             self.device.computer_name.clone(),
@@ -3681,7 +3678,7 @@ mod tests {
         let cipher = ParamCipher::new(
             "0123456789abcdef01234567",
             1_700_000_000,
-            API_TYPE,
+            api_type(),
             "a1b2c3d4e5",
         )
         .expect("cipher");

@@ -956,7 +956,7 @@ pub fn png_asset(file: &str, max_edge: u32) -> Option<Arc<RenderImage>> {
     }
     let path = Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/images"
+        "/../../../assets/images"
     ))
     .join(file);
     let image = std::fs::read(path)
@@ -977,7 +977,7 @@ pub fn like_icon() -> Option<Arc<RenderImage>> {
     LIKE.get_or_init(|| {
         let path = Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../assets/images/like-24-emoji@4x.png"
+            "/../../../assets/images/like-24-emoji@4x.png"
         ));
         let bytes = std::fs::read(path).ok()?;
         let rgba = decode_rgba(&bytes, 96)?;

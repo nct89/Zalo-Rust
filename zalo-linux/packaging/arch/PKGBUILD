@@ -13,17 +13,17 @@ optdepends=(
 )
 
 build() {
-  cd "${startdir}/../.."
+  cd "${startdir}/../../.."
   cargo build --release -p zalo-gpui --features tray-xembed
 }
 
 package() {
-  cd "${startdir}/../.."
+  cd "${startdir}/../../.."
   local target_dir
   target_dir="${CARGO_TARGET_DIR:-target}"
   install -Dm755 "${target_dir}/release/zalo-gpui" "${pkgdir}/usr/bin/zalo-gpui"
   strip --strip-all "${pkgdir}/usr/bin/zalo-gpui" || true
-  bash packaging/linux/stage-runtime-assets.sh "${pkgdir}/usr/share/zalo-rust"
-  install -Dm644 packaging/linux/zalo-gpui.desktop "${pkgdir}/usr/share/applications/zalo-gpui.desktop"
-  install -Dm644 crates/zalo-shell/assets/zalo-256.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/zalo-gpui.png"
+  bash zalo-linux/packaging/linux/stage-runtime-assets.sh "${pkgdir}/usr/share/zalo-rust"
+  install -Dm644 zalo-linux/packaging/linux/zalo-gpui.desktop "${pkgdir}/usr/share/applications/zalo-gpui.desktop"
+  install -Dm644 zalo-linux/crates/zalo-shell/assets/zalo-256.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/zalo-gpui.png"
 }

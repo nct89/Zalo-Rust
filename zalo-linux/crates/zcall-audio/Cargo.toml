@@ -14,4 +14,4 @@ workspace = true
 libpulse-binding = "2.29"
 libpulse-simple-binding = "2.29"
 sonora = "0.3"
-zcall-core = { path = "../zcall-core" }
+zcall-core = { workspace = true }

@@ -1,15 +1,23 @@
-# Rust workspace for the native Zalo desktop client for Linux.
+# Unified cross-platform Rust workspace for Zalo-Rust.
 #
-# Built purely in Rust with GPUI (no Electron, Node.js, or Python runtime).
+# - `core/*` holds OS-independent pure-Rust crates shared across Linux, Windows, and macOS.
+# - `zalo-linux/crates/*` holds Linux desktop integration, audio/video engine, and GPUI UI.
 [workspace]
 resolver = "2"
-members = ["crates/*"]
-default-members = ["crates/zalo-gpui"]
+members = ["core/*", "zalo-linux/crates/*"]
+default-members = ["zalo-linux/crates/zalo-gpui"]
 
 [workspace.dependencies]
-zalo-core = { path = "crates/zalo-core" }
-zalo-protocol = { path = "crates/zalo-protocol" }
-zalo-client = { path = "crates/zalo-client" }
+zalo-core = { path = "core/zalo-core" }
+zalo-protocol = { path = "core/zalo-protocol" }
+zalo-client = { path = "core/zalo-client" }
+zalo-storage = { path = "core/zalo-storage" }
+zalo-sync2 = { path = "core/zalo-sync2" }
+zalo-design = { path = "core/zalo-design" }
+zcall-core = { path = "core/zcall-core" }
+zimage = { path = "core/zimage" }
+zjxl = { path = "core/zjxl" }
+zocr = { path = "core/zocr" }
 aes = "0.8"
 anyhow = "1"
 base64 = "0.22"
@@ -52,7 +60,7 @@ missing_docs = "warn"
 [workspace.lints.clippy]
 all = "warn"
 
-# gpui 0.2.2 → zed-async-tar → xattr 0.2.3 still names libc::ENOATTR, which
+# gpui 0.2.2 -> zed-async-tar -> xattr 0.2.3 still names libc::ENOATTR, which
 # Linux libc dropped. Vendor maps it to ENODATA.
 [patch.crates-io]
 xattr = { path = "vendor/xattr-0.2.3" }

@@ -87,7 +87,7 @@ const AWESOME_TTF: &[u8] = include_bytes!("../assets/fa-solid-900.ttf");
 
 const BUNDLED_FONTS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/fonts"
+    "/../../../assets/fonts"
 );
 
 static ICON_OK: AtomicBool = AtomicBool::new(false);

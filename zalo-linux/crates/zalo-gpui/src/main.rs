@@ -6,6 +6,11 @@
 use gpui::{App, Application};
 
 fn main() {
+    if let Ok(xdg) = zalo_core::XdgDirs::from_env() {
+        zalo_protocol::init_from_dir(&xdg.config_home().join("zalo-rust"));
+    } else {
+        let _ = zalo_protocol::apply_env_overrides();
+    }
     let args: Vec<String> = std::env::args().collect();
     let installer_mode = args.iter().any(|a| a == "--install" || a == "--setup");
     if installer_mode {

@@ -56,7 +56,8 @@ impl ParamCipher {
             return Err(CryptoError::EmptyZcidExt);
         }
         let plain = format!("{api_type},{imei},{first_launch_time}");
-        let zcid = hex::encode_upper(aes256_cbc_encrypt(PARAM_CIPHER_KEY, plain.as_bytes())?);
+        let key = crate::config::param_cipher_key();
+        let zcid = hex::encode_upper(aes256_cbc_encrypt(&key, plain.as_bytes())?);
         let encrypt_key = derive_encrypt_key(&zcid, &zcid_ext)?;
         Ok(Self {
             zcid,
@@ -136,8 +137,8 @@ impl ParamCipher {
         params.insert("zcid_ext".to_owned(), self.zcid_ext.clone());
         params.insert("enc_ver".to_owned(), "v2".to_owned());
         params.insert("params".to_owned(), self.encrypt_json(payload)?);
-        params.insert("type".to_owned(), API_TYPE.to_string());
-        params.insert("client_version".to_owned(), CLIENT_VERSION.to_owned());
+        params.insert("type".to_owned(), crate::config::api_type().to_string());
+        params.insert("client_version".to_owned(), crate::config::client_version());
         let signature = sign_key_map(tag, &params);
         params.insert("signkey".to_owned(), signature);
         Ok(params)

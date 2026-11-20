@@ -23,9 +23,9 @@ cargo build --release -p zalo-gpui --features tray-xembed
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 install -Dm755 "${TARGET_DIR}/release/zalo-gpui" %{buildroot}%{_bindir}/zalo-gpui
 strip --strip-all %{buildroot}%{_bindir}/zalo-gpui || true
-bash packaging/linux/stage-runtime-assets.sh %{buildroot}%{_datadir}/zalo-rust
-install -Dm644 packaging/linux/zalo-gpui.desktop %{buildroot}%{_datadir}/applications/zalo-gpui.desktop
-install -Dm644 crates/zalo-shell/assets/zalo-256.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/zalo-gpui.png
+bash zalo-linux/packaging/linux/stage-runtime-assets.sh %{buildroot}%{_datadir}/zalo-rust
+install -Dm644 zalo-linux/packaging/linux/zalo-gpui.desktop %{buildroot}%{_datadir}/applications/zalo-gpui.desktop
+install -Dm644 zalo-linux/crates/zalo-shell/assets/zalo-256.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/zalo-gpui.png
 
 %files
 %{_bindir}/zalo-gpui

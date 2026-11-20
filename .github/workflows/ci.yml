@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-test-and-build:
+    name: Linux (x86_64) Test & Release Build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            nasm \
+            pkg-config \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libpulse-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxcb-randr0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate protocol.json schema
+        run: |
+          python3 -c '
+          import json
+          data = json.load(open("protocol.json", encoding="utf-8"))
+          assert isinstance(data["client_version"], str) and data["client_version"].isdigit()
+          assert isinstance(data["api_type"], int)
+          assert isinstance(data["zalo_desktop_version"], str) and data["zalo_desktop_version"]
+          assert isinstance(data["user_agent"], str) and data["user_agent"]
+          print("protocol.json valid:", data["zalo_desktop_version"], "zpw_ver=" + data["client_version"])
+          '
+
+      - name: Run workspace unit tests
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: Build release binary (universal Wayland + X11)
+        run: cargo build --release -p zalo-gpui --features tray-xembed

@@ -28,11 +28,11 @@ modules:
     build-commands:
       - cargo build --release --offline -p zalo-gpui --features tray-xembed
       - install -Dm755 target/release/zalo-gpui /app/bin/zalo-gpui
-      - bash packaging/linux/stage-runtime-assets.sh /app/share/zalo-rust
-      - install -Dm644 packaging/linux/zalo-gpui.desktop /app/share/applications/io.github.nct89.ZaloLinux.desktop
+      - bash zalo-linux/packaging/linux/stage-runtime-assets.sh /app/share/zalo-rust
+      - install -Dm644 zalo-linux/packaging/linux/zalo-gpui.desktop /app/share/applications/io.github.nct89.ZaloLinux.desktop
       - sed -i 's|^Exec=.*|Exec=zalo-gpui|' /app/share/applications/io.github.nct89.ZaloLinux.desktop
       - sed -i 's|^Icon=.*|Icon=io.github.nct89.ZaloLinux|' /app/share/applications/io.github.nct89.ZaloLinux.desktop
-      - install -Dm644 crates/zalo-shell/assets/zalo-256.png /app/share/icons/hicolor/256x256/apps/io.github.nct89.ZaloLinux.png
+      - install -Dm644 zalo-linux/crates/zalo-shell/assets/zalo-256.png /app/share/icons/hicolor/256x256/apps/io.github.nct89.ZaloLinux.png
     sources:
       - type: dir
-        path: ../..
+        path: ../../..

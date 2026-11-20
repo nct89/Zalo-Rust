@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+LINUX_DIR="$ROOT/zalo-linux"
 VERSION="${VERSION:-0.1.0}"
 ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])')}"
@@ -21,11 +22,11 @@ mkdir -p "$STAGE/DEBIAN" \
 
 install -Dm755 "$TARGET_DIR/release/zalo-gpui" "$STAGE/usr/bin/zalo-gpui"
 strip --strip-all "$STAGE/usr/bin/zalo-gpui" || true
-bash "$ROOT/packaging/linux/stage-runtime-assets.sh" "$STAGE/usr/share/zalo-rust"
-install -Dm644 "$ROOT/packaging/linux/zalo-gpui.desktop" "$STAGE/usr/share/applications/zalo-gpui.desktop"
-install -Dm644 "$ROOT/crates/zalo-shell/assets/zalo-256.png" \
+bash "$LINUX_DIR/packaging/linux/stage-runtime-assets.sh" "$STAGE/usr/share/zalo-rust"
+install -Dm644 "$LINUX_DIR/packaging/linux/zalo-gpui.desktop" "$STAGE/usr/share/applications/zalo-gpui.desktop"
+install -Dm644 "$LINUX_DIR/crates/zalo-shell/assets/zalo-256.png" \
   "$STAGE/usr/share/icons/hicolor/256x256/apps/zalo-gpui.png"
-install -Dm644 "$ROOT/crates/zalo-shell/assets/zalo-256.png" \
+install -Dm644 "$LINUX_DIR/crates/zalo-shell/assets/zalo-256.png" \
   "$STAGE/usr/share/pixmaps/zalo-gpui.png"
 
 cat > "$STAGE/DEBIAN/control" <<EOF

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+LINUX_DIR="$ROOT/zalo-linux"
 TARGET_DIR="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])')}"
 APPDIR="$TARGET_DIR/Zalo.AppDir"
 OUT_APPIMAGE="${OUT_APPIMAGE:-$ROOT/dist/Zalo-Linux-Rust-x86_64.AppImage}"
@@ -15,13 +16,13 @@ mkdir -p "$APPDIR/usr/bin" \
 
 install -Dm755 "$TARGET_DIR/release/zalo-gpui" "$APPDIR/usr/bin/zalo-gpui"
 strip --strip-all "$APPDIR/usr/bin/zalo-gpui" || true
-bash "$ROOT/packaging/linux/stage-runtime-assets.sh" "$APPDIR/usr/bin"
-cp "$ROOT/packaging/linux/zalo-gpui.desktop" "$APPDIR/zalo-gpui.desktop"
+bash "$LINUX_DIR/packaging/linux/stage-runtime-assets.sh" "$APPDIR/usr/bin"
+cp "$LINUX_DIR/packaging/linux/zalo-gpui.desktop" "$APPDIR/zalo-gpui.desktop"
 sed -i 's|^Exec=/usr/bin/zalo-gpui|Exec=zalo-gpui|g' "$APPDIR/zalo-gpui.desktop"
 cp "$APPDIR/zalo-gpui.desktop" "$APPDIR/usr/share/applications/zalo-gpui.desktop"
-install -Dm644 "$ROOT/crates/zalo-shell/assets/zalo-256.png" \
+install -Dm644 "$LINUX_DIR/crates/zalo-shell/assets/zalo-256.png" \
   "$APPDIR/zalo-gpui.png"
-install -Dm644 "$ROOT/crates/zalo-shell/assets/zalo-256.png" \
+install -Dm644 "$LINUX_DIR/crates/zalo-shell/assets/zalo-256.png" \
   "$APPDIR/usr/share/icons/hicolor/256x256/apps/zalo-gpui.png"
 
 cat > "$APPDIR/AppRun" <<'EOF'

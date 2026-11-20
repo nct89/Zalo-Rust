@@ -5831,7 +5831,7 @@ pub(crate) fn stock_sound_path(file: &str) -> Option<std::path::PathBuf> {
     dirs.push(std::path::PathBuf::from("/usr/share/zalo-rust/zcall-sound"));
     dirs.push(std::path::PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../assets/sounds"
+        "/../../../assets/sounds"
     )));
     dirs.into_iter().map(|d| d.join(file)).find(|p| p.is_file())
 }

@@ -15,7 +15,7 @@ name = "zcall-native"
 path = "src/main.rs"
 
 [dependencies]
-zalo-protocol = { path = "../zalo-protocol" }
+zalo-protocol = { workspace = true }
 zcall-audio = { path = "../zcall-audio" }
-zcall-core = { path = "../zcall-core" }
+zcall-core = { workspace = true }
 serde_json.workspace = true

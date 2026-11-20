@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build & Package Linux (x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux build & packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            dpkg-dev \
+            nasm \
+            pkg-config \
+            libasound2-dev \
+            libfontconfig1-dev \
+            libpulse-dev \
+            libssl-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libxcb1-dev \
+            libxcb-randr0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests before packaging
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: Build .deb package & portable tarball
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG:-0.1.0}"
+          export VERSION
+          bash zalo-linux/packaging/deb/build-deb.sh
+
+          STAGE="dist/zalo-linux-${VERSION}-linux-x86_64"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/bin" "$STAGE/share/zalo-rust" "$STAGE/share/applications" "$STAGE/share/icons"
+          install -Dm755 target/release/zalo-gpui "$STAGE/bin/zalo-gpui"
+          strip --strip-all "$STAGE/bin/zalo-gpui" || true
+          bash zalo-linux/packaging/linux/stage-runtime-assets.sh "$STAGE/share/zalo-rust"
+          install -Dm644 zalo-linux/packaging/linux/zalo-gpui.desktop "$STAGE/share/applications/zalo-gpui.desktop"
+          install -Dm644 zalo-linux/crates/zalo-shell/assets/zalo-256.png "$STAGE/share/icons/zalo-gpui.png"
+          install -Dm644 protocol.json "$STAGE/share/zalo-rust/protocol.json"
+
+          tar -C dist -czf "dist/zalo-linux-${VERSION}-linux-x86_64.tar.gz" "zalo-linux-${VERSION}-linux-x86_64"
+          cp protocol.json dist/protocol.json
+          (cd dist && sha256sum *.deb *.tar.gz protocol.json > SHA256SUMS.txt)
+          ls -lh dist/
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/protocol.json
+            dist/SHA256SUMS.txt

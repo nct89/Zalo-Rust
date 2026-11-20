@@ -1,14 +1,14 @@
 # Zalo-Rust — Windows Port (`zalo-windows`)
 
-Dedicated workspace directory for porting and packaging **Zalo-Rust (GPUI)** for **Windows (x86_64 / ARM64)**.
+Dedicated directory for porting and packaging **Zalo-Rust (GPUI)** for **Windows (x86_64 / ARM64)**.
 
-## Porting Roadmap from `../zalo-linux`
+## Porting Roadmap
 
-1. **Reuse 100% of pure-Rust crates:** `zalo-core`, `zalo-protocol`, `zalo-client`, `zalo-storage`, `zalo-sync2`, `zalo-design`, `zcall-core`, `zimage`, `zjxl`, `zocr`.
-2. **Replace OS-specific integration layers:**
+1. **Reuse 100% of shared crates in [../core](../core):** Add `zalo-windows/crates/*` to the root [../Cargo.toml](../Cargo.toml) workspace and depend on `zalo-core.workspace = true`, `zalo-protocol.workspace = true`, `zalo-client.workspace = true`, `zalo-storage.workspace = true`, `zalo-sync2.workspace = true`, `zalo-design.workspace = true`, `zcall-core.workspace = true`, `zimage.workspace = true`, `zjxl.workspace = true`, `zocr.workspace = true`.
+2. **Implement Windows platform crates:**
    - **Data paths (`zalo-core`):** `%APPDATA%\ZaloRust` and `%LOCALAPPDATA%\ZaloRust`.
-   - **Desktop shell (`zalo-shell`):** Win32 `Shell_NotifyIconW` (system tray), Windows Toast Notifications, Windows Startup Registry / Task Scheduler, native file dialogs.
-   - **Call audio (`zcall-audio`):** WASAPI (shared mode 16 kHz mono + AEC/NS) replacing PulseAudio/PipeWire.
+   - **Desktop shell:** Win32 `Shell_NotifyIconW` (system tray), Windows Toast Notifications, Startup Registry / Task Scheduler, native file dialogs.
+   - **Call audio:** WASAPI (shared mode 16 kHz mono + AEC/NS) replacing `zalo-linux/crates/zcall-audio`.
    - **Camera & screen capture:** Windows Media Foundation (`IMFSourceReader`) and DXGI Desktop Duplication.
-   - **UI (`zalo-gpui`):** GPUI DirectX 11 / Win32 backend (dropping Linux `x11rb` / `x11_frame.rs`).
+   - **UI:** GPUI DirectX 11 / Win32 backend sharing UI views with `zalo-linux` without Linux `x11rb` / `x11_frame.rs`.
 3. **Packaging:** `MSI` / `NSIS` / portable `.exe` with no Electron or WebView2 dependency.
