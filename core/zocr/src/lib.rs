@@ -101,9 +101,82 @@ pub fn find_ocr_dir() -> Option<OcrInstall> {
 }
 
 static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+static LAST_USED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static REAPER_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// Default idle TTL before releasing cached ONNX Runtime sessions (~400 MB RAM).
+pub const DEFAULT_IDLE_TTL_SECS: u64 = 120;
+
+/// Parses `ZALO_OCR_IDLE_TTL_SECS`:
+/// - `None`, empty, or `"0"` -> `Some(Duration::from_secs(DEFAULT_IDLE_TTL_SECS))`
+/// - `"off"` / `"disable"` / `"never"` -> `None` (keep loaded until exit)
+/// - positive integer -> `Some(Duration::from_secs(n))`
+#[must_use]
+pub fn parse_idle_ttl(raw: Option<&str>) -> Option<std::time::Duration> {
+    let s = raw.map(str::trim).unwrap_or("");
+    if s.is_empty() || s == "0" {
+        return Some(std::time::Duration::from_secs(DEFAULT_IDLE_TTL_SECS));
+    }
+    if matches!(
+        s.to_ascii_lowercase().as_str(),
+        "off" | "disable" | "disabled" | "never"
+    ) {
+        return None;
+    }
+    match s.parse::<u64>() {
+        Ok(0) => Some(std::time::Duration::from_secs(DEFAULT_IDLE_TTL_SECS)),
+        Ok(secs) => Some(std::time::Duration::from_secs(secs)),
+        Err(_) => Some(std::time::Duration::from_secs(DEFAULT_IDLE_TTL_SECS)),
+    }
+}
+
+/// Drops the cached OCR engine if it has been idle for at least `ttl`.
+/// Returns `true` when a loaded engine was released.
+pub fn release_idle(ttl: std::time::Duration) -> bool {
+    let last = LAST_USED.lock().ok().and_then(|g| *g);
+    let Some(last) = last else {
+        return false;
+    };
+    if last.elapsed() < ttl {
+        return false;
+    }
+    let Ok(mut guard) = ENGINE.lock() else {
+        return false;
+    };
+    if guard.is_some() {
+        *guard = None;
+        if let Ok(mut ts) = LAST_USED.lock() {
+            *ts = None;
+        }
+        return true;
+    }
+    false
+}
+
+fn ensure_reaper_started() {
+    let ttl = parse_idle_ttl(std::env::var("ZALO_OCR_IDLE_TTL_SECS").ok().as_deref());
+    let Some(ttl) = ttl else {
+        return;
+    };
+    REAPER_STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("zocr-idle-reaper".into())
+            .spawn(move || {
+                let tick = (ttl / 4).clamp(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(30),
+                );
+                loop {
+                    std::thread::sleep(tick);
+                    let _ = release_idle(ttl);
+                }
+            });
+    });
+}
 
 /// Recognized lines of `image`, joined by newlines. The engine is loaded on
-/// first use and kept for the life of the process.
+/// first use and automatically released after [`DEFAULT_IDLE_TTL_SECS`] of
+/// inactivity to reclaim ONNX Runtime memory.
 ///
 /// # Errors
 ///
@@ -124,6 +197,7 @@ pub fn recognize(image: &RgbImage) -> Result<String, OcrError> {
 ///
 /// See [`recognize`].
 pub fn recognize_lines(image: &RgbImage) -> Result<Vec<Line>, OcrError> {
+    ensure_reaper_started();
     let mut guard = ENGINE
         .lock()
         .map_err(|_| OcrError::Runtime("engine lock poisoned".into()))?;
@@ -135,10 +209,14 @@ pub fn recognize_lines(image: &RgbImage) -> Result<Vec<Line>, OcrError> {
             Options::default(),
         )?);
     }
-    match guard.as_mut() {
+    let res = match guard.as_mut() {
         Some(engine) => engine.recognize(image),
         None => Err(OcrError::ModelMissing),
+    };
+    if let Ok(mut ts) = LAST_USED.lock() {
+        *ts = Some(std::time::Instant::now());
     }
+    res
 }
 
 #[cfg(test)]
@@ -157,6 +235,29 @@ mod tests {
         let found = install_in(&dir).expect("install");
         assert!(found.manifest.ends_with("zocr/models.json"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_ttl_treats_zero_and_unset_as_default_and_off_as_disabled() {
+        assert_eq!(
+            parse_idle_ttl(None),
+            Some(std::time::Duration::from_secs(DEFAULT_IDLE_TTL_SECS))
+        );
+        assert_eq!(
+            parse_idle_ttl(Some("")),
+            Some(std::time::Duration::from_secs(DEFAULT_IDLE_TTL_SECS))
+        );
+        assert_eq!(
+            parse_idle_ttl(Some("0")),
+            Some(std::time::Duration::from_secs(DEFAULT_IDLE_TTL_SECS))
+        );
+        assert_eq!(parse_idle_ttl(Some("off")), None);
+        assert_eq!(parse_idle_ttl(Some("DISABLED")), None);
+        assert_eq!(
+            parse_idle_ttl(Some("45")),
+            Some(std::time::Duration::from_secs(45))
+        );
+        assert!(!release_idle(std::time::Duration::ZERO));
     }
 
     /// Runs the real models on a rendered line. Needs an OCR install

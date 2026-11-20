@@ -1604,12 +1604,19 @@ impl ShellView {
         match event {
             RtEvent::Online => self.rt_status = None,
             RtEvent::Offline(why) => {
+                eprintln!("zalo-gpui realtime offline: {why}");
                 if crate::login_flow::is_session_error(&why) {
                     self.has_session = false;
                     self.rt_status =
                         Some("Phiên đăng nhập đã hết hạn — bấm «Đăng nhập lại» trên thanh thông báo để quét QR".into());
+                } else if zalo_client::listener::is_transient_disconnect(&why)
+                    || why.contains("http://")
+                    || why.contains("https://")
+                {
+                    self.rt_status = Some("Mất kết nối máy chủ tin nhắn, đang kết nối lại…".into());
                 } else {
-                    self.rt_status = Some(format!("Mất kết nối nhận tin ({why}), đang thử lại…"));
+                    let brief: String = why.chars().take(80).collect();
+                    self.rt_status = Some(format!("Mất kết nối nhận tin ({brief}), đang thử lại…"));
                 }
             }
             RtEvent::Replaced => {

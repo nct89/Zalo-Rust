@@ -199,6 +199,14 @@ const EXTRA: &[(&str, &str)] = &[
     ("Đã đặt", "Set"),
     ("Nhập mã PIN để xem trong lần dùng này", "Enter the PIN to show them for this session"),
     ("Chưa có hội thoại", "No conversations yet"),
+    (
+        "Mất kết nối máy chủ tin nhắn, đang kết nối lại…",
+        "Connection to messaging server lost, reconnecting…",
+    ),
+    (
+        "Phiên này đã được mở ở nơi khác — ngừng nhận tin",
+        "This session was opened elsewhere — realtime paused",
+    ),
     ("Tìm kiếm", "Search"),
     (
         "Xuất tin nhắn văn bản đang có trên máy này ra file JSON. Không khôi phục từ điện thoại.",

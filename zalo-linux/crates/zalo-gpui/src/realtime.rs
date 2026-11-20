@@ -200,182 +200,204 @@ pub fn start(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
 }
 
 async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
-    let mut wait = Duration::from_secs(5);
-    let (api, server_info, self_uin) = loop {
+    let store_path = dir.join("store.db");
+    let mut synced = false;
+    loop {
         if tx.is_closed() {
             return;
         }
-        let attempt: Result<_, String> = async {
-            let device = Device::load_or_create(dir).map_err(|e| e.to_string())?;
-            let session = StoredSession::load(dir).map_err(|e| e.to_string())?;
-            let mut api = ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
-            let info = api.get_login_info().await.map_err(|e| e.to_string())?;
-            crate::bridge::remember_login_info(
-                dir,
-                session.zpw_sek().as_deref().unwrap_or(""),
-                &info,
-            );
-            let server = api.get_server_info().await.ok();
-            let self_uid = info
-                .send2me_id
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| info.uin.clone());
-            Ok((api, server, self_uid))
-        }
-        .await;
-        match attempt {
-            Ok(ready) => break ready,
-            Err(err) => {
-                let fatal = crate::login_flow::is_session_error(&err);
-                let _ = tx.unbounded_send(RtEvent::Offline(err));
-                if fatal {
-                    return;
-                }
-                tokio::time::sleep(wait).await;
-                wait = (wait * 2).min(Duration::from_secs(60));
+        let mut wait = Duration::from_secs(5);
+        let (api, server_info, self_uin) = loop {
+            if tx.is_closed() {
+                return;
             }
-        }
-    };
-    let store_path = dir.join("store.db");
-    let (since_user, since_group) = LocalStore::open(&store_path)
-        .ok()
-        .and_then(|s| s.newest_global_ids().ok())
-        .unwrap_or((None, None));
-    let mut config = api.listener_config(server_info.as_ref());
-    config.since_user = since_user.map(|n| n.to_string());
-    config.since_group = since_group.map(|n| n.to_string());
-    config.cursor_path = Some(dir.join("queue-cursors.json"));
-    tokio::spawn(startup_sync(
-        api,
-        store_path.clone(),
-        self_uin.clone(),
-        tx.clone(),
-    ));
-    let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
-    if let Ok(mut slot) = SYNC_OUT.lock() {
-        *slot = Some(sync_tx);
-    }
-    let tx2 = tx.clone();
-    let result = run_listener_with(config, Some(sync_rx), move |event| {
-        if tx2.is_closed() {
-            return false;
-        }
-        let out = match event {
-            ListenerEvent::Ready => {
-                LISTENING.store(true, std::sync::atomic::Ordering::Relaxed);
-                RtEvent::Online
+            let attempt: Result<_, String> = async {
+                let device = Device::load_or_create(dir).map_err(|e| e.to_string())?;
+                let session = StoredSession::load(dir).map_err(|e| e.to_string())?;
+                let mut api =
+                    ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
+                let info = api.get_login_info().await.map_err(|e| e.to_string())?;
+                crate::bridge::remember_login_info(
+                    dir,
+                    session.zpw_sek().as_deref().unwrap_or(""),
+                    &info,
+                );
+                let server = api.get_server_info().await.ok();
+                let self_uid = info
+                    .send2me_id
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| info.uin.clone());
+                Ok((api, server, self_uid))
             }
-            ListenerEvent::Disconnected(why) => {
-                LISTENING.store(false, std::sync::atomic::Ordering::Relaxed);
-                RtEvent::Offline(why)
+            .await;
+            match attempt {
+                Ok(ready) => break ready,
+                Err(err) => {
+                    let fatal = crate::login_flow::is_session_error(&err);
+                    let _ = tx.unbounded_send(RtEvent::Offline(err));
+                    if fatal {
+                        return;
+                    }
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(Duration::from_secs(60));
+                }
             }
-            ListenerEvent::Replaced => RtEvent::Replaced,
-            ListenerEvent::Status(status) => {
-                if status.is_empty() {
-                    return true;
-                }
-                RtEvent::Status(status)
-            }
-            ListenerEvent::Typing(list) => {
-                let filtered: Vec<_> = list
-                    .into_iter()
-                    .filter(|t| !t.user_id.is_empty() && t.user_id != self_uin)
-                    .collect();
-                if filtered.is_empty() {
-                    return true;
-                }
-                RtEvent::Typing(filtered)
-            }
-            ListenerEvent::Event { cmd, sub_cmd, data }
-                if cmd == zalo_client::listener::CMD_PUSH_CTRL =>
-            {
-                if crate::call::call_log_enabled() {
-                    eprintln!(
-                        "zalo-gpui ws: ctrl cmd={cmd} sub={sub_cmd} {}",
-                        crate::call::sanitized_call_json(&data)
-                    );
-                }
-                for (id, url) in zalo_client::listener::file_done_from_event(&data) {
-                    file_done(id, url);
-                }
-                if crate::phone_sync::is_running()
-                    && tx2
-                        .unbounded_send(RtEvent::SyncSignal(cmd, data.clone()))
-                        .is_err()
-                {
-                    return false;
-                }
-                let voip = zalo_client::voip_controls_from_event(&data);
-                if voip.is_empty() {
-                    return true;
-                }
-                RtEvent::Voip(voip)
-            }
-            ListenerEvent::Event { cmd, data, .. } if crate::backup_msg::wants(cmd) => {
-                RtEvent::BackupReply(cmd, data)
-            }
-            ListenerEvent::Event { cmd, data, .. }
-                if cmd == zalo_sync2::request::CMD_REQUEST_SYNC =>
-            {
-                if !crate::phone_sync::is_running() {
-                    return true;
-                }
-                RtEvent::SyncSignal(cmd, data)
-            }
-            ListenerEvent::Event { cmd, data, .. }
-                if matches!(
-                    cmd,
-                    zalo_client::listener::CMD_PULL_REACT
-                        | zalo_client::listener::CMD_PULL_REACT_GROUP
-                        | zalo_client::listener::CMD_PUSH_REACT
-                        | zalo_client::listener::CMD_CLEAR_REACT
-                ) =>
-            {
-                let list = reactions_from_event(cmd, &data, &self_uin);
-                if list.is_empty() {
-                    return true;
-                }
-                RtEvent::Reactions(list)
-            }
-            ListenerEvent::Event { cmd, sub_cmd, data } => {
-                if crate::call::call_log_enabled() {
-                    eprintln!(
-                        "zalo-gpui ws: event cmd={cmd} sub={sub_cmd} {}",
-                        crate::call::sanitized_call_json(&data)
-                    );
-                }
-                return true;
-            }
-            ListenerEvent::Messages {
-                group,
-                items,
-                history,
-                status,
-            } => {
-                if !status.is_empty() && tx2.unbounded_send(RtEvent::Status(status)).is_err() {
-                    return false;
-                }
-                let mut list: Vec<Incoming> = items
-                    .iter()
-                    .filter_map(|item| parse_item(item, group, &self_uin))
-                    .collect();
-                if list.is_empty() {
-                    return true;
-                }
-                store_all(&store_path, &mut list);
-                RtEvent::Messages(list, !history)
-            }
-            _ => return true,
         };
-        tx2.unbounded_send(out).is_ok()
-    })
-    .await;
-    if let Ok(mut slot) = SYNC_OUT.lock() {
-        *slot = None;
-    }
-    if let Err(err) = result {
-        let _ = tx.unbounded_send(RtEvent::Offline(err.to_string()));
+        let (since_user, since_group) = LocalStore::open(&store_path)
+            .ok()
+            .and_then(|s| s.newest_global_ids().ok())
+            .unwrap_or((None, None));
+        let mut config = api.listener_config(server_info.as_ref());
+        config.since_user = since_user.map(|n| n.to_string());
+        config.since_group = since_group.map(|n| n.to_string());
+        config.cursor_path = Some(dir.join("queue-cursors.json"));
+        config.max_unready_retries = Some(3);
+        if !synced {
+            synced = true;
+            tokio::spawn(startup_sync(
+                api,
+                store_path.clone(),
+                self_uin.clone(),
+                tx.clone(),
+            ));
+        }
+        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
+        if let Ok(mut slot) = SYNC_OUT.lock() {
+            *slot = Some(sync_tx);
+        }
+        let tx2 = tx.clone();
+        let store_path_cb = store_path.clone();
+        let result = run_listener_with(config, Some(sync_rx), move |event| {
+            if tx2.is_closed() {
+                return false;
+            }
+            let out = match event {
+                ListenerEvent::Ready => {
+                    LISTENING.store(true, std::sync::atomic::Ordering::Relaxed);
+                    RtEvent::Online
+                }
+                ListenerEvent::Disconnected(why) => {
+                    LISTENING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    RtEvent::Offline(why)
+                }
+                ListenerEvent::Replaced => RtEvent::Replaced,
+                ListenerEvent::Status(status) => {
+                    if status.is_empty() {
+                        return true;
+                    }
+                    RtEvent::Status(status)
+                }
+                ListenerEvent::Typing(list) => {
+                    let filtered: Vec<_> = list
+                        .into_iter()
+                        .filter(|t| !t.user_id.is_empty() && t.user_id != self_uin)
+                        .collect();
+                    if filtered.is_empty() {
+                        return true;
+                    }
+                    RtEvent::Typing(filtered)
+                }
+                ListenerEvent::Event { cmd, sub_cmd, data }
+                    if cmd == zalo_client::listener::CMD_PUSH_CTRL =>
+                {
+                    if crate::call::call_log_enabled() {
+                        eprintln!(
+                            "zalo-gpui ws: ctrl cmd={cmd} sub={sub_cmd} {}",
+                            crate::call::sanitized_call_json(&data)
+                        );
+                    }
+                    for (id, url) in zalo_client::listener::file_done_from_event(&data) {
+                        file_done(id, url);
+                    }
+                    if crate::phone_sync::is_running()
+                        && tx2
+                            .unbounded_send(RtEvent::SyncSignal(cmd, data.clone()))
+                            .is_err()
+                    {
+                        return false;
+                    }
+                    let voip = zalo_client::voip_controls_from_event(&data);
+                    if voip.is_empty() {
+                        return true;
+                    }
+                    RtEvent::Voip(voip)
+                }
+                ListenerEvent::Event { cmd, data, .. } if crate::backup_msg::wants(cmd) => {
+                    RtEvent::BackupReply(cmd, data)
+                }
+                ListenerEvent::Event { cmd, data, .. }
+                    if cmd == zalo_sync2::request::CMD_REQUEST_SYNC =>
+                {
+                    if !crate::phone_sync::is_running() {
+                        return true;
+                    }
+                    RtEvent::SyncSignal(cmd, data)
+                }
+                ListenerEvent::Event { cmd, data, .. }
+                    if matches!(
+                        cmd,
+                        zalo_client::listener::CMD_PULL_REACT
+                            | zalo_client::listener::CMD_PULL_REACT_GROUP
+                            | zalo_client::listener::CMD_PUSH_REACT
+                            | zalo_client::listener::CMD_CLEAR_REACT
+                    ) =>
+                {
+                    let list = reactions_from_event(cmd, &data, &self_uin);
+                    if list.is_empty() {
+                        return true;
+                    }
+                    RtEvent::Reactions(list)
+                }
+                ListenerEvent::Event { cmd, sub_cmd, data } => {
+                    if crate::call::call_log_enabled() {
+                        eprintln!(
+                            "zalo-gpui ws: event cmd={cmd} sub={sub_cmd} {}",
+                            crate::call::sanitized_call_json(&data)
+                        );
+                    }
+                    return true;
+                }
+                ListenerEvent::Messages {
+                    group,
+                    items,
+                    history,
+                    status,
+                } => {
+                    if !status.is_empty() && tx2.unbounded_send(RtEvent::Status(status)).is_err() {
+                        return false;
+                    }
+                    let mut list: Vec<Incoming> = items
+                        .iter()
+                        .filter_map(|item| parse_item(item, group, &self_uin))
+                        .collect();
+                    if list.is_empty() {
+                        return true;
+                    }
+                    store_all(&store_path_cb, &mut list);
+                    RtEvent::Messages(list, !history)
+                }
+                _ => return true,
+            };
+            tx2.unbounded_send(out).is_ok()
+        })
+        .await;
+        if let Ok(mut slot) = SYNC_OUT.lock() {
+            *slot = None;
+        }
+        match result {
+            Ok(()) => return,
+            Err(zalo_client::listener::ListenerError::RefreshNeeded) => {
+                eprintln!(
+                    "zalo-gpui realtime: consecutive WebSocket drops before Ready; refreshing login info and endpoints"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(err) => {
+                let _ = tx.unbounded_send(RtEvent::Offline(err.to_string()));
+                return;
+            }
+        }
     }
 }
 

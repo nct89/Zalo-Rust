@@ -1371,10 +1371,27 @@ impl MediaSession {
         }
     }
 
-    /// Sends a Ping to the active server. A group call sends ZaviPing instead,
-    /// then asks the SFU for each watched member and announces our one layer.
+    /// Sends a Ping to the active server.
+    ///
+    /// While ringing in a 1-1 call (before `start()` picks `active_server`),
+    /// pings every relay server that answered `InitZRTP` so NAT bindings and
+    /// server sessions stay alive when the callee answers after a long ring.
+    /// A group call sends `ZaviPing` instead, then asks the SFU for each watched
+    /// member and announces our one layer.
     pub fn send_ping(&mut self) {
         let Some(server) = self.active_server.clone() else {
+            if !self.group && !self.replies.is_empty() {
+                let targets: Vec<(Server, u32)> = self
+                    .replies
+                    .iter()
+                    .map(|r| (r.server.clone(), r.token))
+                    .collect();
+                for (target, token) in targets {
+                    let packet =
+                        build_ping_packet(self.local_uid, token, self.sess_id.as_bytes());
+                    self.send(&packet, &target, "Ping");
+                }
+            }
             return;
         };
         if self.group {
@@ -3466,5 +3483,71 @@ mod tests {
         assert_eq!(plan.encode.fps, 20);
         assert_eq!(plan.encode.bitrate, 800_000);
         assert_eq!(plan.layers.len(), 9);
+    }
+
+    #[test]
+    fn ringing_1to1_pings_all_replied_servers_until_active_chosen() {
+        let sent = Arc::new(Mutex::new(Vec::<(Vec<u8>, Server, String)>::new()));
+        let record = Arc::clone(&sent);
+        let mut session = MediaSession::new();
+        session.send_udp = true;
+        session.set_send(move |pkt, srv, what| {
+            record
+                .lock()
+                .unwrap()
+                .push((pkt.to_vec(), srv.clone(), what.to_owned()));
+        });
+        session.on_negotiated(&serde_json::json!({
+            "callId": 42,
+            "role": "caller",
+            "localUid": 100,
+            "peerUid": 200,
+            "sessId": "sess-ring-12345678901234567890",
+            "servers": [
+                {"rtpaddr": "192.0.2.10:5000"},
+                {"rtpaddr": "192.0.2.11:5001"}
+            ]
+        }));
+        session.replies.push(Reply {
+            server: Server {
+                host: "192.0.2.10".into(),
+                port: 5000,
+            },
+            token: 111,
+            rtt_ms: 20,
+            public_addr: None,
+        });
+        session.replies.push(Reply {
+            server: Server {
+                host: "192.0.2.11".into(),
+                port: 5001,
+            },
+            token: 222,
+            rtt_ms: 40,
+            public_addr: None,
+        });
+
+        // While ringing (active_server is None), send_ping must keep all replied relays alive.
+        session.send_ping();
+        {
+            let pkts = sent.lock().unwrap();
+            assert_eq!(pkts.len(), 2);
+            assert_eq!(pkts[0].1.host, "192.0.2.10");
+            assert_eq!(pkts[1].1.host, "192.0.2.11");
+            assert_eq!(pkts[0].2, "Ping");
+            assert_eq!(pkts[1].2, "Ping");
+            assert_eq!(unwrap_packet(&pkts[0].0).unwrap().token, Some(111));
+            assert_eq!(unwrap_packet(&pkts[1].0).unwrap().token, Some(222));
+        }
+
+        // Once start() chooses the active server, send_ping targets only that server.
+        sent.lock().unwrap().clear();
+        session.start("caller", Some("192.0.2.10:5000"));
+        sent.lock().unwrap().clear();
+        session.send_ping();
+        let pkts = sent.lock().unwrap();
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0].1.host, "192.0.2.10");
+        assert_eq!(pkts[0].2, "Ping");
     }
 }

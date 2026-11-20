@@ -755,7 +755,7 @@ impl EngineCore {
                     .unwrap_or(0);
                 if status != 0 {
                     self._finish(
-                        103,
+                        if status == 3 { 160 } else { 103 },
                         Some(if status == 3 {
                             "Người nhận đã từ chối"
                         } else {
@@ -1175,7 +1175,7 @@ impl EngineCore {
         self.call = Some(c);
     }
 
-    fn _peer_ended(&mut self, _why: &str) {
+    fn _peer_ended(&mut self, why: &str) {
         let Some(c) = self.call.clone() else {
             return;
         };
@@ -1185,7 +1185,14 @@ impl EngineCore {
         if c.state == "connected" {
             self.emit(json!({"type": "request", "command": "showNotification", "data": {"isGroup": false, "reason": "partner_endcall", "toUid": c.peer_id, "userId": c.peer_id}}));
         }
-        self._finish(if c.state == "connected" { 50 } else { 103 }, None, true);
+        let code = if c.state == "connected" {
+            50
+        } else if why == "reject" {
+            160
+        } else {
+            103
+        };
+        self._finish(code, None, true);
     }
 
     fn _extend_data(
@@ -3557,5 +3564,22 @@ mod tests {
         let started_at = h_off.engine.call.as_ref().unwrap().started_at;
         h_off.engine.tick_at(started_at.saturating_add(2_500));
         assert_eq!(sent(&h_off.engine.frames, 12006).len(), 1);
+    }
+
+    #[test]
+    fn callee_reject_finishes_with_status_160() {
+        let mut h = setup();
+        h.engine.on_zalo_frame(&json!({
+            "type": "request",
+            "command": "makeCall",
+            "data": {"type": 0, "partner": [{"id": "111", "name": "Alice"}]},
+        }));
+        let cid = h.engine.call.as_ref().expect("call").call_id;
+        h.engine.on_zalo_frame(&control(
+            "answer",
+            json!({"callId": cid, "params": serde_json::to_string(&json!({"status": 3})).unwrap()}),
+        ));
+        let end_frame = sent(&h.engine.frames, 406).pop().expect("406 finish");
+        assert_eq!(end_frame["data"]["status"], 160);
     }
 }

@@ -779,6 +779,8 @@ impl ZaloApi {
             .cookie_provider(Arc::clone(&jar))
             .default_headers(headers)
             .user_agent(user_agent())
+            .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_keepalive(Duration::from_secs(30))
             .timeout(Duration::from_secs(40))
             .build()?;
         Ok(Self {
@@ -3285,6 +3287,7 @@ impl ZaloApi {
             since_user: None,
             since_group: None,
             cursor_path: None,
+            max_unready_retries: None,
         }
     }
 

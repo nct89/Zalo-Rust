@@ -138,6 +138,10 @@ pub enum ListenerError {
     /// The server closed the socket.
     #[error("socket closed ({0})")]
     Closed(String),
+    /// Repeated disconnects before handshake readiness; caller should refresh
+    /// `getLoginInfo` cookies and WebSocket endpoints before reconnecting.
+    #[error("session refresh required")]
+    RefreshNeeded,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for ListenerError {
@@ -947,6 +951,10 @@ pub struct ListenerConfig {
     /// `queue-cursors.json`: last `lastActionId` per `"cmd_sub"` queue.
     /// `None` keeps the cursors in memory for this process only.
     pub cursor_path: Option<std::path::PathBuf>,
+    /// Optional cap on consecutive disconnects before reaching `Ready`.
+    /// When reached, [`run_listener_with`] returns [`ListenerError::RefreshNeeded`]
+    /// so the caller can refresh `getLoginInfo` cookies and endpoints.
+    pub max_unready_retries: Option<u32>,
 }
 
 impl std::fmt::Debug for ListenerConfig {
@@ -959,8 +967,32 @@ impl std::fmt::Debug for ListenerConfig {
             .field("since_user", &self.since_user)
             .field("since_group", &self.since_group)
             .field("cursor_path", &self.cursor_path)
+            .field("max_unready_retries", &self.max_unready_retries)
             .finish()
     }
+}
+
+/// Returns `true` when `reason` is a common transient network/TLS disconnect
+/// (e.g. peer closed TCP without TLS `close_notify`, reset, or timeout).
+#[must_use]
+pub fn is_transient_disconnect(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    [
+        "close_notify",
+        "unexpected-eof",
+        "unexpected eof",
+        "connection reset",
+        "broken pipe",
+        "timed out",
+        "socket ended",
+        "dns",
+        "failed to lookup",
+        "network is unreachable",
+        "temporary failure",
+        "eof",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Builds `endpoint?zpw_ver=…&zpw_type=…&t=…`.
@@ -1014,6 +1046,7 @@ where
     };
     let mut backoff = Duration::from_secs(2);
     let mut attempt = 0_usize;
+    let mut consecutive_unready = 0_u32;
     let mut last_ids = LastIds {
         user: config.since_user.clone(),
         group: config.since_group.clone(),
@@ -1044,15 +1077,31 @@ where
             Ok(Outcome::Dropped { was_ready, reason }) => {
                 if was_ready {
                     backoff = Duration::from_secs(2);
+                    consecutive_unready = 0;
+                } else {
+                    consecutive_unready = consecutive_unready.saturating_add(1);
                 }
                 if !on_event(ListenerEvent::Disconnected(reason)) {
                     return Ok(());
                 }
+                if config
+                    .max_unready_retries
+                    .is_some_and(|limit| limit > 0 && consecutive_unready >= limit)
+                {
+                    return Err(ListenerError::RefreshNeeded);
+                }
             }
             Err(ListenerError::Url(e)) => return Err(ListenerError::Url(e)),
             Err(err) => {
+                consecutive_unready = consecutive_unready.saturating_add(1);
                 if !on_event(ListenerEvent::Disconnected(err.to_string())) {
                     return Ok(());
+                }
+                if config
+                    .max_unready_retries
+                    .is_some_and(|limit| limit > 0 && consecutive_unready >= limit)
+                {
+                    return Err(ListenerError::RefreshNeeded);
                 }
             }
         }
@@ -1100,11 +1149,19 @@ where
     let mut decoder = EventDecoder::with_cursors(cursors.clone());
     let mut ping = tokio::time::interval(config.ping_interval);
     ping.tick().await;
+    let mut last_rx = tokio::time::Instant::now();
+    let stale_after = config
+        .ping_interval
+        .saturating_mul(2)
+        .max(Duration::from_secs(45));
     loop {
         tokio::select! {
             incoming = stream.next() => {
                 let message = match incoming {
-                    Some(Ok(message)) => message,
+                    Some(Ok(message)) => {
+                        last_rx = tokio::time::Instant::now();
+                        message
+                    }
                     Some(Err(err)) => return Ok(Outcome::Dropped {
                         was_ready: decoder.is_ready(),
                         reason: err.to_string(),
@@ -1180,6 +1237,13 @@ where
             }
             _ = ping.tick() => {
                 if decoder.is_ready() {
+                    if last_rx.elapsed() >= stale_after {
+                        let _ = sink.close().await;
+                        return Ok(Outcome::Dropped {
+                            was_ready: true,
+                            reason: "connection timed out".to_owned(),
+                        });
+                    }
                     let frame = Frame::ping(unix_ms());
                     if let Err(err) = sink.send(Message::binary(frame.encode())).await {
                         return Ok(Outcome::Dropped {
@@ -1485,8 +1549,14 @@ mod tests {
             since_user: None,
             since_group: None,
             cursor_path: None,
+            max_unready_retries: Some(3),
         };
         assert!(!format!("{config:?}").contains("secret"));
+        assert!(is_transient_disconnect(
+            "IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof"
+        ));
+        assert!(is_transient_disconnect("connection timed out"));
+        assert!(!is_transient_disconnect("Zalo returned -1: session expired"));
     }
 
     #[test]
