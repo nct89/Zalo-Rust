@@ -1,0 +1,60 @@
+[package]
+name = "zalo-gpui"
+description = "Native GPUI desktop GUI for the Rust Zalo client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# GPUI (GPU/Wayland) macros may expand unsafe blocks. Protocol, storage, and
+# call crates keep `unsafe_code = "forbid"` from the workspace lints.
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[features]
+default = ["tray-xembed"]
+tray-xembed = ["zalo-shell/tray-xembed"]
+
+[lib]
+name = "zalo_gpui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zalo-gpui"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2.2"
+zalo-design = { path = "../zalo-design" }
+zalo-client = { workspace = true }
+zalo-core = { workspace = true }
+zalo-storage = { path = "../zalo-storage" }
+zalo-shell = { path = "../zalo-shell" }
+qrcode = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+serde_json.workspace = true
+tokio = { workspace = true }
+unicode-segmentation = "1.12"
+futures = "0.3"
+md-5 = { workspace = true }
+zjxl = { path = "../zjxl" }
+zimage = { path = "../zimage" }
+zcall-core = { path = "../zcall-core" }
+zcall-audio = { path = "../zcall-audio" }
+zcall-engine = { path = "../zcall-engine" }
+zalo-sync2 = { path = "../zalo-sync2" }
+zocr = { path = "../zocr" }
+openh264 = "0.8"
+libc = "0.2"
+raw-window-handle = "0.6"
+x11rb = { version = "0.13.2", features = ["shape", "randr"] }
+reqwest = { workspace = true }
+sha2 = "0.10"
+hex = { workspace = true }
+zstd = "0.13"
+resvg = "0.45"

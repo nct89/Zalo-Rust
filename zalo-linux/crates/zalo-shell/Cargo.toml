@@ -1,0 +1,21 @@
+[package]
+name = "zalo-shell"
+description = "Linux tray badge, Unity launcher count, and freedesktop notifications"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+tray-xembed = ["dep:x11rb"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+thiserror.workspace = true
+x11rb = { version = "0.13.2", optional = true }
+zbus = { version = "4.4", default-features = false, features = ["async-io", "blocking"] }

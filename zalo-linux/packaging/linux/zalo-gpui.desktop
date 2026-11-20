@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=Zalo
+Comment=Native Rust Zalo Desktop client
+Exec=/usr/bin/zalo-gpui
+Icon=zalo-gpui
+Terminal=false
+StartupNotify=true
+StartupWMClass=zalo-gpui
+Categories=Network;InstantMessaging;
+Actions=open;toggle-mute;quit;
+
+[Desktop Action open]
+Name=Open Zalo
+Exec=/usr/bin/zalo-gpui --show
+
+[Desktop Action toggle-mute]
+Name=Toggle Notifications
+Exec=/usr/bin/zalo-gpui --toggle-mute
+
+[Desktop Action quit]
+Name=Quit Zalo
+Exec=/usr/bin/zalo-gpui --quit

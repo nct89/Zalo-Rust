@@ -1,0 +1,910 @@
+//! User-click bridge to `zalo-client`. Never runs on GPUI startup.
+//!
+//! Preview thread ids (`preview:*`, `1`–`4`) are rejected. Tokio lives on a
+//! dedicated current-thread worker so GPUI's executor is not mixed in.
+
+use std::path::PathBuf;
+
+use zalo_client::{
+    conv_id, DeleteItem, Device, GifRef, QuoteTarget, Reaction, StickerRef, StoredSession, ZaloApi,
+    ARCHIVE_ADD, ARCHIVE_REMOVE, MSG_FILE, MSG_TEXT, MSG_VOICE, PIN_ADD, PIN_REMOVE, SET_MUTE,
+    UNSET_MUTE,
+};
+
+use crate::data::live_allowed;
+
+/// One user-initiated protocol call.
+#[derive(Clone, Debug)]
+pub enum LiveAction {
+    /// Plain text, or quote when `quote` is set (`urgency`: 0 normal, 1 important, 2 urgent).
+    Send {
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Body.
+        text: String,
+        /// Quote target when the composer reply bar is set and ids exist.
+        quote: Option<QuoteTarget>,
+        /// Priority tag (`0` normal, `1` important, `2` urgent).
+        urgency: u8,
+        /// `clientId` / `cliMsgId`.
+        client_id: u64,
+    },
+    /// Send a friend contact / namecard (`/api/message/contact` or `/api/group/contact`).
+    SendContact {
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Contact user id to share.
+        contact_uid: String,
+        /// `clientId` / `cliMsgId`.
+        client_id: u64,
+    },
+    /// Pin (`true`) or unpin.
+    Pin {
+        /// Thread to pin.
+        thread_id: String,
+        /// Pin when true.
+        pin: bool,
+    },
+    /// Mute (`true`) or unmute.
+    Mute {
+        /// Thread to mute.
+        thread_id: String,
+        /// Group vs 1-1 (`muteType`).
+        is_group: bool,
+        /// Mute when true.
+        mute: bool,
+        /// Seconds; −1 until the user unmutes (`STR_MUTE_NO_LIMIT`).
+        duration: i64,
+    },
+    /// Focused / Other.
+    Archive {
+        /// Thread to move.
+        thread_id: String,
+        /// Move to Other when true.
+        archive: bool,
+    },
+    /// Recall a message we sent.
+    Undo {
+        /// Parent thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Server id.
+        msg_id: i64,
+        /// New client id of the undo request.
+        client_id: u64,
+        /// `cliMsgId` of the recalled bubble.
+        cli_msg_id_undo: i64,
+    },
+    /// Delete for me.
+    Delete {
+        /// Parent thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// New client id of the delete request.
+        cli_msg_id: i64,
+        /// Row in `msgs`.
+        item: DeleteItem,
+    },
+    /// Message reaction (`/-strong`, `/-heart`, `:>` … or clear with `r_type == -1`).
+    React {
+        /// Parent thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Server id.
+        msg_id: i64,
+        /// Client id of the target bubble.
+        cli_msg_id: i64,
+        /// Zalo message type (`MSG_TEXT`, `MSG_VOICE`, `MSG_FILE`).
+        msg_type: i64,
+        /// Wire reaction (`r_type`, `r_icon`).
+        reaction: Reaction,
+        /// New client id of the reaction request.
+        client_id: u64,
+    },
+    /// Forward text to another thread.
+    Forward {
+        /// Destination thread.
+        dest_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Body.
+        text: String,
+        /// `clientId`.
+        client_id: u64,
+    },
+    /// Block messages and calls (`/api/friend/block`).
+    Block {
+        /// Friend uid.
+        uid: String,
+    },
+    /// Logout the saved session.
+    Logout,
+    /// Upload + send one photo (`upload_photo` → `send_photo`).
+    SendPhoto {
+        /// `clientId` shared with the local bubble (dedupes the echo).
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Local image file (PNG/JPEG/…).
+        path: PathBuf,
+        /// Caption (may be empty).
+        caption: String,
+    },
+    /// Upload + send one file (`sharefile_full`).
+    SendFile {
+        /// `clientId` shared with the local bubble.
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Local file.
+        path: PathBuf,
+    },
+    /// Send a sticker from the store / pack / suggestion strip.
+    SendSticker {
+        /// `clientId` shared with the local bubble.
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Sticker metadata.
+        sticker: StickerRef,
+    },
+    /// Send a GIF from search / trending / categories.
+    SendGif {
+        /// `clientId` shared with the local bubble.
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// GIF metadata.
+        gif: GifRef,
+    },
+    /// Upload and send a recorded MP3 voice note (`voicemp3` / `group/sendmp3`).
+    SendVoice {
+        /// `clientId` shared with the local bubble.
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Encoded MP3 bytes.
+        bytes: Vec<u8>,
+        /// File name passed to multipart upload (e.g. `"voice.mp3"`).
+        file_name: String,
+    },
+    /// Upload a video (`video/file/upload`), wait for `video_done`, then
+    /// forward with `msgType` 5 on the file host.
+    SendVideo {
+        /// `clientId` shared with the local bubble.
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Local video file.
+        path: PathBuf,
+        /// Length in milliseconds (`duration || 1`).
+        duration_ms: u64,
+        /// Pixel width. `0` omits `width` on the forward body.
+        width: u32,
+        /// Pixel height. `0` omits `height` on the forward body.
+        height: u32,
+        /// JPEG poster from `ffmpeg`, when one was written.
+        thumb: Option<PathBuf>,
+    },
+    /// Send a read receipt (`/api/message/seenv2` or `/api/group/seenv2`).
+    Seen {
+        /// Destination thread.
+        thread_id: String,
+        /// Raw `seen_record` payload `{cmi, gmi, si, di, mt, st, at, cmd, ts}`.
+        record: serde_json::Value,
+    },
+    /// Send a delivery receipt (`/api/message/deliveredv2` or `/api/group/deliveredv2`).
+    Delivered {
+        /// Destination thread.
+        thread_id: String,
+        /// Same per-message record as [`LiveAction::Seen`].
+        record: serde_json::Value,
+    },
+    /// Send a typing indicator (`/api/message/typing` or `/api/group/typing`).
+    Typing {
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+    },
+    /// Persist an unread badge on server (`/api/conv/addUnreadMark`).
+    MarkUnread {
+        /// Thread and last message reference.
+        item: zalo_client::ThreadMsgRef,
+    },
+    /// Clear server unread mark (`/api/conv/removeUnreadMark`).
+    RemoveUnread {
+        /// Conversation `thread_id`.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Timestamp (ms).
+        ts: i64,
+    },
+    /// Delete a conversation on server (`/api/message/deleteconver` or `/api/group/deleteconver`).
+    DeleteConv {
+        /// Thread and last message reference.
+        item: zalo_client::ThreadMsgRef,
+        /// Request client id.
+        client_id: u64,
+    },
+    /// Remove a friend (`/api/friend/remove`).
+    RemoveFriend {
+        /// Peer user id.
+        uid: String,
+    },
+    /// Set or clear a friend's alias (`/api/alias/update` or `/api/alias/remove`).
+    UpdateAlias {
+        /// Peer user id.
+        uid: String,
+        /// New alias; empty removes it.
+        alias: String,
+    },
+    /// Report a user or group (`/api/social/profile/reportabuse`).
+    ReportAbuse {
+        /// User uid or `g_<id>`.
+        target_id: String,
+        /// True for group threads.
+        is_group: bool,
+        /// Zalo abuse reason code.
+        reason: i64,
+        /// Optional description.
+        content: String,
+    },
+    /// Pin a message/note onto the group board (`/api/board/pinv2`).
+    PinBoard {
+        /// Group thread id.
+        thread_id: String,
+        /// Topic/message id to pin.
+        topic_id: String,
+        /// `zalo_client::GROUP_BOARD_*` type.
+        item_type: i64,
+    },
+    /// Unpin an item from the group board (`/api/board/unpinv2`).
+    UnpinBoard {
+        /// Group thread id.
+        thread_id: String,
+        /// Topic/message id to unpin.
+        topic_id: String,
+        /// Board version if known (`0` default).
+        board_version: i64,
+    },
+    /// Submit votes for a group poll (`/api/poll/vote`).
+    VotePoll {
+        /// Server poll id.
+        poll_id: i64,
+        /// Selected option ids.
+        option_ids: Vec<i64>,
+    },
+}
+
+/// Fire-and-forget. No-op when the thread id is a preview fixture.
+pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
+    if let LiveAction::Send { thread_id, .. }
+    | LiveAction::SendContact { thread_id, .. }
+    | LiveAction::Pin { thread_id, .. }
+    | LiveAction::Mute { thread_id, .. }
+    | LiveAction::Archive { thread_id, .. }
+    | LiveAction::Undo { thread_id, .. }
+    | LiveAction::Delete { thread_id, .. }
+    | LiveAction::React { thread_id, .. }
+    | LiveAction::Forward {
+        dest_id: thread_id, ..
+    }
+    | LiveAction::SendPhoto { thread_id, .. }
+    | LiveAction::SendFile { thread_id, .. }
+    | LiveAction::SendSticker { thread_id, .. }
+    | LiveAction::SendGif { thread_id, .. }
+    | LiveAction::SendVoice { thread_id, .. }
+    | LiveAction::SendVideo { thread_id, .. }
+    | LiveAction::Seen { thread_id, .. }
+    | LiveAction::Delivered { thread_id, .. }
+    | LiveAction::Typing { thread_id, .. }
+    | LiveAction::RemoveUnread { thread_id, .. }
+    | LiveAction::PinBoard { thread_id, .. }
+    | LiveAction::UnpinBoard { thread_id, .. }
+    | LiveAction::MarkUnread {
+        item: zalo_client::ThreadMsgRef { thread_id, .. },
+    }
+    | LiveAction::DeleteConv {
+        item: zalo_client::ThreadMsgRef { thread_id, .. },
+        ..
+    }
+    | LiveAction::ReportAbuse {
+        target_id: thread_id,
+        ..
+    } = &action
+    {
+        if !live_allowed(thread_id) {
+            return;
+        }
+    }
+    if let LiveAction::Block { uid }
+    | LiveAction::RemoveFriend { uid }
+    | LiveAction::UpdateAlias { uid, .. } = &action
+    {
+        if !live_allowed(uid) {
+            return;
+        }
+    }
+    let label = match &action {
+        LiveAction::SendPhoto { .. } => Some("Gửi ảnh"),
+        LiveAction::SendFile { .. } => Some("Gửi file"),
+        LiveAction::SendSticker { .. } => Some("Gửi sticker"),
+        LiveAction::SendGif { .. } => Some("Gửi GIF"),
+        LiveAction::SendVoice { .. } => Some("Gửi thoại"),
+        LiveAction::SendVideo { .. } => Some("Gửi video"),
+        LiveAction::SendContact { .. } => Some("Gửi danh thiếp"),
+        LiveAction::Send { .. } => Some("Gửi tin"),
+        LiveAction::Forward { .. } => Some("Chia sẻ"),
+        _ => None,
+    };
+    let silent = matches!(
+        &action,
+        LiveAction::Seen { .. } | LiveAction::Delivered { .. } | LiveAction::Typing { .. }
+    );
+    let is_logout = matches!(&action, LiveAction::Logout);
+    let _ = std::thread::Builder::new()
+        .name("zalo-gpui-bridge".into())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            match run_live(action, session_dir) {
+                Ok(()) => {
+                    if let Some(l) = label {
+                        eprintln!("zalo-gpui bridge: {l} ok in {} ms", started.elapsed().as_millis());
+                        if matches!(l, "Gửi file" | "Gửi thoại" | "Gửi video") {
+                            report(format!("{l}: đã gửi"));
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("zalo-gpui bridge: {err}");
+                    if is_logout {
+                        // Local wipe already left the session; 102/600 is expected.
+                    } else if crate::login_flow::is_session_error(&err) {
+                        report(
+                            "Phiên đăng nhập đã hết hạn — bấm «Đăng nhập lại» trên thanh thông báo để quét QR"
+                                .into(),
+                        );
+                    } else if !silent {
+                        report(format!("{} thất bại: {}", label.unwrap_or("Thao tác"), short(&err)));
+                    }
+                }
+            }
+        });
+}
+
+#[derive(Clone)]
+struct CachedLogin {
+    dir: PathBuf,
+    sek: String,
+    info: zalo_client::LoginInfo,
+}
+
+static LOGIN_CACHE: std::sync::Mutex<Option<CachedLogin>> = std::sync::Mutex::new(None);
+
+/// Cache `zpw_service_map_v3` hosts for this active session directory and cookie.
+pub(crate) fn remember_login_info(
+    dir: &std::path::Path,
+    sek: &str,
+    info: &zalo_client::LoginInfo,
+) {
+    if let Ok(mut slot) = LOGIN_CACHE.lock() {
+        *slot = Some(CachedLogin {
+            dir: dir.to_path_buf(),
+            sek: sek.to_owned(),
+            info: info.clone(),
+        });
+    }
+}
+
+fn cached_login_info(dir: &std::path::Path, sek: &str) -> Option<zalo_client::LoginInfo> {
+    let guard = LOGIN_CACHE.lock().ok()?;
+    let cached = guard.as_ref()?;
+    (cached.dir == dir && cached.sek == sek).then(|| cached.info.clone())
+}
+
+async fn ensure_service_hosts(
+    api: &mut ZaloApi,
+    dir: &std::path::Path,
+    sek: &str,
+    force_refresh: bool,
+) -> Result<(), String> {
+    if !force_refresh {
+        if let Some(info) = cached_login_info(dir, sek) {
+            api.apply_login_hosts(&info);
+            return Ok(());
+        }
+    }
+    let info = api.get_login_info().await.map_err(|e| e.to_string())?;
+    remember_login_info(dir, sek, &info);
+    Ok(())
+}
+
+fn run_live(action: LiveAction, dir: PathBuf) -> Result<(), String> {
+    let session = StoredSession::load(&dir).map_err(|e| e.to_string())?;
+    let Some(sek) = session.zpw_sek() else {
+        return Err("session has no zpw_sek".into());
+    };
+    let device = Device::load_or_create(&dir).map_err(|e| e.to_string())?;
+    let mut api = ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let needs_fresh_upload_hosts = matches!(
+        action,
+        LiveAction::SendPhoto { .. }
+            | LiveAction::SendFile { .. }
+            | LiveAction::SendSticker { .. }
+            | LiveAction::SendGif { .. }
+            | LiveAction::SendVoice { .. }
+            | LiveAction::SendVideo { .. }
+    );
+    rt.block_on(ensure_service_hosts(
+        &mut api,
+        &dir,
+        &sek,
+        needs_fresh_upload_hosts,
+    ))?;
+    rt.block_on(dispatch(&api, action))
+}
+
+/// JPEG for upload: longest side ≤ 2560 px, quality lowered until ≤ 2.5 MB
+/// (`zalo-gui` `encode_upload`). Returns bytes, width, height.
+fn encode_upload(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let rgba = crate::media::decode_rgba(&bytes, 2560).ok_or("ảnh không đọc được")?;
+    let (w, h) = rgba.dimensions();
+    let mut rgb = image::RgbImage::new(w, h);
+    for (x, y, p) in rgba.enumerate_pixels() {
+        let a = u16::from(p[3]);
+        let mix = |c: u8| ((u16::from(c) * a + 255 * (255 - a)) / 255) as u8;
+        rgb.put_pixel(x, y, image::Rgb([mix(p[0]), mix(p[1]), mix(p[2])]));
+    }
+    for quality in [90_u8, 80, 70, 60] {
+        let mut jpeg = Vec::new();
+        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality);
+        rgb.write_with_encoder(enc).map_err(|e| e.to_string())?;
+        if jpeg.len() <= 2_500_000 || quality == 60 {
+            return Ok((jpeg, w, h));
+        }
+    }
+    Err("không nén được ảnh".into())
+}
+
+async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
+    match action {
+        LiveAction::Send {
+            thread_id,
+            is_group,
+            text,
+            quote,
+            urgency,
+            client_id,
+        } => {
+            if let Some(quote) = quote {
+                api.send_quote(&thread_id, is_group, &text, client_id, &quote)
+                    .await
+            } else {
+                api.send_text_with_urgency(&thread_id, is_group, &text, client_id, urgency)
+                    .await
+            }
+        }
+        LiveAction::SendContact {
+            thread_id,
+            is_group,
+            contact_uid,
+            client_id,
+        } => {
+            api.send_contact(&thread_id, is_group, &contact_uid, client_id)
+                .await
+        }
+        LiveAction::Pin { thread_id, pin } => {
+            let action = if pin { PIN_ADD } else { PIN_REMOVE };
+            api.update_pinned_conversations(&[thread_id], action).await
+        }
+        LiveAction::Mute {
+            thread_id,
+            is_group,
+            mute,
+            duration,
+        } => {
+            let action = if mute { SET_MUTE } else { UNSET_MUTE };
+            api.set_mute(&thread_id, is_group, action, duration).await
+        }
+        LiveAction::Archive { thread_id, archive } => {
+            let action = if archive { ARCHIVE_ADD } else { ARCHIVE_REMOVE };
+            let version = api
+                .get_archived_chats(0)
+                .await
+                .ok()
+                .map(|v| zalo_client::archived_ids_from(&v).1)
+                .unwrap_or(0);
+            api.update_archived_chats(&[conv_id(&thread_id)], version, action)
+                .await
+        }
+        LiveAction::Undo {
+            thread_id,
+            is_group,
+            msg_id,
+            client_id,
+            cli_msg_id_undo,
+        } => {
+            api.undo_message(&thread_id, is_group, msg_id, client_id, cli_msg_id_undo)
+                .await
+        }
+        LiveAction::Delete {
+            thread_id,
+            is_group,
+            cli_msg_id,
+            item,
+        } => {
+            api.delete_messages(&thread_id, is_group, cli_msg_id, &[item], true)
+                .await
+        }
+        LiveAction::React {
+            thread_id,
+            is_group,
+            msg_id,
+            cli_msg_id,
+            msg_type,
+            reaction,
+            client_id,
+        } => {
+            api.send_reaction(
+                &thread_id, is_group, msg_id, cli_msg_id, msg_type, &reaction, client_id,
+            )
+            .await
+        }
+        LiveAction::Forward {
+            dest_id,
+            is_group,
+            text,
+            client_id,
+        } => api.forward_text(&dest_id, is_group, &text, client_id).await,
+        LiveAction::Block { uid } => api.set_block(&uid, true).await,
+        LiveAction::SendPhoto {
+            client_id: cid,
+            thread_id,
+            is_group,
+            path,
+            caption,
+        } => {
+            let (jpeg, w, h) = encode_upload(&path)?;
+            let up = api
+                .upload_photo(
+                    &thread_id,
+                    is_group,
+                    jpeg,
+                    &format!("zalo-rust-{cid}.jpg"),
+                    cid,
+                )
+                .await
+                .map_err(|e| format!("upload: {e}"))?;
+            api.send_photo(&thread_id, is_group, &up, w, h, &caption)
+                .await
+        }
+        LiveAction::SendFile {
+            client_id: cid,
+            thread_id,
+            is_group,
+            path,
+        } => {
+            // Hash and upload from disk. `upload_async_file_path` sends 3 MiB
+            // chunks, so the whole file is not held in memory.
+            use md5::{Digest, Md5};
+            if !crate::realtime::listening() {
+                return Err("chưa kết nối realtime (cần để nhận file_done)".into());
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_owned();
+            let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+            let mut hasher = Md5::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = std::io::Read::read(&mut file, &mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            drop(file);
+            let checksum = format!("{:x}", hasher.finalize());
+            let (file_id, size) = api
+                .upload_async_file_path(&thread_id, is_group, &path, &name, cid)
+                .await
+                .map_err(|e| format!("upload: {e}"))?;
+            let url = crate::realtime::wait_file_url(&file_id, std::time::Duration::from_secs(90))
+                .ok_or("máy chủ chưa báo file_done sau 90 s")?;
+            api.send_async_file_msg(
+                &thread_id, is_group, &file_id, &url, &name, size, &checksum, cid,
+            )
+            .await
+        }
+        LiveAction::SendSticker {
+            client_id: cid,
+            thread_id,
+            is_group,
+            sticker,
+        } => api.send_sticker(&thread_id, is_group, &sticker, cid).await,
+        LiveAction::SendGif {
+            client_id: cid,
+            thread_id,
+            is_group,
+            gif,
+        } => api.send_gif(&thread_id, is_group, &gif, cid).await,
+        LiveAction::SendVoice {
+            client_id: cid,
+            thread_id,
+            is_group,
+            bytes,
+            file_name,
+        } => api
+            .send_voice(&thread_id, is_group, bytes, &file_name, cid)
+            .await
+            .map(|_| serde_json::Value::Null),
+        LiveAction::SendVideo {
+            client_id: cid,
+            thread_id,
+            is_group,
+            path,
+            duration_ms,
+            width,
+            height,
+            thumb,
+        } => {
+            // Same socket gate as async files: the playable URL is `video_done`.
+            if !crate::realtime::listening() {
+                return Err("chưa kết nối realtime (cần để nhận video_done)".into());
+            }
+            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("video.mp4")
+                .to_owned();
+            let file_id = api
+                .upload_video_file(&thread_id, is_group, &bytes, &name, cid)
+                .await
+                .map_err(|e| format!("upload: {e}"))?;
+            let thumb_url = match thumb.as_ref().and_then(|p| std::fs::read(p).ok()) {
+                Some(tb) if !tb.is_empty() => api
+                    .upload_video_thumb(&thread_id, is_group, &tb, "thumb.jpg", cid)
+                    .await
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let url = crate::realtime::wait_file_url(&file_id, std::time::Duration::from_secs(120))
+                .ok_or_else(|| "máy chủ chưa báo video_done sau 120 s".to_owned())?;
+            let info = zalo_client::ops::VideoSendInfo {
+                title: name,
+                video_url: url,
+                thumb_url,
+                duration_ms,
+                file_size: bytes.len() as u64,
+                width,
+                height,
+            };
+            api.forward_video(&thread_id, is_group, cid, &info).await
+        }
+        LiveAction::Seen { thread_id, record } => api.send_seen(&thread_id, &[record]).await,
+        LiveAction::Delivered { thread_id, record } => {
+            api.send_delivered(&thread_id, &[record]).await
+        }
+        LiveAction::Typing {
+            thread_id,
+            is_group,
+        } => api.send_typing(&thread_id, is_group).await,
+        LiveAction::MarkUnread { item } => api.add_unread_mark(&item).await,
+        LiveAction::RemoveUnread {
+            thread_id,
+            is_group,
+            ts,
+        } => api.remove_unread_mark(&thread_id, is_group, ts).await,
+        LiveAction::DeleteConv { item, client_id } => {
+            api.delete_conversation(&item, client_id).await
+        }
+        LiveAction::RemoveFriend { uid } => api.remove_friend(&uid).await,
+        LiveAction::UpdateAlias { uid, alias } => {
+            if alias.trim().is_empty() {
+                api.remove_alias(&uid).await
+            } else {
+                api.update_alias(&uid, alias.trim()).await
+            }
+        }
+        LiveAction::ReportAbuse {
+            target_id,
+            is_group,
+            reason,
+            content,
+        } => {
+            api.report_abuse(&target_id, is_group, reason, &content)
+                .await
+        }
+        LiveAction::PinBoard {
+            thread_id,
+            topic_id,
+            item_type,
+        } => api.pin_board_item(&thread_id, &topic_id, item_type).await,
+        LiveAction::UnpinBoard {
+            thread_id,
+            topic_id,
+            board_version,
+        } => {
+            api.unpin_board_item(&thread_id, &topic_id, board_version)
+                .await
+        }
+        LiveAction::VotePoll {
+            poll_id,
+            option_ids,
+        } => api.vote_poll(poll_id, &option_ids).await,
+        LiveAction::Logout => api.logout().await,
+    }
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+static REPORTER: std::sync::Mutex<Option<futures::channel::mpsc::UnboundedSender<String>>> =
+    std::sync::Mutex::new(None);
+
+/// The view that shows bridge outcomes (errors, file sent).
+pub fn set_reporter(tx: futures::channel::mpsc::UnboundedSender<String>) {
+    if let Ok(mut r) = REPORTER.lock() {
+        *r = Some(tx);
+    }
+}
+
+fn report(text: String) {
+    if let Ok(r) = REPORTER.lock() {
+        if let Some(tx) = r.as_ref() {
+            let _ = tx.unbounded_send(text);
+        }
+    }
+}
+
+/// First line, without HTML bodies.
+fn short(err: &str) -> String {
+    let line = err.lines().next().unwrap_or(err);
+    let cut = line.find('<').unwrap_or(line.len());
+    line[..cut].chars().take(160).collect()
+}
+
+/// Run one read/write call with a fresh client (session + `getLoginInfo`,
+/// like zalo-gui's `spawn_api`). Blocking: background executor only.
+///
+/// # Errors
+///
+/// Returns a short message without a session or when `job` fails.
+pub fn block_api<T, F, Fut>(dir: &std::path::Path, job: F) -> Result<T, String>
+where
+    F: FnOnce(ZaloApi) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let session = StoredSession::load(dir).map_err(|e| e.to_string())?;
+    let Some(sek) = session.zpw_sek() else {
+        return Err("chưa đăng nhập".into());
+    };
+    if !dir.join("device.json").is_file() {
+        return Err("chưa đăng nhập".into());
+    }
+    let device = Device::load_or_create(dir).map_err(|e| e.to_string())?;
+    let mut api = ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    rt.block_on(async move {
+        ensure_service_hosts(&mut api, dir, &sek, false).await?;
+        job(api).await
+    })
+    .map_err(|e| short(&e))
+}
+
+/// `/api/convlabel/get` on a user click (opening "Labels"). Blocking:
+/// run it on a background executor.
+///
+/// # Errors
+///
+/// Returns a short message when there is no usable session or the call fails.
+pub fn fetch_labels(dir: &std::path::Path) -> Result<Vec<zalo_client::ConversationLabel>, String> {
+    let session = StoredSession::load(dir).map_err(|e| e.to_string())?;
+    let Some(sek) = session.zpw_sek() else {
+        return Err("session has no zpw_sek".into());
+    };
+    if !dir.join("device.json").is_file() {
+        return Err("no device.json".into());
+    }
+    let device = Device::load_or_create(dir).map_err(|e| e.to_string())?;
+    let mut api = ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let value = rt
+        .block_on(async move {
+            ensure_service_hosts(&mut api, dir, &sek, false)
+                .await
+                .map_err(|e| e)?;
+            api.get_labels().await.map_err(|e| e.to_string())
+        })?;
+    if std::env::var_os("ZALO_GPUI_DEBUG_LABELS").is_some() {
+        eprintln!("zalo-gpui labels raw: {value}");
+    }
+    Ok(zalo_client::ConversationLabel::list_from(&value))
+}
+
+/// Maps a [`crate::media::MsgKind`] to Zalo's numeric reaction `msgType`.
+#[must_use]
+pub fn msg_type_for(kind: crate::media::MsgKind) -> i64 {
+    match kind {
+        crate::media::MsgKind::Voice => MSG_VOICE,
+        crate::media::MsgKind::File => MSG_FILE,
+        _ => MSG_TEXT,
+    }
+}
+
+/// `clientId` from unix milliseconds.
+#[must_use]
+pub fn client_id() -> u64 {
+    crate::data::now_ms().max(1) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_mute_constants_match_ops() {
+        assert_eq!(PIN_ADD, 1);
+        assert_eq!(PIN_REMOVE, 2);
+        assert_eq!(SET_MUTE, 1);
+        assert_eq!(UNSET_MUTE, 3);
+        assert_eq!(ARCHIVE_ADD, 0);
+        assert_eq!(ARCHIVE_REMOVE, 1);
+        assert_eq!(MSG_TEXT, 1);
+        assert!(!live_allowed("preview:1"));
+        assert!(live_allowed("g_1"));
+    }
+
+    #[test]
+    fn spawn_live_drops_preview_without_thread() {
+        spawn_live(
+            LiveAction::Send {
+                thread_id: "preview:1".into(),
+                is_group: false,
+                text: "no".into(),
+                quote: None,
+                urgency: 0,
+                client_id: 1,
+            },
+            PathBuf::from("/tmp/zalo-gpui-no-session"),
+        );
+        spawn_live(
+            LiveAction::Block { uid: "1".into() },
+            PathBuf::from("/tmp/zalo-gpui-no-session"),
+        );
+    }
+}

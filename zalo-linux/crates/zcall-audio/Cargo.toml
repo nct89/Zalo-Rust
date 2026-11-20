@@ -1,0 +1,17 @@
+[package]
+name = "zcall-audio"
+description = "Audio capture/playout for the Rust Zalo call engine (parec/pacat subprocesses)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libpulse-binding = "2.29"
+libpulse-simple-binding = "2.29"
+sonora = "0.3"
+zcall-core = { path = "../zcall-core" }

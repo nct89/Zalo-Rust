@@ -1,0 +1,15 @@
+[package]
+name = "zimage"
+description = "Thumbnail resize for the Rust client (Lanczos3, JPEG quality 85 or PNG)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+thiserror.workspace = true

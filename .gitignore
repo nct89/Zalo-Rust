@@ -1,0 +1,28 @@
+# Rust build artifacts
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Packaging outputs
+dist/
+*.deb
+*.rpm
+*.AppImage
+*.tar.zst
+
+# Local environment, secrets & runtime session data
+.env
+*.env
+session.json
+store.db
+store.db-*
+*.log
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

@@ -1,0 +1,29 @@
+# Maintainer: Zalo-Rust contributors
+pkgname=zalo-linux
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native Rust Zalo Desktop client (GPUI) with SNI, DBusMenu, and XEmbed tray fallback"
+arch=('x86_64' 'aarch64')
+url="https://github.com/nct89/Zalo-Rust"
+license=('MIT')
+makedepends=('cargo')
+optdepends=(
+  'gnome-shell-extension-appindicator: system tray icon on GNOME Wayland'
+  'xdg-desktop-portal: background apps & file/screenshot integration'
+)
+
+build() {
+  cd "${startdir}/../.."
+  cargo build --release -p zalo-gpui --features tray-xembed
+}
+
+package() {
+  cd "${startdir}/../.."
+  local target_dir
+  target_dir="${CARGO_TARGET_DIR:-target}"
+  install -Dm755 "${target_dir}/release/zalo-gpui" "${pkgdir}/usr/bin/zalo-gpui"
+  strip --strip-all "${pkgdir}/usr/bin/zalo-gpui" || true
+  bash packaging/linux/stage-runtime-assets.sh "${pkgdir}/usr/share/zalo-rust"
+  install -Dm644 packaging/linux/zalo-gpui.desktop "${pkgdir}/usr/share/applications/zalo-gpui.desktop"
+  install -Dm644 crates/zalo-shell/assets/zalo-256.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/zalo-gpui.png"
+}

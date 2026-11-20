@@ -1,0 +1,38 @@
+app-id: io.github.nct89.ZaloLinux
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: zalo-gpui
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --device=all
+  - --socket=pulseaudio
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=org.kde.StatusNotifierItem-*
+  - --talk-name=org.freedesktop.Notifications
+  - --talk-name=com.canonical.Unity
+  - --talk-name=org.freedesktop.portal.Background
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --filesystem=xdg-download
+modules:
+  - name: zalo-linux
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+    build-commands:
+      - cargo build --release --offline -p zalo-gpui --features tray-xembed
+      - install -Dm755 target/release/zalo-gpui /app/bin/zalo-gpui
+      - bash packaging/linux/stage-runtime-assets.sh /app/share/zalo-rust
+      - install -Dm644 packaging/linux/zalo-gpui.desktop /app/share/applications/io.github.nct89.ZaloLinux.desktop
+      - sed -i 's|^Exec=.*|Exec=zalo-gpui|' /app/share/applications/io.github.nct89.ZaloLinux.desktop
+      - sed -i 's|^Icon=.*|Icon=io.github.nct89.ZaloLinux|' /app/share/applications/io.github.nct89.ZaloLinux.desktop
+      - install -Dm644 crates/zalo-shell/assets/zalo-256.png /app/share/icons/hicolor/256x256/apps/io.github.nct89.ZaloLinux.png
+    sources:
+      - type: dir
+        path: ../..

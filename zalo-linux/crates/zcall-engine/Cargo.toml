@@ -1,0 +1,21 @@
+[package]
+name = "zcall-engine"
+description = "Native call engine entry: connects to Zalo's call-v2 TCP sockets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "zcall-native"
+path = "src/main.rs"
+
+[dependencies]
+zalo-protocol = { path = "../zalo-protocol" }
+zcall-audio = { path = "../zcall-audio" }
+zcall-core = { path = "../zcall-core" }
+serde_json.workspace = true

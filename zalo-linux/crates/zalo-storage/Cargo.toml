@@ -1,0 +1,19 @@
+[package]
+name = "zalo-storage"
+description = "ZDB4 backup decryption and the local SQLite store for threads, messages and users"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes.workspace = true
+cbc.workspace = true
+cipher.workspace = true
+lzma-rs = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror.workspace = true
