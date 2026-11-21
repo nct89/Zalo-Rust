@@ -585,6 +585,8 @@ impl ShellView {
                         }),
                 )
         };
+        let sync_enabled = self.sync_ui.config.is_enabled_for(zalo_sync::SyncSource::Manual);
+        let backup_enabled = self.backup_ui.config.enabled;
         div()
             .id("setting-sync")
             .relative()
@@ -602,8 +604,46 @@ impl ShellView {
                     .text_size(px(16.))
                     .line_height(px(22.))
                     .font_family(FAMILY_SEMIBOLD)
-                    .child("Chọn phương thức:"),
+                    .child(str_vi("STR_SELECT_METHOD_SETTING", "Chọn phương thức:")),
             )
+            .when(sync_enabled, |el| {
+                el.child(
+                    card(
+                        "sync-phone-to-pc",
+                        sync_art_phone_to_pc(blue),
+                        str_vi("STR_PROFILE_SYNC_MESSAGES", "Đồng bộ tin nhắn"),
+                        str_vi(
+                            "STR_SYNC_METHOD_SETTING_DESC",
+                            "Đồng bộ tin nhắn từ điện thoại sang máy tính này",
+                        )
+                        .to_owned(),
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_open = false;
+                        this.start_manual_sync(cx);
+                    })),
+                )
+            })
+            .when(backup_enabled, |el| {
+                el.child(
+                    card(
+                        "backup-pc-to-phone",
+                        sync_art_pc_to_phone(blue),
+                        str_vi("STR_BACKUP_METHOD_SETTING_TITLE", "Sao lưu tin nhắn"),
+                        str_vi(
+                            "STR_BACKUP_METHOD_SETTING_DESC",
+                            "Sao lưu tin nhắn từ máy tính này sang điện thoại",
+                        )
+                        .to_owned(),
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.settings_open = false;
+                        this.open_backup_popup(cx);
+                    })),
+                )
+            })
             .child(
                 card(
                     "sync-pc-export",
@@ -1278,6 +1318,19 @@ impl ShellView {
                     "tl" | "tr" | "bl" | "br" | "custom" => p.str("notifyCorner", "tr"),
                     _ => "tr".to_owned(),
                 };
+                let duration_secs = p
+                    .json("notifyDuration")
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+                    .unwrap_or(crate::notice::DEFAULT_DURATION_SECS);
+                let duration_key = match duration_secs {
+                    3 => "3",
+                    10 => "10",
+                    15 => "15",
+                    _ => "5",
+                };
                 vec![
                     sec(
                         "Cài đặt thông báo",
@@ -1288,6 +1341,16 @@ impl ShellView {
                         "Âm thanh thông báo",
                         None,
                         vec![toggle("notifySound", true, "Phát âm thanh khi có tin nhắn & thông báo mới", None)],
+                    ),
+                    sec(
+                        "Thời gian hiển thị thông báo",
+                        Some("Tự đóng sau khi thanh tiến trình đếm ngược chạy hết (rê chuột lên thẻ để tạm dừng)."),
+                        vec![
+                            radio("notifyDuration", "3", duration_key, "3 giây"),
+                            radio("notifyDuration", "5", duration_key, "5 giây (mặc định)"),
+                            radio("notifyDuration", "10", duration_key, "10 giây"),
+                            radio("notifyDuration", "15", duration_key, "15 giây"),
+                        ],
                     ),
                     sec(
                         "Vị trí hiển thị thông báo",
@@ -1653,6 +1716,14 @@ impl ShellView {
                         .set(key, serde_json::Value::String("none".into()));
                 }
             }
+            "notifyDuration" => {
+                let secs = value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    .unwrap_or(crate::notice::DEFAULT_DURATION_SECS);
+                let clamped = crate::notice::clamp_duration_secs(secs);
+                self.prefs.set(key, serde_json::json!(clamped));
+            }
             "notifyCorner" => {
                 let corner = match value.as_str() {
                     Some(corner @ ("tl" | "tr" | "bl" | "br" | "custom")) => corner.to_owned(),
@@ -1863,11 +1934,14 @@ impl ShellView {
                 Err(err) => self.set_note(err.to_string()),
             },
             SAction::PreviewNotice => {
+                self.notice_thread = None;
                 self.show_msg_notice(
                     "Thông báo mẫu".into(),
                     "Kéo thẻ này để đặt vị trí trên màn hình.".into(),
                     "Z".into(),
+                    0x0068ff,
                     None,
+                    Vec::new(),
                 );
             }
         }
@@ -2734,6 +2808,53 @@ fn sync_monitor(blue: u32, mark: &'static str) -> gpui::AnyElement {
         )
         .child(div().mt(px(2.)).w(px(16.)).h(px(2.)).bg(rgb(blue)))
         .child(div().w(px(24.)).h(px(2.)).bg(rgb(blue)))
+        .into_any_element()
+}
+
+fn sync_phone(blue: u32) -> gpui::AnyElement {
+    div()
+        .w(px(22.))
+        .h(px(34.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(rgb(blue))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_between()
+        .py(px(3.))
+        .child(div().w(px(8.)).h(px(2.)).rounded(px(1.)).bg(rgb(blue)))
+        .child(div().w(px(4.)).h(px(4.)).rounded(px(2.)).bg(rgb(blue)))
+        .into_any_element()
+}
+
+/// Phone → PC icon for Sync 2.
+fn sync_art_phone_to_pc(blue: u32) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(10.))
+        .h(px(40.))
+        .child(sync_phone(blue))
+        .child(sync_dash(blue))
+        .child(sync_monitor(blue, ""))
+        .into_any_element()
+}
+
+/// PC → Phone icon for Message Backup.
+fn sync_art_pc_to_phone(blue: u32) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(10.))
+        .h(px(40.))
+        .child(sync_monitor(blue, ""))
+        .child(sync_dash(blue))
+        .child(sync_phone(blue))
         .into_any_element()
 }
 

@@ -121,6 +121,9 @@ pub struct LoginInfo {
     /// Every service of `zpw_service_map_v3` with its hosts, keyed like the
     /// domain enum of Zalo PC (`chat`, `group`, `label`, …).
     pub service_hosts: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-account `settings` (or `setttings`) object returned by `getLoginInfo`
+    /// (`authen-info-config` in Electron, containing `features.*` overrides).
+    pub settings: Option<Value>,
 }
 
 /// One sticker: what `/api/message/sticker` needs and the image to show.
@@ -736,6 +739,10 @@ impl LoginInfo {
                     .collect()
             })
             .unwrap_or_default();
+        let settings = data
+            .get("settings")
+            .or_else(|| data.get("setttings"))
+            .cloned();
         Ok(Self {
             uin,
             zpw_enk,
@@ -752,6 +759,7 @@ impl LoginInfo {
             label_host,
             group_cloud_host,
             service_hosts,
+            settings,
         })
     }
 }
@@ -869,13 +877,36 @@ impl ZaloApi {
         self.zpw_sek.as_deref()
     }
 
-    /// Calls /api/login/getServerInfo.
+    /// Native Zalo PC client type matching Electron's `iqBP.getClientType()`:
+    /// `24` on Windows, `23` on macOS and Linux.
+    #[must_use]
+    pub const fn pc_api_type() -> u32 {
+        if cfg!(windows) {
+            24
+        } else {
+            23
+        }
+    }
+
+    /// Calls /api/login/getServerInfo using the active [`api_type()`].
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] on transport, JSON, signature or Zalo errors.
     pub async fn get_server_info(&self) -> Result<Value, ClientError> {
+        self.get_server_info_for_type(api_type()).await
+    }
+
+    /// Calls /api/login/getServerInfo with an explicit `type` parameter
+    /// (for example [`Self::pc_api_type()`] to obtain PC-only feature flags such as
+    /// `sync_2_pc` and `backup_msg` when the session uses Web `type=30`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, JSON, signature or Zalo errors.
+    pub async fn get_server_info_for_type(&self, client_type: u32) -> Result<Value, ClientError> {
         let mut params = self.base_params();
+        params.insert("type".to_owned(), client_type.to_string());
         params.insert("sp_mtn".to_owned(), "-1".to_owned());
         params.insert("bkt".to_owned(), "-1".to_owned());
         params.insert("signkey".to_owned(), sign_key_map("getserverinfo", &params));
@@ -1865,6 +1896,70 @@ impl ZaloApi {
             .await
     }
 
+    /// Newest "My Documents" (`send2me_id`, formerly "My Cloud") messages from Zalo's
+    /// cloud message host (`/api/cm/getrecentv2` with `isOA: 1` and `MAX_MSG_ID`, matching
+    /// Electron `getCM` / `loadToOldest`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn get_my_cloud_recent(
+        &self,
+        send2me_id: &str,
+        before_msg_id: Option<&str>,
+        count: u32,
+    ) -> Result<Value, ClientError> {
+        let global_id = before_msg_id
+            .filter(|s| !s.is_empty() && *s != "0")
+            .unwrap_or("9223372036854775808");
+        self.my_cloud_cm(send2me_id, global_id, count, "/api/cm/getrecentv2")
+            .await
+    }
+
+    /// Older "My Documents" (`send2me_id`) messages before `before_msg_id`
+    /// (`/api/cm/getoldv2` with `isOA: 1`, matching Electron `getCM`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn get_my_cloud_older(
+        &self,
+        send2me_id: &str,
+        before_msg_id: &str,
+        count: u32,
+    ) -> Result<Value, ClientError> {
+        let global_id = if before_msg_id.is_empty() || before_msg_id == "0" {
+            "9223372036854775808"
+        } else {
+            before_msg_id
+        };
+        self.my_cloud_cm(send2me_id, global_id, count, "/api/cm/getoldv2")
+            .await
+    }
+
+    async fn my_cloud_cm(
+        &self,
+        send2me_id: &str,
+        global_msg_id: &str,
+        count: u32,
+        path: &str,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .group_cloud_host
+            .as_deref()
+            .unwrap_or("https://tt-group-cm.chat.zalo.me");
+        let payload = serde_json::json!({
+            "groupId": send2me_id,
+            "globalMsgId": global_msg_id,
+            "count": count,
+            "msgIds": [],
+            "imei": self.device.imei,
+            "isOA": 1,
+            "src": -1,
+        });
+        self.get_encrypted_cm(host, path, &payload).await
+    }
+
     async fn group_cloud(
         &self,
         group_id: &str,
@@ -1876,21 +1971,44 @@ impl ZaloApi {
             .group_cloud_host
             .clone()
             .ok_or_else(|| ClientError::Unexpected("no group_cloud_message host".to_owned()))?;
-        // Zalo compares ids as numbers; "newest" is a very large id.
-        let global: u64 = before_msg_id
-            .parse()
-            .ok()
-            .filter(|id| *id > 0)
-            .unwrap_or(10_000_000_000_000_000);
+        let global_id = if before_msg_id.is_empty() || before_msg_id == "0" {
+            "9223372036854775808"
+        } else {
+            before_msg_id
+        };
         let payload = serde_json::json!({
             "groupId": group_id.trim_start_matches("g_"),
-            "globalMsgId": global,
+            "globalMsgId": global_id,
             "count": count,
             "msgIds": [],
             "imei": self.device.imei,
-            "src": 1,
+            "src": -1,
         });
-        self.get_encrypted(&host, path, &payload).await
+        self.get_encrypted_cm(&host, path, &payload).await
+    }
+
+    /// Calls `group_cloud_message` (`/api/cm/getrecentv2`, `/api/cm/getoldv2`),
+    /// which requires `nretry=0` in the query string (without it, Zalo returns
+    /// error `604`) and wraps its decrypted `data` field as a JSON-encoded string.
+    async fn get_encrypted_cm(
+        &self,
+        host: &str,
+        path: &str,
+        payload: &Value,
+    ) -> Result<Value, ClientError> {
+        let mut params = self.common_params();
+        params.insert("nretry".to_owned(), "0".to_owned());
+        params.insert("params".to_owned(), self.encode_params(payload)?);
+        let (status, body) = self.get_text(format!("{host}{path}"), &params).await?;
+        if !status.is_success() {
+            return Err(ClientError::Unexpected(format!(
+                "{path} HTTP {status}: {body}"
+            )));
+        }
+        let value: Value = serde_json::from_str(&body)?;
+        ensure_success(&value)?;
+        let decoded = self.decrypt_data(&value)?;
+        Ok(unwrap_string_json_data(decoded))
     }
 
     /// Tells Zalo the newest message of a conversation was read here
@@ -3513,6 +3631,151 @@ impl ZaloApi {
         Ok((status, body))
     }
 
+    /// Resolves PC noised 1-1 user IDs to cross-platform global noise IDs
+    /// (`GET {profile}/api/gid/encrypt`, Electron `getGlobalNoiseId`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn get_global_noise_ids(&self, uids: &[String]) -> Result<Value, ClientError> {
+        let host = self
+            .profile_host
+            .as_deref()
+            .or(self.friend_host.as_deref())
+            .unwrap_or("https://tt-profile-wpa.zaloapp.com");
+        let url = format!("{host}/api/gid/encrypt");
+        let mut params = self.common_params();
+        let payload = serde_json::json!({ "noiseUids": uids });
+        params.insert("params".to_owned(), self.encode_params(&payload)?);
+        let (status, body) = self.get_text(url, &params).await?;
+        if !status.is_success() {
+            return Err(ClientError::Unexpected(format!(
+                "gid/encrypt HTTP {status}: {body}"
+            )));
+        }
+        let value: Value = serde_json::from_str(&body)?;
+        ensure_success(&value)?;
+        self.decrypt_data(&value)
+    }
+
+    /// Resolves cross-platform global noise IDs back to PC noised 1-1 user IDs
+    /// (`GET {profile}/api/gid/decrypt`, Electron `getUidFromGlobalNoiseId`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn get_uids_from_global_noise_ids(
+        &self,
+        global_uids: &[String],
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .profile_host
+            .as_deref()
+            .or(self.friend_host.as_deref())
+            .unwrap_or("https://tt-profile-wpa.zaloapp.com");
+        let url = format!("{host}/api/gid/decrypt");
+        let mut params = self.common_params();
+        let serialized_list = serde_json::to_string(global_uids)?;
+        let payload = serde_json::json!({ "globalUids": serialized_list });
+        params.insert("params".to_owned(), self.encode_params(&payload)?);
+        let (status, body) = self.get_text(url, &params).await?;
+        if !status.is_success() {
+            return Err(ClientError::Unexpected(format!(
+                "gid/decrypt HTTP {status}: {body}"
+            )));
+        }
+        let value: Value = serde_json::from_str(&body)?;
+        ensure_success(&value)?;
+        self.decrypt_data(&value)
+    }
+
+    /// Returns the PC → Mobile backup upload host (`zpw_service_map_v3["backuppcmobile"]`,
+    /// fallback `https://bkpc2mb.zaloapp.com`, matching Electron `getBackupPcMobileDomain`).
+    #[must_use]
+    pub fn backup_pc_mobile_host(&self) -> String {
+        self.service_hosts
+            .get("backuppcmobile")
+            .and_then(|hosts| hosts.first())
+            .cloned()
+            .unwrap_or_else(|| "https://bkpc2mb.zaloapp.com".to_owned())
+    }
+
+    /// Uploads one chunk of a PC → Mobile message backup (`POST /api/backuppc2mb/upload`,
+    /// Electron `uploadBackupChunk`, 60s timeout).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, timeout, HTTP, or Zalo server errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_backup_chunk(
+        &self,
+        bkid: &str,
+        chunk_id: u32,
+        total_chunks: u32,
+        is_last: bool,
+        file_size: u64,
+        bytes: Vec<u8>,
+    ) -> Result<Value, ClientError> {
+        let host = self.backup_pc_mobile_host();
+        let url = format!("{host}/api/backuppc2mb/upload");
+        let query = self.common_params();
+        let batch_data = serde_json::to_string(&serde_json::json!({
+            "last": if is_last { 1 } else { 0 },
+            "chunk_id": chunk_id,
+            "total_chunk": total_chunks,
+            "size": file_size,
+        }))?;
+        let param_enc = self.encode_params(&serde_json::json!({
+            "bkid": bkid,
+            "batch_data": batch_data,
+        }))?;
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name("backup_chunk")
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new()
+            .text("param", param_enc)
+            .part("file_data", part);
+        let response = self
+            .http
+            .post(url)
+            .query(&query)
+            .timeout(Duration::from_secs(60))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(ClientError::Unexpected(format!(
+                "backuppc2mb/upload HTTP {status}: {body}"
+            )));
+        }
+        let value: Value = serde_json::from_str(&body)?;
+        ensure_success(&value)?;
+        self.decrypt_data(&value)
+    }
+
+    /// Downloads one framed Sync 2 batch blob (`msgUrl` from `upload_batch`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, timeout, or non-2xx HTTP status.
+    pub async fn download_sync_batch(&self, url: &str) -> Result<Vec<u8>, ClientError> {
+        let response = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ClientError::Unexpected(format!(
+                "sync batch download HTTP {status}"
+            )));
+        }
+        Ok(response.bytes().await?.to_vec())
+    }
+
     async fn post_form(
         &self,
         url: String,
@@ -4039,4 +4302,31 @@ mod tests {
             Some("sek.abc")
         );
     }
+
+    #[test]
+    fn unwrap_string_json_data_parses_cm_payload() {
+        let raw = json!({
+            "error_code": 0,
+            "error_message": "Successful.",
+            "data": "{\"groupMsgs\":[{\"msgId\":\"123\"}],\"hasMore\":1,\"isOld\":0,\"lastMsgId\":\"123\"}"
+        });
+        let unwrapped = unwrap_string_json_data(raw);
+        assert_eq!(unwrapped["data"]["hasMore"], json!(1));
+        assert_eq!(unwrapped["data"]["lastMsgId"], json!("123"));
+        assert_eq!(
+            unwrapped["data"]["groupMsgs"].as_array().map(|a| a.len()),
+            Some(1)
+        );
+    }
+}
+
+fn unwrap_string_json_data(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(Value::String(s)) = obj.get("data") {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                obj.insert("data".to_owned(), parsed);
+            }
+        }
+    }
+    value
 }

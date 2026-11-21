@@ -736,6 +736,28 @@ fn load_from_disk() -> Option<Snapshot> {
     snap.send2me_id = session.send2me_id.clone();
     snap.has_session = true;
     snap.session_dir = Some(dir.clone());
+    if let Some(sid) = snap.send2me_id.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(existing) = snap.convs.iter_mut().find(|c| c.thread_id == sid) {
+            existing.name = "My Documents".to_owned();
+        } else {
+            snap.convs.push(ChatConv {
+                id: hash_id(sid),
+                thread_id: sid.to_owned(),
+                name: "My Documents".to_owned(),
+                preview: String::new(),
+                time: String::new(),
+                unread: 0,
+                is_group: false,
+                online: false,
+                live: true,
+            });
+        }
+    }
+    for conv in &mut snap.convs {
+        if conv.name == "Cloud của tôi" || conv.name == "My Cloud" {
+            conv.name = "My Documents".to_owned();
+        }
+    }
     if let Some(uin) = session.uin.as_deref() {
         merge_index_friends(&mut snap, uin);
     }

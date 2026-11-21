@@ -37,6 +37,22 @@ impl LoginView {
             window.refresh();
         })
         .detach();
+        if !cfg!(test) {
+            let weak = cx.weak_entity();
+            window
+                .spawn(cx, async move |cx| {
+                    for delay_ms in [50u64, 180, 400] {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(delay_ms))
+                            .await;
+                        let _ = weak.update_in(cx, |_, window, cx| {
+                            window.refresh();
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+        }
         let live = !cfg!(test) && std::env::var_os("ZALO_GPUI_LOGIN_PREVIEW").is_none();
         let mut view = Self {
             qr: if live {

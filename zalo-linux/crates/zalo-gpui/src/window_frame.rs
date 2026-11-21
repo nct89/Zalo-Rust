@@ -141,19 +141,49 @@ pub fn wrap_csd(window: &mut Window, content: impl IntoElement) -> gpui::AnyElem
     // XFCE (and any WM without `_GTK_FRAME_EXTENTS`) would keep a square
     // server frame. Drop the OS frame here; the ARGB buffer rounds the
     // corners. Wayland returns immediately.
-    crate::x11_frame::sync(window.scale_factor());
+    let vp = window.viewport_size();
+    let frame_changed = crate::x11_frame::sync_window(
+        f32::from(vp.width).round() as i32,
+        f32::from(vp.height).round() as i32,
+        window.is_maximized(),
+        window.scale_factor(),
+    );
+    if frame_changed {
+        window.refresh();
+    }
     let composited = crate::x11_frame::is_composited();
     let corners = CsdCorners::from_window(window);
     let paper = token_rgb("--layer-background", "#ffffff");
     let show_hairline = !window.is_maximized() && !window.is_fullscreen();
-    // No shadow gutter. On Wayland that inset stays an opaque light band:
-    // white around a dark window, grey around a light one.
-    window.set_client_inset(px(0.));
-    window.set_background_appearance(if composited {
-        WindowBackgroundAppearance::Transparent
-    } else {
-        WindowBackgroundAppearance::Opaque
-    });
+    // Apply client inset and background appearance once per window (and again
+    // if compositing state changes, or right after `_MOTIF_WM_HINTS` strips a
+    // server frame so Blade/Vulkan reconfigures its swapchain onto xfwm4's
+    // newly redirected XComposite pixmap instead of staying black).
+    {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static APPLIED: OnceLock<Mutex<HashMap<gpui::WindowId, bool>>> = OnceLock::new();
+        let wid = window.window_handle().window_id();
+        let prev = APPLIED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .ok()
+            .and_then(|mut map| map.insert(wid, composited));
+        if prev.is_none() {
+            window.set_client_inset(px(0.));
+        }
+        if frame_changed && composited {
+            window.set_background_appearance(WindowBackgroundAppearance::Opaque);
+            window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+            window.refresh();
+        } else if prev != Some(composited) {
+            window.set_background_appearance(if composited {
+                WindowBackgroundAppearance::Transparent
+            } else {
+                WindowBackgroundAppearance::Opaque
+            });
+        }
+    }
 
     // On composited desktops keep `#window-chrome` transparent so corner
     // widgets (e.g. blue `#main-tab` rail) anti-alias directly against the

@@ -1,0 +1,23 @@
+[package]
+name = "zalo-backup"
+description = "Zalo PC message backup (PC-to-phone: socket 630-634, /api/backuppc2mb/upload, libzproto_backup_wasm_bg, protobuf SyncChunk, guards and pipeline)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version = "1.86"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio.workspace = true
+wasmi = { version = "1", default-features = false, features = ["std"] }
+zstd = "0.13"

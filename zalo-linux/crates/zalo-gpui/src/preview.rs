@@ -53,7 +53,7 @@ pub const PREVIEW: &[PreviewConv] = &[
     },
     PreviewConv {
         id: 4,
-        name: "Cloud của tôi",
+        name: "My Documents",
         preview: "Ảnh đã lưu",
         time: "T2",
         unread: 0,
@@ -62,11 +62,11 @@ pub const PREVIEW: &[PreviewConv] = &[
     },
 ];
 
-/// Id of the "My Cloud" preview row.
+/// Id of the "My Documents" preview row.
 pub fn cloud_of_mine_id() -> u64 {
     PREVIEW
         .iter()
-        .find(|row| row.name == "Cloud của tôi")
+        .find(|row| row.name == "My Documents")
         .map(|row| row.id)
         .unwrap_or(4)
 }

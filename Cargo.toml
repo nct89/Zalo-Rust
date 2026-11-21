@@ -13,6 +13,8 @@ zalo-protocol = { path = "core/zalo-protocol" }
 zalo-client = { path = "core/zalo-client" }
 zalo-storage = { path = "core/zalo-storage" }
 zalo-design = { path = "core/zalo-design" }
+zalo-sync = { path = "core/zalo-sync" }
+zalo-backup = { path = "core/zalo-backup" }
 zcall-core = { path = "core/zcall-core" }
 zimage = { path = "core/zimage" }
 zjxl = { path = "core/zjxl" }

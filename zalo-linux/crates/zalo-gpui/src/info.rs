@@ -778,7 +778,11 @@ impl ShellView {
                                         div()
                                             .text_size(px(18.))
                                             .font_family(FAMILY_SEMIBOLD)
-                                            .child(conv.name.clone()),
+                                            .child(if cloud {
+                                                "My Documents".to_owned()
+                                            } else {
+                                                conv.name.clone()
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -1877,53 +1881,69 @@ impl ShellView {
         let thread = conv.thread_id.clone();
         let muted = token_rgb("--text-secondary", "#5a6981");
         let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
-        let msgs = self.messages_of(id);
-        let local_photos: Vec<_> = msgs
-            .iter()
-            .rev()
-            .filter(|m| {
-                matches!(
-                    m.kind,
-                    crate::media::MsgKind::Photo
-                        | crate::media::MsgKind::Doodle
-                        | crate::media::MsgKind::Gif
-                        | crate::media::MsgKind::Video
-                )
-            })
-            .cloned()
-            .collect();
-        let local_files: Vec<_> = msgs
-            .iter()
-            .rev()
-            .filter(|m| m.kind == crate::media::MsgKind::File)
-            .cloned()
-            .collect();
-        let local_links: Vec<(String, String, i64)> = msgs
-            .iter()
-            .rev()
-            .filter_map(|m| {
-                let url = if !m.href.is_empty() {
-                    m.href.clone()
-                } else {
-                    crate::media::first_link(&m.text)?
-                };
-                Some((url.clone(), link_row_title(&m.text, &m.file_name, &url), m.at_ms))
-            })
-            .collect();
         let cloud_photos = self.cloud_photos(&thread);
         let cloud_files = self.cloud_files(&thread);
         let cloud_links = self.cloud_links(&thread);
-        let photo_count = if cloud_photos.is_empty() {
+        let need_photos = cloud_photos.is_empty();
+        let need_files = cloud_files.is_empty();
+        let need_links = cloud_links.is_empty();
+        let mut local_photos: Vec<crate::data::ChatMsg> = Vec::new();
+        let mut local_files: Vec<crate::data::ChatMsg> = Vec::new();
+        let mut local_links: Vec<(String, String, i64)> = Vec::new();
+        if need_photos || need_files || need_links {
+            // Single reverse pass capped to recent messages, stopping as soon as all
+            // visible preview slots (8 photos, 3 files, 3 links) are filled.
+            for m in self.messages_of(id).iter().rev().take(600) {
+                if need_photos
+                    && local_photos.len() < 8
+                    && matches!(
+                        m.kind,
+                        crate::media::MsgKind::Photo
+                            | crate::media::MsgKind::Doodle
+                            | crate::media::MsgKind::Gif
+                            | crate::media::MsgKind::Video
+                    )
+                {
+                    local_photos.push(m.clone());
+                }
+                if need_files
+                    && local_files.len() < 3
+                    && m.kind == crate::media::MsgKind::File
+                {
+                    local_files.push(m.clone());
+                }
+                if need_links && local_links.len() < 3 {
+                    let url = if !m.href.is_empty() {
+                        Some(m.href.clone())
+                    } else if m.text.contains("http") || m.text.contains("www.") || m.text.contains(".com") || m.text.contains(".vn") {
+                        crate::media::first_link(&m.text)
+                    } else {
+                        None
+                    };
+                    if let Some(url) = url {
+                        let title = link_row_title(&m.text, &m.file_name, &url);
+                        local_links.push((url, title, m.at_ms));
+                    }
+                }
+                if (!need_photos || local_photos.len() >= 8)
+                    && (!need_files || local_files.len() >= 3)
+                    && (!need_links || local_links.len() >= 3)
+                {
+                    break;
+                }
+            }
+        }
+        let photo_count = if need_photos {
             local_photos.len()
         } else {
             cloud_photos.len()
         };
-        let file_count = if cloud_files.is_empty() {
+        let file_count = if need_files {
             local_files.len()
         } else {
             cloud_files.len()
         };
-        let link_count = if cloud_links.is_empty() {
+        let link_count = if need_links {
             local_links.len()
         } else {
             cloud_links.len()

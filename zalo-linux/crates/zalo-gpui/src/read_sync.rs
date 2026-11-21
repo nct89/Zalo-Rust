@@ -379,25 +379,32 @@ pub const REACTION_PRESETS: &[(&str, &str, i64, &str)] = &[
     ("😠", ":-h", 20, "Phẫn nộ"),
 ];
 
+/// Maps Zalo's reaction icon / type to its index in [`REACTION_PRESETS`] (`0..6`):
+/// `0 = Like`, `1 = Heart`, `2 = Haha`, `3 = Wow`, `4 = Cry`, `5 = Angry`.
+#[must_use]
+pub fn reaction_preset_index(r_icon: &str, r_type: i64) -> usize {
+    match r_icon.trim() {
+        "/-strong" => 0,
+        "/-heart" => 1,
+        ":>" | ":)" => 2,
+        ":o" | ":-o" | ":-O" | ":O" => 3,
+        ":-(" | ":-((" | ":((" | ":(" => 4,
+        ":-h" | ":-H" | ":/" | ":-/" | ">:-(" => 5,
+        _ => match r_type {
+            5 => 1,
+            0 => 2,
+            32 | 1 => 3,
+            2 => 4,
+            20 | 4 => 5,
+            _ => 0,
+        },
+    }
+}
+
 /// Maps Zalo's reaction icon / type to a compact display emoji.
 #[must_use]
 pub fn reaction_emoji(r_icon: &str, r_type: i64) -> &'static str {
-    match r_icon.trim() {
-        "/-heart" => "❤️",
-        "/-strong" => "👍",
-        ":>" | ":)" => "😆",
-        ":o" | ":-o" | ":-O" | ":O" => "😮",
-        ":-(" | ":-((" | ":((" | ":(" => "😢",
-        ":-h" | ":-H" | ":/" | ":-/" | ">:-(" => "😠",
-        _ => match r_type {
-            5 => "❤️",
-            0 => "😆",
-            32 | 1 => "😮",
-            2 => "😢",
-            20 | 4 => "😠",
-            _ => "👍",
-        },
-    }
+    REACTION_PRESETS[reaction_preset_index(r_icon, r_type)].0
 }
 
 /// Normalizes thread ids returned by Zalo pin/archive APIs (`u123`, `g456`, `g_456`)
@@ -416,10 +423,12 @@ pub fn normalize_thread_id(raw: &str) -> Option<String> {
             return Some(format!("g_{rest}"));
         }
     }
-    if let Some(rest) = s.strip_prefix('u') {
-        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-            return Some(rest.to_owned());
-        }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1..].iter().all(u8::is_ascii_digit)
+    {
+        return Some(s[1..].to_owned());
     }
     Some(s.to_owned())
 }

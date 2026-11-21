@@ -30,15 +30,98 @@ pub struct OpenMenu {
     pub view_h: f32,
 }
 
-/// Floating multi-emoji reaction bar (`❤️ 👍 😆 😮 😢 😠`).
+/// Floating multi-emoji reaction bar (`👍 ❤️ 😆 😮 😢 😠`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactPicker {
     /// Target message.
     pub msg: ChatMsg,
-    /// Left coordinate inside the chrome.
+    /// Pill left coordinate inside the chrome.
     pub x: f32,
-    /// Top coordinate inside the chrome.
+    /// Pill top coordinate inside the chrome (pop-out headroom sits above this).
     pub y: f32,
+    /// Anchor cursor `(x, y)` inside the chrome where press-and-hold started.
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+    /// Pill width.
+    pub bar_w: f32,
+    /// Whether the current user already reacted (shows clear `✕` button).
+    pub has_my: bool,
+    /// True while left mouse button is still held from long-pressing the Like icon.
+    pub holding: bool,
+    /// Emoji index (`0..REACTION_PRESETS.len()`) currently hovered or slid over.
+    pub hovered_idx: Option<usize>,
+    /// True when the clear `✕` button is hovered or slid over.
+    pub hovered_clear: bool,
+    /// Continuous chrome X while pointer glides over the emoji slots (drives wave).
+    pub cursor_x: Option<f32>,
+    /// Smoothly interpolated per-emoji lift factor (`0.0..=1.0`) for the dock wave.
+    pub lifts: [f32; REACT_COUNT],
+    /// True while the 60 FPS wave interpolation task is active.
+    pub anim_running: bool,
+}
+
+const REACT_COUNT: usize = 6;
+const REACT_PAD_X: f32 = 10.0;
+const REACT_SLOT_W: f32 = 42.0;
+const REACT_SLOT_GAP: f32 = 4.0;
+const REACT_CLEAR_W: f32 = 28.0;
+const REACT_BAR_H: f32 = 44.0;
+const REACT_POP_HEADROOM: f32 = 34.0;
+const REACT_ICON_BASE: f32 = 28.0;
+const REACT_ICON_GAIN: f32 = 11.0;
+const REACT_LIFT_MAX: f32 = 7.0;
+
+fn react_slot_at(picker: &ReactPicker, cx_pos: f32, cy_pos: f32) -> (Option<usize>, bool) {
+    // Cover the pill plus the lifted emoji rim so moving directly onto a lifted
+    // emoji never drops hover. While press-holding, keep the anchor point below
+    // (or above when flipped) strictly outside the hit band so releasing in place
+    // leaves the bar open instead of misfiring a reaction.
+    let (top, bottom) = if !picker.holding {
+        (picker.y - 14.0, picker.y + REACT_BAR_H + 8.0)
+    } else if picker.y < picker.anchor_y {
+        (picker.y - 16.0, picker.y + REACT_BAR_H + 4.0)
+    } else {
+        (picker.y - 4.0, picker.y + REACT_BAR_H + 16.0)
+    };
+    if cy_pos < top || cy_pos > bottom {
+        return (None, false);
+    }
+    let count = crate::read_sync::REACTION_PRESETS.len();
+    let step = REACT_SLOT_W + REACT_SLOT_GAP;
+    let rel_x = cx_pos - (picker.x + REACT_PAD_X);
+    if rel_x >= -4.0 {
+        let slots_w = count as f32 * step - REACT_SLOT_GAP;
+        if rel_x <= slots_w + 4.0 {
+            let idx = ((rel_x.max(0.0)) / step).floor() as usize;
+            if idx < count {
+                return (Some(idx), false);
+            }
+        }
+        if picker.has_my {
+            let clear_left = slots_w + REACT_SLOT_GAP;
+            if rel_x >= clear_left - 2.0 && rel_x <= clear_left + REACT_CLEAR_W + 6.0 {
+                return (None, true);
+            }
+        }
+    }
+    (None, false)
+}
+
+/// Smooth Gaussian wave target (`0.0..=1.0`) for each emoji from continuous `cursor_x`.
+fn react_wave_targets(picker: &ReactPicker) -> [f32; REACT_COUNT] {
+    let mut targets = [0.0f32; REACT_COUNT];
+    let Some(cx) = picker.cursor_x else {
+        return targets;
+    };
+    let step = REACT_SLOT_W + REACT_SLOT_GAP;
+    let sigma = 0.78_f32;
+    for (idx, slot) in targets.iter_mut().enumerate() {
+        let center = picker.x + REACT_PAD_X + idx as f32 * step + REACT_SLOT_W * 0.5;
+        let dist_slots = (cx - center).abs() / step;
+        let v = (-0.5 * (dist_slots / sigma).powi(2)).exp();
+        *slot = if v > 0.01 { v } else { 0.0 };
+    }
+    targets
 }
 
 /// Place a `w × h` panel at the cursor like Zalo PC's popover: below-right,
@@ -320,7 +403,7 @@ impl ShellView {
         });
         self.sticker_open = false;
         self.forward_of = None;
-        self.react_picker = None;
+        self.close_react_picker();
         if matches!(
             self.menu.as_ref().map(|m| &m.kind),
             Some(MenuKind::Conv(_) | MenuKind::Filter | MenuKind::ContactFilter)
@@ -334,11 +417,14 @@ impl ShellView {
     }
 
     /// Opens the floating 6-emoji reaction picker above/near `pos`.
+    /// When `holding` is true (long-press on default Like), sliding over an emoji
+    /// pops it out and releasing sends that reaction immediately (Facebook style).
     pub(crate) fn open_react_picker(
         &mut self,
         msg: ChatMsg,
         pos: Point<Pixels>,
         window: &gpui::Window,
+        holding: bool,
     ) {
         let (raw_x, raw_y) = crate::window_frame::window_to_chrome(window, pos);
         let view = window.viewport_size();
@@ -350,123 +436,371 @@ impl ShellView {
         let view_w = f32::from(view.width) - csd;
         let view_h = f32::from(view.height) - csd;
         let has_my = self.my_reaction(msg.id).is_some();
-        let bar_w = if has_my { 256.0 } else { 222.0 };
-        let bar_h = 42.0;
+        let count = crate::read_sync::REACTION_PRESETS.len() as f32;
+        let bar_w = REACT_PAD_X * 2.0
+            + count * REACT_SLOT_W
+            + (count - 1.0) * REACT_SLOT_GAP
+            + if has_my {
+                REACT_SLOT_GAP + REACT_CLEAR_W
+            } else {
+                0.0
+            };
         let x = (raw_x - bar_w * 0.5).clamp(8.0, (view_w - bar_w - 8.0).max(8.0));
-        let y = if raw_y - bar_h - 10.0 >= 8.0 {
-            raw_y - bar_h - 10.0
+        let min_y = REACT_POP_HEADROOM + 6.0;
+        let y = if raw_y - REACT_BAR_H - 16.0 >= min_y {
+            raw_y - REACT_BAR_H - 16.0
         } else {
-            place(raw_y + 8.0, bar_h, view_h)
+            (raw_y + 18.0).clamp(min_y, (view_h - REACT_BAR_H - 8.0).max(min_y))
         };
         self.menu = None;
         self.forward_of = None;
         self.sticker_open = false;
-        self.react_picker = Some(ReactPicker { msg, x, y });
+        self.react_picker = Some(ReactPicker {
+            msg,
+            x,
+            y,
+            anchor_x: raw_x,
+            anchor_y: raw_y,
+            bar_w,
+            has_my,
+            holding,
+            hovered_idx: None,
+            hovered_clear: false,
+            cursor_x: None,
+            lifts: [0.0; REACT_COUNT],
+            anim_running: false,
+        });
     }
 
-    /// Floating 6-emoji reaction bar overlay (`👍 ❤️ 😆 😮 😢 😠`).
+    pub(crate) fn close_react_picker(&mut self) {
+        self.react_picker = None;
+        self.react_hold_msg = None;
+        self.react_hold_opened = false;
+        self.react_hold_gen = self.react_hold_gen.wrapping_add(1);
+    }
+
+    /// Drives smooth 60 FPS wave interpolation for the reaction picker until all
+    /// emoji lifts settle onto their target wave curve, then exits (0% idle CPU).
+    fn ensure_react_anim(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        let Some(p) = self.react_picker.as_mut() else {
+            return;
+        };
+        if p.anim_running {
+            return;
+        }
+        p.anim_running = true;
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let mut keep_going = false;
+                let res = weak.update(cx, |this, cx| {
+                    let Some(p) = this.react_picker.as_mut() else {
+                        return;
+                    };
+                    let targets = react_wave_targets(p);
+                    let mut changed = false;
+                    let mut remaining = false;
+                    for i in 0..REACT_COUNT {
+                        let diff = targets[i] - p.lifts[i];
+                        if diff.abs() <= 0.008 {
+                            if (p.lifts[i] - targets[i]).abs() > f32::EPSILON {
+                                p.lifts[i] = targets[i];
+                                changed = true;
+                            }
+                        } else {
+                            p.lifts[i] += diff * 0.30;
+                            changed = true;
+                            remaining = true;
+                        }
+                    }
+                    if !remaining {
+                        p.anim_running = false;
+                    }
+                    keep_going = remaining;
+                    if changed {
+                        cx.notify();
+                    }
+                });
+                if res.is_err() || !keep_going {
+                    break;
+                }
+            })
+            .detach();
+    }
+
+    /// Floating 6-emoji reaction bar overlay using official Zalo reaction icons.
+    /// Supports Facebook-style press-and-hold + slide-to-select as well as free
+    /// hover & click, with a smooth low-profile dock wave across emojis.
     pub(crate) fn react_picker_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(picker) = self.react_picker.clone() else {
             return div().into_any_element();
         };
+        let dark = crate::color::is_dark();
         let paper = token_rgb("--layer-background", "#ffffff");
         let active_bg = token_rgb("--B10", "#e5efff");
         let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let line = crate::color::border_subtle();
         let my_type = self.my_reaction(picker.msg.id).map(|r| r.r_type);
-        let clear_msg = picker.msg.clone();
+        let wrap_top = (picker.y - REACT_POP_HEADROOM).max(2.0);
+        let pill_offset = (picker.y - wrap_top).max(0.0);
+        let over_action = picker.hovered_idx.is_some() || picker.hovered_clear;
+
         div()
-            .id("react-picker-layer")
+            .id("react-picker-backdrop")
             .absolute()
-            .inset(px(0.))
-            .child(
-                div()
-                    .id("react-picker-dismiss")
-                    .absolute()
-                    .inset(px(0.))
-                    .occlude()
-                    .on_mouse_down(
-                        gpui::MouseButton::Right,
-                        cx.listener(|this, _, _, cx| {
-                            this.react_picker = None;
-                            cx.notify();
-                        }),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.react_picker = None;
-                        cx.notify();
-                    })),
+            .inset_0()
+            .occlude()
+            .when(over_action, |el| el.cursor_pointer())
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                    let Some(p) = this.react_picker.clone() else {
+                        return;
+                    };
+                    let (cx_pos, cy_pos) = crate::window_frame::window_to_chrome(window, e.position);
+                    let (hit_idx, hit_clear) = react_slot_at(&p, cx_pos, cy_pos);
+                    if let Some(idx) = hit_idx {
+                        if let Some(&(_, r_icon, r_type, _)) =
+                            crate::read_sync::REACTION_PRESETS.get(idx)
+                        {
+                            let already = this
+                                .my_reaction(p.msg.id)
+                                .is_some_and(|r| r.r_type == r_type);
+                            if already {
+                                this.apply_reaction(&p.msg, "", -1);
+                            } else {
+                                this.apply_reaction(&p.msg, r_icon, r_type);
+                            }
+                        }
+                        this.close_react_picker();
+                    } else if hit_clear {
+                        this.apply_reaction(&p.msg, "", -1);
+                        this.close_react_picker();
+                    } else {
+                        let inside_pill = cx_pos >= p.x
+                            && cx_pos <= p.x + p.bar_w
+                            && cy_pos >= p.y
+                            && cy_pos <= p.y + REACT_BAR_H;
+                        if !inside_pill {
+                            this.close_react_picker();
+                        }
+                    }
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.close_react_picker();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, window, cx| {
+                let (cx_pos, cy_pos) = crate::window_frame::window_to_chrome(window, e.position);
+                let mut need_anim = false;
+                let mut need_notify = false;
+                if let Some(p) = this.react_picker.as_mut() {
+                    let (next_idx, next_clear) = react_slot_at(p, cx_pos, cy_pos);
+                    let next_cursor_x = next_idx.map(|_| cx_pos);
+                    if p.hovered_idx != next_idx || p.hovered_clear != next_clear {
+                        p.hovered_idx = next_idx;
+                        p.hovered_clear = next_clear;
+                        need_notify = true;
+                    }
+                    let cursor_moved = match (p.cursor_x, next_cursor_x) {
+                        (Some(a), Some(b)) => (a - b).abs() > 0.5,
+                        (None, None) => false,
+                        _ => true,
+                    };
+                    if cursor_moved {
+                        p.cursor_x = next_cursor_x;
+                        need_anim = true;
+                    }
+                }
+                if need_anim {
+                    this.ensure_react_anim(window, cx);
+                }
+                if need_notify {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, e: &gpui::MouseUpEvent, window, cx| {
+                    let Some(p) = this.react_picker.clone() else {
+                        return;
+                    };
+                    if !p.holding {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let (cx_pos, cy_pos) = crate::window_frame::window_to_chrome(window, e.position);
+                    let (hit_idx, hit_clear) = react_slot_at(&p, cx_pos, cy_pos);
+                    let chosen_idx = hit_idx.or(p.hovered_idx);
+                    let chosen_clear = hit_clear || p.hovered_clear;
+                    if let Some(idx) = chosen_idx {
+                        if let Some(&(_, r_icon, r_type, _)) =
+                            crate::read_sync::REACTION_PRESETS.get(idx)
+                        {
+                            let already = this
+                                .my_reaction(p.msg.id)
+                                .is_some_and(|r| r.r_type == r_type);
+                            if already {
+                                this.apply_reaction(&p.msg, "", -1);
+                            } else {
+                                this.apply_reaction(&p.msg, r_icon, r_type);
+                            }
+                        }
+                        this.close_react_picker();
+                    } else if chosen_clear {
+                        this.apply_reaction(&p.msg, "", -1);
+                        this.close_react_picker();
+                    } else {
+                        let near_anchor = (cx_pos - p.anchor_x).abs() <= 36.0
+                            && (cy_pos - p.anchor_y).abs() <= 36.0;
+                        if near_anchor {
+                            if let Some(live) = this.react_picker.as_mut() {
+                                live.holding = false;
+                                live.hovered_idx = None;
+                                live.hovered_clear = false;
+                                live.cursor_x = None;
+                            }
+                            this.ensure_react_anim(window, cx);
+                            this.react_hold_msg = None;
+                            this.react_hold_opened = false;
+                        } else {
+                            this.close_react_picker();
+                        }
+                    }
+                    cx.notify();
+                }),
             )
             .child(
                 div()
-                    .id("react-picker-bar")
+                    .id("react-picker-wrap")
                     .absolute()
                     .left(px(picker.x))
-                    .top(px(picker.y))
-                    .h(px(40.))
-                    .px(px(8.))
-                    .rounded(px(20.))
-                    .bg(rgb(paper))
-                    .border_1()
-                    .border_color(line)
-                    .shadow_lg()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.))
-                    .occlude()
-                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .children(crate::read_sync::REACTION_PRESETS.iter().enumerate().map(
-                        |(idx, &(emoji, r_icon, r_type, label))| {
-                            let target = picker.msg.clone();
-                            let picked = my_type == Some(r_type);
-                            div()
-                                .id(("react-pick", idx))
-                                .size(px(30.))
-                                .rounded(px(15.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(18.))
-                                .cursor_pointer()
-                                .when(picked, |el| el.bg(rgb(active_bg)))
-                                .hover(move |st| st.bg(rgb(hover_bg)))
-                                .tooltip(move |_, cx| crate::widgets::tip(label, cx))
-                                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                                    if picked {
-                                        this.apply_reaction(&target, "", -1);
-                                    } else {
-                                        this.apply_reaction(&target, r_icon, r_type);
-                                    }
-                                    this.react_picker = None;
-                                    cx.notify();
-                                }))
-                                .child(emoji)
-                        },
-                    ))
-                    .when(my_type.is_some(), |el| {
-                        el.child(
-                            div()
-                                .id("react-pick-clear")
-                                .size(px(26.))
-                                .rounded(px(13.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_size(px(12.))
-                                .text_color(rgb(muted))
-                                .cursor_pointer()
-                                .hover(move |st| st.bg(rgb(hover_bg)))
-                                .tooltip(|_, cx| crate::widgets::tip("Bỏ cảm xúc", cx))
-                                .on_click(cx.listener(move |this, _: &gpui::ClickEvent, _, cx| {
-                                    this.apply_reaction(&clear_msg, "", -1);
-                                    this.react_picker = None;
-                                    cx.notify();
-                                }))
-                                .child("✕"),
-                        )
-                    }),
+                    .top(px(wrap_top))
+                    .w(px(picker.bar_w))
+                    .h(px(pill_offset + REACT_BAR_H))
+                    .child(
+                        div()
+                            .id("react-picker-bar")
+                            .mt(px(pill_offset))
+                            .w(px(picker.bar_w))
+                            .h(px(REACT_BAR_H))
+                            .px(px(REACT_PAD_X))
+                            .rounded(px(REACT_BAR_H / 2.0))
+                            .bg(rgb(paper))
+                            .border_1()
+                            .border_color(line)
+                            .shadow_lg()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(REACT_SLOT_GAP))
+                            .children(crate::read_sync::REACTION_PRESETS.iter().enumerate().map(
+                                |(idx, &(emoji, _r_icon, r_type, label))| {
+                                    let picked = my_type == Some(r_type);
+                                    let lift = picker.lifts.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                                    let is_peak = picker.hovered_idx == Some(idx);
+                                    let icon_size = REACT_ICON_BASE + REACT_ICON_GAIN * lift;
+                                    let rise_px = REACT_LIFT_MAX * lift;
+                                    let halo_size = icon_size + 6.0;
+                                    let icon_bottom = (REACT_BAR_H - halo_size) * 0.5 + rise_px;
+                                    let label_bottom = icon_bottom + halo_size + 3.0;
+                                    let icon_el = match crate::media::reaction_icon_by_index(idx) {
+                                        Some(image) => gpui::img(image)
+                                            .size(px(icon_size))
+                                            .object_fit(gpui::ObjectFit::Contain)
+                                            .into_any_element(),
+                                        None => div()
+                                            .text_size(px(icon_size * 0.68))
+                                            .child(emoji)
+                                            .into_any_element(),
+                                    };
+                                    div()
+                                        .id(("react-pick", idx))
+                                        .relative()
+                                        .w(px(REACT_SLOT_W))
+                                        .h(px(REACT_BAR_H))
+                                        .cursor_pointer()
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .bottom(px(icon_bottom))
+                                                .left(px((REACT_SLOT_W - halo_size) * 0.5))
+                                                .size(px(halo_size))
+                                                .rounded(px(halo_size * 0.5))
+                                                .when(picked, |d| d.bg(rgb(active_bg)))
+                                                .when(lift > 0.35, |d| d.shadow_md())
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(icon_el),
+                                        )
+                                        .when(is_peak && lift > 0.25, |el| {
+                                            el.child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom(px(label_bottom))
+                                                    .left(px((REACT_SLOT_W - 72.0) * 0.5))
+                                                    .w(px(72.))
+                                                    .flex()
+                                                    .justify_center()
+                                                    .child(
+                                                        div()
+                                                            .px(px(7.))
+                                                            .py(px(1.5))
+                                                            .rounded(px(9.))
+                                                            .bg(rgb(if dark {
+                                                                0x12_15_1a
+                                                            } else {
+                                                                0x1c_24_30
+                                                            }))
+                                                            .border_1()
+                                                            .border_color(if dark {
+                                                                gpui::hsla(0., 0., 1., 0.14)
+                                                            } else {
+                                                                gpui::transparent_black()
+                                                            })
+                                                            .shadow_sm()
+                                                            .text_size(px(10.5))
+                                                            .line_height(px(13.))
+                                                            .whitespace_nowrap()
+                                                            .font_family(
+                                                                crate::fonts::FAMILY_SEMIBOLD,
+                                                            )
+                                                            .text_color(rgb(0xffffff))
+                                                            .child(label),
+                                                    ),
+                                            )
+                                        })
+                                },
+                            ))
+                            .when(picker.has_my, |el| {
+                                let clear_pop = picker.hovered_clear;
+                                el.child(
+                                    div()
+                                        .id("react-pick-clear")
+                                        .size(px(REACT_CLEAR_W))
+                                        .rounded(px(REACT_CLEAR_W / 2.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(12.))
+                                        .text_color(rgb(muted))
+                                        .cursor_pointer()
+                                        .when(clear_pop, |d| d.bg(rgb(hover_bg)))
+                                        .tooltip(|_, cx| crate::widgets::tip("Bỏ cảm xúc", cx))
+                                        .child("✕"),
+                                )
+                            }),
+                    ),
             )
             .into_any_element()
     }
@@ -2618,5 +2952,55 @@ mod tests {
         // No synced message at all -> None (never sends "0"/"0"/"").
         assert!(build_thread_msg_ref(&conv, &[unsynced], Some("987654")).is_none());
         assert!(build_thread_msg_ref(&conv, &[], Some("987654")).is_none());
+    }
+
+    #[test]
+    fn react_slot_hit_test_and_wave_curve() {
+        let mut picker = ReactPicker {
+            msg: test_msg(MsgKind::Text, "hi"),
+            x: 100.0,
+            y: 200.0,
+            anchor_x: 240.0,
+            anchor_y: 264.0,
+            bar_w: 324.0,
+            has_my: true,
+            holding: true,
+            hovered_idx: None,
+            hovered_clear: false,
+            cursor_x: None,
+            lifts: [0.0; REACT_COUNT],
+            anim_running: false,
+        };
+        // Anchor point below the bar must not misfire a reaction when releasing in place.
+        assert_eq!(react_slot_at(&picker, picker.anchor_x, picker.anchor_y), (None, false));
+        // Sliding over each of the 6 emoji slots (center AND lifted upper rim).
+        let step = REACT_SLOT_W + REACT_SLOT_GAP;
+        for idx in 0..crate::read_sync::REACTION_PRESETS.len() {
+            let cx = picker.x + REACT_PAD_X + idx as f32 * step + REACT_SLOT_W * 0.5;
+            assert_eq!(react_slot_at(&picker, cx, picker.y + 22.0), (Some(idx), false));
+            assert_eq!(react_slot_at(&picker, cx, picker.y - 8.0), (Some(idx), false));
+        }
+        // In free-hover mode, moving directly onto the lifted emoji stays active.
+        picker.holding = false;
+        let mid_cx = picker.x + REACT_PAD_X + 2.0 * step + REACT_SLOT_W * 0.5;
+        assert_eq!(react_slot_at(&picker, mid_cx, picker.y - 6.0), (Some(2), false));
+        assert_eq!(react_slot_at(&picker, mid_cx, picker.y + 10.0), (Some(2), false));
+        // Wave targets peak at 1.0 on the hovered slot and ripple smoothly onto neighbors.
+        picker.cursor_x = Some(mid_cx);
+        let wave = react_wave_targets(&picker);
+        assert!((wave[2] - 1.0).abs() < 1e-4);
+        assert!(wave[1] > 0.3 && wave[1] < 0.6);
+        assert!((wave[1] - wave[3]).abs() < 1e-4);
+        assert!(wave[0] < wave[1]);
+        // Clear `✕` button at the right end when `has_my` is true.
+        let clear_cx = picker.x
+            + REACT_PAD_X
+            + crate::read_sync::REACTION_PRESETS.len() as f32 * step
+            + REACT_CLEAR_W * 0.5;
+        assert_eq!(react_slot_at(&picker, clear_cx, picker.y + 22.0), (None, true));
+        // Outside bounds returns no hit.
+        assert_eq!(react_slot_at(&picker, 40.0, picker.y + 22.0), (None, false));
+        assert_eq!(react_slot_at(&picker, 500.0, picker.y + 22.0), (None, false));
+        assert_eq!(react_slot_at(&picker, 130.0, picker.y - 50.0), (None, false));
     }
 }

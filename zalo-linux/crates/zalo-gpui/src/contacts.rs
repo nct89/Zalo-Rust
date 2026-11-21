@@ -481,7 +481,7 @@ impl ShellView {
                                         .rounded(px(6.))
                                         .bg(rgb(0x2fcc70))
                                         .border_2()
-                                        .border_color(rgb(0xffffff)),
+                                        .border_color(rgb(token_rgb("--layer-background", "#ffffff"))),
                                 )
                             })
                     })

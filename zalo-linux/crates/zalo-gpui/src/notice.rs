@@ -30,17 +30,30 @@ const MARGIN: f32 = 5.0;
 /// `#zbg` radius.
 const CARD_RADIUS: f32 = 4.0;
 
-/// One popup: title, one-line body, avatar initial (and a photo when we have one).
+/// Default popup auto-dismiss time in seconds (matching Electron `popupApprearTime`).
+pub const DEFAULT_DURATION_SECS: u64 = 5;
+
+/// Clamp user-configured popup display duration into a safe range (`2..=30` s).
+#[must_use]
+pub fn clamp_duration_secs(secs: u64) -> u64 {
+    secs.clamp(2, 30)
+}
+
+/// One popup: title, one-line body, avatar initial, decoded photo, or group collage.
 pub struct NoticeContent {
     /// Conversation name, or the sample title.
     pub title: String,
     /// Message line. Newlines already turned into spaces.
     pub body: String,
-    /// Letter drawn when no avatar bitmap is cached.
+    /// Initials drawn when neither a photo nor a group collage is available.
     pub initial: String,
-    /// Cached avatar, when the shell already decoded one.
+    /// Fallback disc colour (`avatar_color` of the thread id).
+    pub accent: u32,
+    /// Cached single avatar, when the shell already decoded one.
     pub image: Option<Arc<RenderImage>>,
-    /// Thread whose photo should replace the letter while this popup is open.
+    /// Overlapping member collage for groups without a custom group photo.
+    pub(crate) collage: Vec<crate::sidebar::CollageFace>,
+    /// Thread whose title/photo/collage should patch while this popup is open.
     pub thread_key: String,
 }
 
@@ -203,23 +216,26 @@ pub fn present(
     corner: &str,
     saved_x: f32,
     saved_y: f32,
+    duration: Duration,
 ) {
+    let duration = Duration::from_secs(clamp_duration_secs(duration.as_secs().max(2)));
     let (wx, wy, ww, wh) = area_for(cx, scale);
     let (x, y) = screen_origin(corner, saved_x, saved_y, wx, wy, ww, wh);
     set_target(x, y, true);
     if let Some(handle) = open_slot().lock().ok().and_then(|guard| *guard) {
         if handle.read(cx).is_ok() {
             let _ = handle.update(cx, |view, _, cx| {
-                view.replace(content, cx);
+                view.replace(content, duration, cx);
                 cx.notify();
             });
+            crate::x11_frame::move_notice_to(x, y, scale);
             return;
         }
         if let Ok(mut guard) = open_slot().lock() {
             *guard = None;
         }
     }
-    // Stamp the corner before GPUI maps, so xfwm does not center the card.
+    // Stamp non-focusable notification hints before the WM handles MapRequest.
     crate::x11_frame::anticipate_notice(scale);
     let bounds = Bounds {
         origin: point(px(x), px(y)),
@@ -231,7 +247,10 @@ pub fn present(
             titlebar: None,
             focus: false,
             show: true,
-            kind: WindowKind::Normal,
+            // `PopUp` sets `_NET_WM_WINDOW_TYPE_NOTIFICATION` on X11 before
+            // `map_window()`, matching Electron `znotification` (no focus
+            // stealing, no server frame, no center-screen placement).
+            kind: WindowKind::PopUp,
             is_movable: true,
             is_resizable: false,
             is_minimizable: false,
@@ -242,12 +261,12 @@ pub fn present(
         },
         move |window, cx| {
             window.set_window_title("Zalo Notice");
-            // Map already happened inside GPUI. Withdraw and place before the
-            // first draw so xfwm does not show the card in the screen center.
+            // Ensure `WM_HINTS.input=0`, `_NET_WM_USER_TIME=0`, `_NET_WM_STATE`,
+            // corner position, and 4 px input mask without unmapping/remapping.
             crate::x11_frame::park_notice(window.scale_factor());
             window.set_client_inset(px(0.));
             window.set_background_appearance(WindowBackgroundAppearance::Transparent);
-            cx.new(|cx| NoticeView::new(content, cx))
+            cx.new(|cx| NoticeView::new(content, duration, cx))
         },
     );
     if let Ok(handle) = opened {
@@ -257,9 +276,15 @@ pub fn present(
     }
 }
 
-/// Put a decoded avatar on the open popup when it is still this thread and
-/// still showing the letter. Does not restart the dismiss timer.
-pub fn patch_avatar(cx: &mut App, thread_key: &str, image: Arc<RenderImage>) -> bool {
+/// Update the open popup's title, decoded photo, or group collage while it is
+/// still showing `thread_key`. Does not restart the countdown progress bar.
+pub(crate) fn patch_notice(
+    cx: &mut App,
+    thread_key: &str,
+    title: Option<String>,
+    image: Option<Arc<RenderImage>>,
+    collage: Vec<crate::sidebar::CollageFace>,
+) -> bool {
     let Some(handle) = open_slot().lock().ok().and_then(|guard| *guard) else {
         return false;
     };
@@ -272,12 +297,31 @@ pub fn patch_avatar(cx: &mut App, thread_key: &str, image: Arc<RenderImage>) -> 
     let key = thread_key.to_owned();
     handle
         .update(cx, |view, _, cx| {
-            if view.expired || view.content.thread_key != key || view.content.image.is_some() {
+            if view.expired || view.content.thread_key != key {
                 return false;
             }
-            view.content.image = Some(image);
-            cx.notify();
-            true
+            let mut changed = false;
+            if let Some(name) = title {
+                if !name.is_empty() && name != view.content.title {
+                    view.content.initial = crate::sidebar::avatar_initials(&name);
+                    view.content.title = name;
+                    changed = true;
+                }
+            }
+            if let Some(img) = image {
+                if view.content.image.is_none() {
+                    view.content.image = Some(img);
+                    view.content.collage.clear();
+                    changed = true;
+                }
+            } else if view.content.image.is_none() && !collage.is_empty() {
+                view.content.collage = collage;
+                changed = true;
+            }
+            if changed {
+                cx.notify();
+            }
+            changed
         })
         .unwrap_or(false)
 }
@@ -296,12 +340,41 @@ pub fn move_if_open(cx: &mut App, scale: f32, corner: &str, saved_x: f32, saved_
     let (wx, wy, ww, wh) = area_for(cx, scale);
     let (x, y) = screen_origin(corner, saved_x, saved_y, wx, wy, ww, wh);
     set_target(x, y, true);
+    crate::x11_frame::move_notice_to(x, y, scale);
+    let _ = handle.update(cx, |_, _, cx| cx.notify());
 }
+
+/// Minimum pointer travel (logical px) before a press turns into a drag.
+const DRAG_THRESHOLD: f32 = 5.0;
+
+/// Inner card width (`#zbg`, inside 1 px outer margin on each side).
+const CARD_W: f32 = 350.0;
+/// Inner card height (`#zbg`).
+const CARD_H: f32 = 80.0;
+/// Countdown progress bar height along the bottom edge of `#zbg`.
+const PROGRESS_H: f32 = 3.0;
 
 struct NoticeView {
     content: NoticeContent,
     gen: u64,
+    duration: Duration,
+    remaining: Duration,
+    last_tick: Instant,
     expired: bool,
+    hovered: bool,
+    /// Local mouse-down position inside the card (logical px).
+    press_local: Option<(f32, f32)>,
+    /// X11 root pointer at mouse-down (`None` on Wayland).
+    press_root: Option<(i32, i32)>,
+    /// Window origin (logical px) when the drag began.
+    drag_origin: (f32, f32),
+    /// Latest window origin (logical px) during an X11 drag.
+    drag_pos: (f32, f32),
+    /// Work-area bounds cached on mouse-down so dragging does not re-query X11.
+    drag_area: (f32, f32, f32, f32),
+    /// True once pointer travel exceeded [`DRAG_THRESHOLD`].
+    dragging: bool,
+    /// Wayland fallback drag tracking (`start_window_move`).
     drag_at: Option<Instant>,
     last_origin: (f32, f32),
     moved: bool,
@@ -309,76 +382,102 @@ struct NoticeView {
 }
 
 impl NoticeView {
-    fn new(content: NoticeContent, cx: &mut Context<Self>) -> Self {
+    fn new(content: NoticeContent, duration: Duration, cx: &mut Context<Self>) -> Self {
+        let now = Instant::now();
         let view = Self {
             content,
             gen: 1,
+            duration,
+            remaining: duration,
+            last_tick: now,
             expired: false,
+            hovered: false,
+            press_local: None,
+            press_root: None,
+            drag_origin: (0.0, 0.0),
+            drag_pos: (0.0, 0.0),
+            drag_area: (0.0, 0.0, 1920.0, 1080.0),
+            dragging: false,
             drag_at: None,
             last_origin: (0.0, 0.0),
             moved: false,
-            still_since: Instant::now(),
+            still_since: now,
         };
-        view.arm(1, cx);
-        Self::arm_snap(cx);
+        view.arm_countdown(1, cx);
         view
     }
 
-    fn replace(&mut self, content: NoticeContent, cx: &mut Context<Self>) {
+    fn replace(&mut self, content: NoticeContent, duration: Duration, cx: &mut Context<Self>) {
         self.content = content;
         self.gen = self.gen.wrapping_add(1);
+        self.duration = duration;
+        self.remaining = duration;
+        self.last_tick = Instant::now();
         let gen = self.gen;
-        self.arm(gen, cx);
-        Self::arm_snap(cx);
+        self.arm_countdown(gen, cx);
     }
 
-    /// Keep rendering briefly so the X11 snap can run after xfwm places us.
-    ///
-    /// An idle popup paints once. That one paint used to land inside the
-    /// frame-shape throttle, and the card stayed in the middle of the screen.
-    fn arm_snap(cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            for _ in 0..8 {
-                gpui::Timer::after(Duration::from_millis(50)).await;
-                let keep = this.update(cx, |view, cx| {
-                    if view.expired {
-                        return false;
-                    }
-                    cx.notify();
-                    true
-                });
-                if !keep.unwrap_or(false) {
-                    break;
+    /// Fraction of display time left in `0.0..=1.0`, used for the bottom
+    /// countdown progress bar.
+    fn progress_ratio(&self) -> f32 {
+        let total = self.duration.as_secs_f32();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        (self.remaining.as_secs_f32() / total).clamp(0.0, 1.0)
+    }
+
+    /// Smooth ~30 FPS countdown ticker. Pauses while hovered or dragged and
+    /// dismisses the popup once `remaining` reaches zero.
+    fn arm_countdown(&self, gen: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            gpui::Timer::after(Duration::from_millis(33)).await;
+            let keep = this.update(cx, |view, cx| {
+                if view.gen != gen || view.expired {
+                    return false;
                 }
+                let now = Instant::now();
+                let dt = now.saturating_duration_since(view.last_tick);
+                view.last_tick = now;
+                if view.hovered || view.dragging || view.drag_at.is_some() {
+                    return true;
+                }
+                view.remaining = view.remaining.saturating_sub(dt);
+                if view.remaining.is_zero() {
+                    view.expired = true;
+                    cx.notify();
+                    return false;
+                }
+                cx.notify();
+                true
+            });
+            if !keep.unwrap_or(false) {
+                break;
             }
         })
         .detach();
     }
 
-    fn arm(&self, gen: u64, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            gpui::Timer::after(Duration::from_secs(5)).await;
-            let _ = this.update(cx, |view, cx| {
-                if view.gen != gen {
-                    return;
-                }
-                if view.drag_at.is_some() {
-                    view.arm(gen, cx);
-                    return;
-                }
-                view.expired = true;
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn dismiss(&mut self, window: &mut Window) {
+        self.press_local = None;
+        self.press_root = None;
+        self.dragging = false;
         if let Ok(mut guard) = open_slot().lock() {
             *guard = None;
         }
         unlock();
         window.remove_window();
+    }
+
+    fn finish_x11_drag(&mut self, cx: &mut Context<Self>) {
+        let was_x11_drag = self.dragging && self.press_root.is_some();
+        let pos = self.drag_pos;
+        self.press_local = None;
+        self.press_root = None;
+        self.dragging = false;
+        if was_x11_drag {
+            remember_custom(pos.0, pos.1, cx);
+        }
     }
 
     fn watch_drag(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -414,7 +513,7 @@ impl NoticeView {
 
 impl Render for NoticeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::x11_frame::sync(window.scale_factor());
+        crate::x11_frame::sync_notice(window.scale_factor());
         self.watch_drag(window, cx);
         if self.expired {
             self.expired = false;
@@ -426,7 +525,22 @@ impl Render for NoticeView {
         let title = self.content.title.clone();
         let body = self.content.body.clone();
         let initial = self.content.initial.clone();
+        let accent = self.content.accent;
         let image = self.content.image.clone();
+        let collage = self.content.collage.clone();
+        let progress_w = (CARD_W * self.progress_ratio()).clamp(0.0, CARD_W);
+        let progress_track = if crate::color::is_dark() {
+            gpui::hsla(0., 0., 1., 0.08)
+        } else {
+            gpui::hsla(0., 0., 0., 0.06)
+        };
+        let cursor = if self.dragging {
+            gpui::CursorStyle::ClosedHand
+        } else if self.content.thread_key.is_empty() {
+            gpui::CursorStyle::OpenHand
+        } else {
+            gpui::CursorStyle::PointingHand
+        };
         let edge = if crate::color::is_dark() {
             gpui::hsla(0., 0., 1., 0.12)
         } else {
@@ -443,8 +557,8 @@ impl Render for NoticeView {
                     .absolute()
                     .left(px(1.))
                     .top(px(1.))
-                    .w(px(350.))
-                    .h(px(80.))
+                    .w(px(CARD_W))
+                    .h(px(CARD_H))
                     .rounded(px(CARD_RADIUS))
                     .bg(rgb(paper))
                     .border_1()
@@ -452,19 +566,100 @@ impl Render for NoticeView {
                     .shadow_md()
                     .overflow_hidden()
                     .occlude()
-                    .cursor(gpui::CursorStyle::OpenHand)
+                    .cursor(cursor)
+                    .on_hover(cx.listener(|this, hovered: &bool, _, _| {
+                        this.hovered = *hovered;
+                    }))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            let origin = window.bounds().origin;
-                            let here = (f32::from(origin.x), f32::from(origin.y));
-                            this.drag_at = Some(Instant::now());
-                            this.last_origin = here;
-                            this.moved = false;
-                            this.still_since = Instant::now();
-                            unlock();
-                            window.start_window_move();
+                        cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                            let scale = window.scale_factor();
+                            let win_origin = crate::x11_frame::notice_root_origin(scale)
+                                .or_else(locked_origin)
+                                .unwrap_or_else(|| {
+                                    let o = window.bounds().origin;
+                                    (f32::from(o.x), f32::from(o.y))
+                                });
+                            this.press_local = Some((f32::from(e.position.x), f32::from(e.position.y)));
+                            this.press_root = crate::x11_frame::query_pointer_root();
+                            this.drag_origin = win_origin;
+                            this.drag_pos = win_origin;
+                            this.drag_area = area_for(cx, scale);
+                            this.dragging = false;
                             cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, window, cx| {
+                        let Some((lx, ly)) = this.press_local else {
+                            return;
+                        };
+                        if e.pressed_button != Some(gpui::MouseButton::Left) {
+                            this.finish_x11_drag(cx);
+                            cx.notify();
+                            return;
+                        }
+                        let scale = window.scale_factor().max(0.5);
+                        if let Some((rx0, ry0)) = this.press_root {
+                            let Some((rx, ry)) = crate::x11_frame::query_pointer_root() else {
+                                return;
+                            };
+                            let dx = (rx - rx0) as f32 / scale;
+                            let dy = (ry - ry0) as f32 / scale;
+                            if !this.dragging {
+                                if dx.abs().max(dy.abs()) <= DRAG_THRESHOLD {
+                                    return;
+                                }
+                                this.dragging = true;
+                                unlock();
+                                cx.notify();
+                            }
+                            let (wx, wy, ww, wh) = this.drag_area;
+                            let max_x = (wx + ww - NOTICE_W).max(wx);
+                            let max_y = (wy + wh - NOTICE_H).max(wy);
+                            let nx = (this.drag_origin.0 + dx).clamp(wx, max_x);
+                            let ny = (this.drag_origin.1 + dy).clamp(wy, max_y);
+                            this.drag_pos = (nx, ny);
+                            crate::x11_frame::move_notice_to(nx, ny, scale);
+                        } else {
+                            let dx = f32::from(e.position.x) - lx;
+                            let dy = f32::from(e.position.y) - ly;
+                            if !this.dragging && dx.abs().max(dy.abs()) > DRAG_THRESHOLD {
+                                this.dragging = true;
+                                let origin = window.bounds().origin;
+                                let here = (f32::from(origin.x), f32::from(origin.y));
+                                this.drag_at = Some(Instant::now());
+                                this.last_origin = here;
+                                this.moved = false;
+                                this.still_since = Instant::now();
+                                unlock();
+                                window.start_window_move();
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_mouse_up(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _: &gpui::MouseUpEvent, window, cx| {
+                            let pressed = this.press_local.is_some();
+                            let dragged = this.dragging;
+                            this.finish_x11_drag(cx);
+                            if pressed && !dragged && !this.content.thread_key.is_empty() {
+                                let key = this.content.thread_key.clone();
+                                this.dismiss(window);
+                                cx.defer(move |cx| {
+                                    crate::shell::open_notice_thread(&key, cx);
+                                });
+                            } else {
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
+                            this.finish_x11_drag(cx);
+                            cx.notify();
                         }),
                     )
                     .child(
@@ -473,8 +668,9 @@ impl Render for NoticeView {
                             .flex_row()
                             .items_center()
                             .size_full()
+                            .pb(px(PROGRESS_H))
                             .overflow_hidden()
-                            .child(avatar_el(initial, image))
+                            .child(avatar_el(initial, accent, image, collage))
                             .child(
                                 div()
                                     .flex_1()
@@ -514,6 +710,22 @@ impl Render for NoticeView {
                     )
                     .child(
                         div()
+                            .id("znotice-progress")
+                            .absolute()
+                            .left(px(0.))
+                            .bottom(px(0.))
+                            .w(px(CARD_W))
+                            .h(px(PROGRESS_H))
+                            .bg(progress_track)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(px(progress_w))
+                                    .bg(rgb(0x0068ff)),
+                            ),
+                    )
+                    .child(
+                        div()
                             .id("znotice-close")
                             .absolute()
                             .top(px(2.))
@@ -524,7 +736,7 @@ impl Render for NoticeView {
                             .justify_center()
                             .cursor_pointer()
                             .text_size(px(14.))
-                            .text_color(rgb(0x7f8c99))
+                            .text_color(rgb(muted))
                             .occlude()
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
@@ -533,14 +745,26 @@ impl Render for NoticeView {
                                     cx.stop_propagation();
                                 }),
                             )
+                            .on_mouse_up(
+                                gpui::MouseButton::Left,
+                                |_, _, cx| {
+                                    cx.stop_propagation();
+                                },
+                            )
                             .child("×"),
                     ),
             )
     }
 }
 
-fn avatar_el(initial: String, image: Option<Arc<RenderImage>>) -> impl IntoElement {
-    let letter = image.is_none();
+fn avatar_el(
+    initial: String,
+    accent: u32,
+    image: Option<Arc<RenderImage>>,
+    collage: Vec<crate::sidebar::CollageFace>,
+) -> impl IntoElement {
+    let show_collage = image.is_none() && !collage.is_empty();
+    let show_letter = image.is_none() && collage.is_empty();
     div()
         .id("zavatar")
         .flex_none()
@@ -555,19 +779,23 @@ fn avatar_el(initial: String, image: Option<Arc<RenderImage>>) -> impl IntoEleme
                     .object_fit(gpui::ObjectFit::Cover),
             )
         })
-        .when(letter, |el| el.child(letter_avatar(initial)))
+        .when(show_collage, |el| {
+            el.child(crate::sidebar::group_collage(&collage, 52.0))
+        })
+        .when(show_letter, |el| el.child(letter_avatar(initial, accent)))
 }
 
-fn letter_avatar(initial: String) -> impl IntoElement {
+fn letter_avatar(initial: String, accent: u32) -> impl IntoElement {
+    let fill = if accent == 0 { 0x0068ff } else { accent };
     div()
         .size(px(52.))
         .rounded(px(26.))
-        .bg(rgb(0x0068ff))
+        .bg(rgb(fill))
         .flex()
         .items_center()
         .justify_center()
         .text_color(rgb(0xffffff))
-        .text_size(px(20.))
+        .text_size(px(19.))
         .font_family(crate::fonts::FAMILY_SEMIBOLD)
         .child(initial)
 }
@@ -597,5 +825,12 @@ mod tests {
     fn notice_body_is_one_line() {
         assert_eq!(super::notice_line("a\r\nb\nc"), "a  b c");
         assert!(!super::notice_line("dòng\ndài").contains('\n'));
+    }
+
+    #[test]
+    fn notice_duration_clamps_to_safe_bounds() {
+        assert_eq!(super::clamp_duration_secs(0), 2);
+        assert_eq!(super::clamp_duration_secs(5), 5);
+        assert_eq!(super::clamp_duration_secs(120), 30);
     }
 }

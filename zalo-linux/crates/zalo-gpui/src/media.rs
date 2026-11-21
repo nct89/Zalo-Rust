@@ -366,22 +366,45 @@ pub fn local_media_file(
 /// (`~/Downloads/Zalo Received Files`, `~/Downloads`, XDG download dir).
 #[must_use]
 pub fn find_downloaded(name: &str) -> Option<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
     let name = name.trim();
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let mut dirs = vec![
-        home.join("Downloads").join("Zalo Received Files"),
-        home.join("Downloads"),
-        home.join("Tải xuống"),
-    ];
-    if let Some(xdg) = std::env::var_os("XDG_DOWNLOAD_DIR") {
-        dirs.insert(0, PathBuf::from(xdg));
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Option<PathBuf>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    if let Ok(map) = cache.lock() {
+        if let Some((at, hit)) = map.get(name) {
+            if now.duration_since(*at) < Duration::from_secs(3) {
+                return hit.clone();
+            }
+        }
     }
-    dirs.into_iter()
-        .map(|dir| dir.join(name))
-        .find(|path| path.is_file())
+    let found = (|| {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let mut dirs = vec![
+            home.join("Downloads").join("Zalo Received Files"),
+            home.join("Downloads"),
+            home.join("Tải xuống"),
+        ];
+        if let Some(xdg) = std::env::var_os("XDG_DOWNLOAD_DIR") {
+            dirs.insert(0, PathBuf::from(xdg));
+        }
+        dirs.into_iter()
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+    })();
+    if let Ok(mut map) = cache.lock() {
+        if map.len() > 256 {
+            map.retain(|_, (at, _)| now.duration_since(*at) < Duration::from_secs(3));
+        }
+        map.insert(name.to_owned(), (now, found.clone()));
+    }
+    found
 }
 
 /// Group-call system bodies that `zalo-gui` stored as the raw action name.
@@ -979,17 +1002,43 @@ pub fn png_asset(file: &str, max_edge: u32) -> Option<Arc<RenderImage>> {
 /// GPUI cannot paint COLRv1 Noto emoji directly.
 #[must_use]
 pub fn like_icon() -> Option<Arc<RenderImage>> {
-    static LIKE: std::sync::OnceLock<Option<Arc<RenderImage>>> = std::sync::OnceLock::new();
-    LIKE.get_or_init(|| {
-        let path = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../assets/images/like-24-emoji@4x.png"
-        ));
-        let bytes = std::fs::read(path).ok()?;
-        let rgba = decode_rgba(&bytes, 96)?;
-        Some(Arc::new(RenderImage::new([Frame::new(rgba_to_bgra(rgba))])))
+    reaction_icon_by_index(0).or_else(|| {
+        static LIKE: std::sync::OnceLock<Option<Arc<RenderImage>>> = std::sync::OnceLock::new();
+        LIKE.get_or_init(|| {
+            let path = Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../assets/images/like-24-emoji@4x.png"
+            ));
+            let bytes = std::fs::read(path).ok()?;
+            let rgba = decode_rgba(&bytes, 96)?;
+            Some(Arc::new(RenderImage::new([Frame::new(rgba_to_bgra(rgba))])))
+        })
+        .clone()
     })
-    .clone()
+}
+
+/// Official Zalo 6-emoji reaction set (`Like`, `Heart`, `Haha`, `Wow`, `Cry`, `Angry`),
+/// rasterised from Zalo PC's `*_24_emoji.svg` under `assets/images/reactions/` and
+/// cached once in GPU-ready BGRA [`RenderImage`] form.
+#[must_use]
+pub fn reaction_icon_by_index(index: usize) -> Option<Arc<RenderImage>> {
+    const FILES: [&str; 6] = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/like.png"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/heart.png"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/haha.png"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/wow.png"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/cry.png"),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/angry.png"),
+    ];
+    static ICONS: std::sync::OnceLock<[Option<Arc<RenderImage>>; 6]> = std::sync::OnceLock::new();
+    let table = ICONS.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let bytes = std::fs::read(Path::new(FILES[i])).ok()?;
+            let rgba = decode_rgba(&bytes, 96)?;
+            Some(Arc::new(RenderImage::new([Frame::new(rgba_to_bgra(rgba))])))
+        })
+    });
+    table.get(index).cloned().flatten()
 }
 
 /// File-type chip label (`PDF`, `ZIP`, …).

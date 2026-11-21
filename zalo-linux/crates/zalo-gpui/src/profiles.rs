@@ -35,6 +35,8 @@ pub struct Profile {
     pub admin_ids: Vec<String>,
     /// From `get_friends` (Contacts › Friends), not a group member or sender.
     pub friend: bool,
+    /// Cross-platform global noise ID (`globalId`) used by Sync 2 and PC→Phone Backup.
+    pub global_id: String,
 }
 
 /// Cached map keyed by thread id (`<uid>` / `g_<grid>`) plus [`ME`].
@@ -105,6 +107,7 @@ impl Profiles {
                             })
                             .unwrap_or_default(),
                         friend: v.get("friend").and_then(Value::as_bool).unwrap_or(false),
+                        global_id: str_of(v, "globalId"),
                     },
                 );
             }
@@ -132,7 +135,7 @@ impl Profiles {
             .map(|(k, p)| {
                 (
                     k.clone(),
-                    serde_json::json!({"name": p.name, "avatar": p.avatar, "members": p.members, "memberIds": p.member_ids, "creatorId": p.creator_id, "adminIds": p.admin_ids, "friend": p.friend}),
+                    serde_json::json!({"name": p.name, "avatar": p.avatar, "members": p.members, "memberIds": p.member_ids, "creatorId": p.creator_id, "adminIds": p.admin_ids, "friend": p.friend, "globalId": p.global_id}),
                 )
             })
             .collect();
@@ -147,6 +150,50 @@ impl Profiles {
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, path);
+        }
+    }
+
+    /// Merge a fresh server fetch without wiping out previously cached friends
+    /// (e.g. when `getfriends` is rate-limited 429), `getgi/v2`-only groups
+    /// omitted by `getlg/v4`, or `getprofiles/v2` member avatars.
+    pub fn merge(&mut self, fresh: Self) {
+        if fresh.saved_at > self.saved_at {
+            self.saved_at = fresh.saved_at;
+        }
+        for (uid, alias) in fresh.aliases {
+            if !alias.is_empty() {
+                self.aliases.insert(uid, alias);
+            }
+        }
+        for (key, got) in fresh.map {
+            let slot = self.map.entry(key).or_default();
+            if !got.name.is_empty() {
+                slot.name = got.name;
+            }
+            if !got.avatar.is_empty()
+                && (crate::sidebar::is_real_avatar(&got.avatar)
+                    || !crate::sidebar::is_real_avatar(&slot.avatar))
+            {
+                slot.avatar = got.avatar;
+            }
+            if got.members > 0 {
+                slot.members = got.members;
+            }
+            if !got.member_ids.is_empty() {
+                slot.member_ids = got.member_ids;
+            }
+            if !got.creator_id.is_empty() {
+                slot.creator_id = got.creator_id;
+            }
+            if !got.admin_ids.is_empty() {
+                slot.admin_ids = got.admin_ids;
+            }
+            if got.friend {
+                slot.friend = true;
+            }
+            if !got.global_id.is_empty() {
+                slot.global_id = got.global_id;
+            }
         }
     }
 }
@@ -267,6 +314,7 @@ pub fn fetch(dir: &Path, now_ms: i64) -> Result<Profiles, String> {
                     Profile {
                         name: find_str(&v, &["displayName", "zaloName"]).unwrap_or_default(),
                         avatar,
+                        global_id: find_str(&v, &["globalId"]).unwrap_or_default(),
                         ..Profile::default()
                     },
                 );
@@ -307,6 +355,7 @@ pub fn friends_from(value: &Value) -> HashMap<String, Profile> {
                 name: find_str(item, &["displayName", "zaloName"]).unwrap_or_default(),
                 avatar: find_str(item, &["avatar"]).unwrap_or_default(),
                 friend: true,
+                global_id: find_str(item, &["globalId"]).unwrap_or_default(),
                 ..Profile::default()
             },
         );
@@ -365,44 +414,92 @@ pub fn group_display_name(thread_id: &str, current: &str, profile_name: &str) ->
     thread_id.to_owned()
 }
 
-/// `get_multi_group_info` → `gridInfoMap` → `g_<grid>` entries.
+/// `get_multi_group_info` / `get_group_info_v2` → `gridInfoMap` (or direct `data`) → `g_<grid>` entries.
 #[must_use]
 pub fn groups_from(value: &Value) -> HashMap<String, Profile> {
     let mut map = HashMap::new();
-    let Some(obj) = value
-        .get("data")
-        .unwrap_or(value)
-        .get("gridInfoMap")
-        .and_then(Value::as_object)
-    else {
+    let root = value.get("data").filter(|v| v.is_object()).unwrap_or(value);
+    if let Some(obj) = root.get("gridInfoMap").and_then(Value::as_object) {
+        for (key, item) in obj {
+            insert_group_entry(&mut map, key, item);
+        }
         return map;
-    };
-    for (key, item) in obj {
-        let raw = item.get("groupId").and_then(Value::as_str).unwrap_or(key);
-        let clean = raw.strip_prefix("g_").unwrap_or(raw);
-        let members = item
-            .get("totalMember")
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                item.get("memberIds")
-                    .and_then(Value::as_array)
-                    .map(|a| a.len() as u64)
-            })
-            .unwrap_or(0) as u32;
-        map.insert(
-            format!("g_{clean}"),
-            Profile {
-                name: find_str(item, &["name", "displayName"]).unwrap_or_default(),
-                avatar: find_str(item, &["fullAvt", "avt", "avatar"]).unwrap_or_default(),
-                members,
-                member_ids: member_ids(item),
-                creator_id: id_of(item, "creatorId"),
-                admin_ids: id_list(item, "adminIds"),
-                friend: false,
-            },
-        );
+    }
+    if let Some(gid) = root
+        .get("groupId")
+        .or_else(|| root.get("grid"))
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+        .filter(|s| !s.is_empty())
+    {
+        insert_group_entry(&mut map, &gid, root);
     }
     map
+}
+
+fn insert_group_entry(map: &mut HashMap<String, Profile>, key: &str, item: &Value) {
+    let raw = item
+        .get("groupId")
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| key.to_owned());
+    let clean = raw.strip_prefix("g_").unwrap_or(&raw);
+    if clean.is_empty() {
+        return;
+    }
+    let members = item
+        .get("totalMember")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            item.get("memberIds")
+                .and_then(Value::as_array)
+                .map(|a| a.len() as u64)
+        })
+        .unwrap_or(0) as u32;
+    map.insert(
+        format!("g_{clean}"),
+        Profile {
+            name: find_str(item, &["name", "displayName"]).unwrap_or_default(),
+            avatar: best_avatar_str(item, &["fullAvt", "avt", "avatar"]).unwrap_or_default(),
+            members,
+            member_ids: member_ids(item),
+            creator_id: id_of(item, "creatorId"),
+            admin_ids: id_list(item, "adminIds"),
+            friend: false,
+            global_id: find_str(item, &["globalId"]).unwrap_or_default(),
+        },
+    );
+}
+
+/// Prefer a real photo URL (non-`/default`) across `keys`; fall back to any
+/// `http(s)://` URL so `/default` placeholders never shadow a real avatar field.
+fn best_avatar_str(v: &Value, keys: &[&str]) -> Option<String> {
+    let mut fallback = None;
+    if let Value::Object(map) = v {
+        for k in keys {
+            if let Some(s) = map
+                .get(*k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| s.starts_with("https://") || s.starts_with("http://"))
+            {
+                if crate::sidebar::is_real_avatar(s) {
+                    return Some(s.to_owned());
+                }
+                if fallback.is_none() {
+                    fallback = Some(s.to_owned());
+                }
+            }
+        }
+    }
+    fallback.or_else(|| find_str(v, keys))
 }
 
 /// `getprofiles/v2` → `data.changed_profiles` keyed by uid.
@@ -439,6 +536,7 @@ pub fn profiles_from_v2(value: &Value) -> HashMap<String, Profile> {
                 name,
                 avatar,
                 friend: false,
+                global_id: find_str(item, &["globalId"]).unwrap_or_default(),
                 ..Profile::default()
             },
         );
@@ -453,8 +551,8 @@ pub fn is_numeric_uid(uid: &str) -> bool {
     !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Group thread ids that still have no server name. The chat list otherwise
-/// paints the placeholder "Nhóm" and a letter disc.
+/// Group thread ids that still lack a real server name, or lack both a custom
+/// group photo and member ids (needed to paint the member collage).
 #[must_use]
 pub fn groups_needing_info(profiles: &Profiles, thread_ids: &[String]) -> Vec<String> {
     let mut out = Vec::new();
@@ -466,7 +564,15 @@ pub fn groups_needing_info(profiles: &Profiles, thread_ids: &[String]) -> Vec<St
             None => true,
             Some(profile) => {
                 let name = profile.name.trim();
-                name.is_empty() || is_id_label(id, name)
+                if name == "Nhóm đã rời" {
+                    false
+                } else {
+                    name.is_empty()
+                        || name == "Nhóm"
+                        || is_id_label(id, name)
+                        || (!crate::sidebar::is_real_avatar(&profile.avatar)
+                            && profile.member_ids.is_empty())
+                }
             }
         };
         if needs && !out.contains(id) {
@@ -779,7 +885,7 @@ pub fn aliases_from(value: &Value) -> HashMap<String, String> {
         .collect()
 }
 
-/// First https / non-empty string under one of `keys`, searching nested objects.
+/// First http(s) / non-empty string under one of `keys`, searching nested objects.
 pub(crate) fn find_str(v: &Value, keys: &[&str]) -> Option<String> {
     match v {
         Value::Object(map) => {
@@ -789,7 +895,10 @@ pub(crate) fn find_str(v: &Value, keys: &[&str]) -> Option<String> {
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                 {
-                    if !k.contains("av") || s.starts_with("https://") {
+                    let is_avatar_key = k.eq_ignore_ascii_case("fullAvt")
+                        || k.eq_ignore_ascii_case("avt")
+                        || k.eq_ignore_ascii_case("avatar");
+                    if !is_avatar_key || s.starts_with("https://") || s.starts_with("http://") {
                         return Some(s.to_owned());
                     }
                 }
@@ -872,16 +981,64 @@ mod tests {
             id.into(),
             Profile {
                 name: "Team Group".into(),
+                member_ids: vec!["11".into()],
+                ..Profile::default()
+            },
+        );
+        cached.map.insert(
+            "g_888".into(),
+            Profile {
+                name: "Missing Visual".into(),
                 ..Profile::default()
             },
         );
         let want = vec![
             id.to_owned(),
+            "g_888".into(),
             "g_999".into(),
             "g_999".into(),
             "42".into(),
         ];
-        assert_eq!(groups_needing_info(&cached, &want), vec!["g_999".to_owned()]);
+        assert_eq!(
+            groups_needing_info(&cached, &want),
+            vec!["g_888".to_owned(), "g_999".to_owned()]
+        );
+
+        let fallback_avt = serde_json::json!({"data": {"gridInfoMap": {
+            "77": {"name": "Fallback", "fullAvt": "default", "avt": "https://ava-grp-talk.zadn.vn/real.jpg", "totalMember": 3}
+        }}});
+        assert_eq!(
+            groups_from(&fallback_avt)["g_77"].avatar,
+            "https://ava-grp-talk.zadn.vn/real.jpg"
+        );
+
+        let mut merged = cached.clone();
+        merged.map.insert(
+            "555".into(),
+            Profile {
+                name: "Friend Kept".into(),
+                avatar: "https://ava.example/555.jpg".into(),
+                friend: true,
+                ..Profile::default()
+            },
+        );
+        let mut partial = Profiles {
+            map: HashMap::new(),
+            aliases: HashMap::new(),
+            saved_at: 99,
+        };
+        partial.map.insert(
+            "g_77".into(),
+            Profile {
+                name: "Fallback".into(),
+                avatar: "https://ava-grp-talk.zadn.vn/real.jpg".into(),
+                ..Profile::default()
+            },
+        );
+        merged.merge(partial);
+        assert!(merged.map.contains_key("555"));
+        assert_eq!(merged.map["g_77"].name, "Fallback");
+        assert_eq!(merged.saved_at, 99);
     }
 
     #[test]

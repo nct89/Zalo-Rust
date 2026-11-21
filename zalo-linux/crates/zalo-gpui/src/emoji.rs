@@ -83,9 +83,35 @@ pub fn thumb_key(item: &EmojiItem) -> String {
 /// True when `text` contains a classic shortcode or a catalogued Unicode emoji.
 #[must_use]
 pub fn contains_pictogram(text: &str) -> bool {
-    !split_pictograms(text)
-        .iter()
-        .all(|part| matches!(part, PictogramPart::Text(_)))
+    if text.is_empty() {
+        return false;
+    }
+    let first = classic_first_bytes();
+    let has_trigger = text.bytes().any(|b| b >= 0x80 || first[b as usize]);
+    if !has_trigger {
+        return false;
+    }
+    let keys = classic_keys();
+    let by_insert = by_insert();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let b = rest.as_bytes()[0];
+        if b < 0x80 && first[b as usize] {
+            if keys
+                .iter()
+                .any(|key| key.as_bytes()[0] == b && rest.starts_with(*key) && by_insert.contains_key(*key))
+            {
+                return true;
+            }
+        }
+        let ch = rest.chars().next().unwrap();
+        let ch_len = ch.len_utf8();
+        if !ch.is_ascii() && by_insert.contains_key(&rest[..ch_len]) {
+            return true;
+        }
+        rest = &rest[ch_len..];
+    }
+    false
 }
 
 /// One run of plain text or an emoji tile, in display order.
@@ -103,16 +129,24 @@ pub fn split_pictograms(text: &str) -> Vec<PictogramPart> {
     if text.is_empty() {
         return Vec::new();
     }
+    let first = classic_first_bytes();
+    if !text.bytes().any(|b| b >= 0x80 || first[b as usize]) {
+        return vec![PictogramPart::Text(text.to_owned())];
+    }
     let keys = classic_keys();
     let by_insert = by_insert();
     let mut out = Vec::new();
     let mut buf = String::new();
     let mut rest = text;
     while !rest.is_empty() {
-        let hit = keys
-            .iter()
-            .find(|key| rest.starts_with(*key))
-            .and_then(|key| by_insert.get(*key).copied().map(|item| (*key, item)));
+        let b = rest.as_bytes()[0];
+        let hit = if b < 0x80 && first[b as usize] {
+            keys.iter()
+                .find(|key| key.as_bytes()[0] == b && rest.starts_with(*key))
+                .and_then(|key| by_insert.get(*key).copied().map(|item| (*key, item)))
+        } else {
+            None
+        };
         if let Some((key, item)) = hit {
             if !buf.is_empty() {
                 out.push(PictogramPart::Text(std::mem::take(&mut buf)));
@@ -140,6 +174,21 @@ pub fn split_pictograms(text: &str) -> Vec<PictogramPart> {
         out.push(PictogramPart::Text(buf));
     }
     out
+}
+
+fn classic_first_bytes() -> &'static [bool; 128] {
+    static FIRST: OnceLock<[bool; 128]> = OnceLock::new();
+    FIRST.get_or_init(|| {
+        let mut table = [false; 128];
+        for key in classic_keys() {
+            if let Some(&b) = key.as_bytes().first() {
+                if (b as usize) < 128 {
+                    table[b as usize] = true;
+                }
+            }
+        }
+        table
+    })
 }
 
 fn classic_keys() -> &'static [&'static str] {

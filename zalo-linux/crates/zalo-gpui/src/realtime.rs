@@ -39,6 +39,15 @@ pub enum RtEvent {
     Pinned(Vec<String>),
     /// Synced archived conversation ids from `/api/archivedchat/list`.
     Archived(Vec<String>),
+    /// Remote feature configs parsed from `getServerInfo` (`sync_2_pc` & `backup_msg`).
+    RemoteConfigs {
+        /// Sync 2 (`sync_2_pc`) remote config.
+        sync: zalo_sync::SyncRemoteConfig,
+        /// PC → Phone Backup (`backup_msg`) remote config.
+        backup: zalo_backup::BackupRemoteConfig,
+    },
+    /// Automatic Sync 2 trigger pushed by mobile right after login (`transfer_after_login`).
+    SyncAfterLogin(zalo_sync::TransferAfterLoginEvent),
 }
 
 /// One parsed reaction update from `610/611/612/613`.
@@ -250,12 +259,13 @@ async fn run(
             return;
         }
         let mut wait = Duration::from_secs(5);
-        let (api, server_info, self_uin) = loop {
+        let (api, server_info, pc_server_info, login_settings, self_uin, device_imei) = loop {
             if tx.is_closed() || *stop_rx.borrow() || !is_active_gen(gen) {
                 return;
             }
             let attempt = async {
                 let device = Device::load_or_create(dir).map_err(|e| (e.to_string(), false))?;
+                let imei = device.imei.clone();
                 let mut session = match StoredSession::load(dir) {
                     Ok(s) => s,
                     Err(err) => {
@@ -295,13 +305,23 @@ async fn run(
                     session.zpw_sek().as_deref().unwrap_or(""),
                     &info,
                 );
-                let server = api.get_server_info().await.ok();
+                let pc_type = ZaloApi::pc_api_type();
+                let (server, pc_server) = if zalo_protocol::api_type() != pc_type {
+                    let (s, pc) = tokio::join!(
+                        api.get_server_info(),
+                        api.get_server_info_for_type(pc_type),
+                    );
+                    (s.ok(), pc.ok())
+                } else {
+                    (api.get_server_info().await.ok(), None)
+                };
+                let login_settings = info.settings.clone();
                 let self_uid = info
                     .send2me_id
                     .clone()
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| info.uin.clone());
-                Ok((api, server, self_uid))
+                Ok((api, server, pc_server, login_settings, self_uid, imei))
             };
             let outcome = tokio::select! {
                 _ = wait_stopped(&mut stop_rx) => return,
@@ -338,6 +358,30 @@ async fn run(
         config.since_group = since_group.map(|n| n.to_string());
         config.cursor_path = Some(dir.join("queue-cursors.json"));
         config.max_unready_retries = Some(3);
+        let mut sync_cfg = zalo_sync::SyncRemoteConfig::default();
+        let mut backup_cfg = zalo_backup::BackupRemoteConfig::default();
+        if let Some(ref pc_srv) = pc_server_info {
+            sync_cfg.apply_server_info(pc_srv);
+            backup_cfg.apply_server_info(pc_srv);
+        }
+        if let Some(ref srv) = server_info {
+            sync_cfg.apply_server_info(srv);
+            backup_cfg.apply_server_info(srv);
+        }
+        if let Some(ref settings) = login_settings {
+            sync_cfg.apply_server_info(settings);
+            backup_cfg.apply_server_info(settings);
+        }
+        crate::ws_rpc::WsRpcHub::global().set_remote_configs(sync_cfg.clone(), backup_cfg.clone());
+        let _ = tx.unbounded_send(RtEvent::RemoteConfigs {
+            sync: sync_cfg,
+            backup: backup_cfg,
+        });
+        let ws_out_rx = crate::ws_rpc::WsRpcHub::global().attach_connection(
+            gen,
+            device_imei.clone(),
+            self_uin.clone(),
+        );
         if !synced {
             synced = true;
             tokio::spawn(startup_sync(
@@ -351,7 +395,7 @@ async fn run(
         let store_path_cb = store_path.clone();
         let reached_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reached_ready_cb = std::sync::Arc::clone(&reached_ready);
-        let listen_fut = run_listener_with(config, None, move |event| {
+        let listen_fut = run_listener_with(config, Some(ws_out_rx), move |event| {
             if tx2.is_closed() || !is_active_gen(gen) {
                 return false;
             }
@@ -359,13 +403,18 @@ async fn run(
                 ListenerEvent::Ready => {
                     reached_ready_cb.store(true, std::sync::atomic::Ordering::Relaxed);
                     set_listening_for(gen, true);
+                    crate::ws_rpc::WsRpcHub::global().set_online(true);
                     RtEvent::Online
                 }
                 ListenerEvent::Disconnected(why) => {
                     set_listening_for(gen, false);
+                    crate::ws_rpc::WsRpcHub::global().set_online(false);
                     RtEvent::Offline(why)
                 }
-                ListenerEvent::Replaced => RtEvent::Replaced,
+                ListenerEvent::Replaced => {
+                    crate::ws_rpc::WsRpcHub::global().set_online(false);
+                    RtEvent::Replaced
+                }
                 ListenerEvent::Status(status) => {
                     if status.is_empty() {
                         return true;
@@ -395,6 +444,14 @@ async fn run(
                     for (id, url) in zalo_client::listener::file_done_from_event(&data) {
                         file_done(id, url);
                     }
+                    // Route Sync 2 (`transfer_sync2` / `transfer_msg`) and Backup (`backup_pc2mb`)
+                    // control pushes on BOTH 601 and 603 (matching Electron `compact3043.js`).
+                    let after_login = crate::ws_rpc::WsRpcHub::global().dispatch_controls(&data);
+                    for ev in after_login {
+                        if let zalo_sync::SyncControlEvent::TransferAfterLogin(payload) = ev {
+                            let _ = tx2.unbounded_send(RtEvent::SyncAfterLogin(payload));
+                        }
+                    }
                     // 603 is the catch-up of 601. Call confirmations ride on it.
                     // Replaying an old call from that catch-up would ring again.
                     if cmd != zalo_client::listener::CMD_PUSH_CTRL {
@@ -405,6 +462,22 @@ async fn run(
                         return true;
                     }
                     RtEvent::Voip(voip)
+                }
+                ListenerEvent::Event { cmd, data, .. }
+                    if matches!(
+                        cmd,
+                        zalo_client::listener::CMD_SYNC_REQUEST
+                            | zalo_client::listener::CMD_SYNC_ACK_DELETE
+                            | zalo_client::listener::CMD_SYNC_WAKEUP
+                            | zalo_client::listener::CMD_BACKUP_INIT
+                            | zalo_client::listener::CMD_BACKUP_CREATE_SESSION
+                            | zalo_client::listener::CMD_BACKUP_GET_METADATA
+                            | zalo_client::listener::CMD_BACKUP_SIGNAL_RESTORE
+                            | zalo_client::listener::CMD_BACKUP_GET_CONFIGS
+                    ) =>
+                {
+                    let _ = crate::ws_rpc::WsRpcHub::global().complete_rpc(cmd, data);
+                    return true;
                 }
                 ListenerEvent::Event { cmd, data, .. }
                     if matches!(
@@ -456,11 +529,13 @@ async fn run(
         let result = tokio::select! {
             _ = wait_stopped(&mut stop_rx) => {
                 set_listening_for(gen, false);
+                crate::ws_rpc::WsRpcHub::global().detach_connection(gen);
                 return;
             }
             res = listen_fut => res,
         };
         set_listening_for(gen, false);
+        crate::ws_rpc::WsRpcHub::global().detach_connection(gen);
         if !is_active_gen(gen) || *stop_rx.borrow() {
             return;
         }
@@ -529,21 +604,33 @@ async fn startup_sync(
             eprintln!("zalo-gpui last-msgs failed {kind}");
         }
     }
+    if !self_uin.is_empty() {
+        let my_docs = sync_my_documents_cloud(&api, &store_path, &self_uin, 20, false).await;
+        if !my_docs.is_empty() {
+            let _ = tx.unbounded_send(RtEvent::Messages(my_docs, false));
+        }
+    }
     if let Ok(pinned) = api.get_pinned_conversations().await {
         let root = pinned
             .get("data")
             .filter(|v| v.is_object())
             .unwrap_or(&pinned);
-        if let Some(items) = root.get("conversations").and_then(Value::as_array) {
-            let ids: Vec<String> = items
-                .iter()
-                .filter_map(|v| {
-                    v.as_str()
+        let mut ids: Vec<String> = Vec::new();
+        for key in ["conversations", "otherTabConvs"] {
+            if let Some(items) = root.get(key).and_then(Value::as_array) {
+                for v in items {
+                    if let Some(s) = v
+                        .as_str()
                         .map(str::to_owned)
                         .or_else(|| v.as_i64().map(|n| n.to_string()))
-                })
-                .filter(|s| !s.is_empty() && s != "m1")
-                .collect();
+                        .filter(|s| !s.is_empty() && s != "m1")
+                    {
+                        ids.push(s);
+                    }
+                }
+            }
+        }
+        if root.get("conversations").is_some() || root.get("otherTabConvs").is_some() {
             let _ = tx.unbounded_send(RtEvent::Pinned(ids));
         }
     }
@@ -688,6 +775,157 @@ fn zero_preload_map(clear_unreads: Option<&Value>) -> Option<String> {
 }
 
 /// Last-message rows from `msgs` / `groupMsgs`, or Electron's `allmsgs`.
+/// Fetches "My Documents" (`send2me_id`) cloud history from `/api/cm/getrecentv2` and
+/// `/api/cm/getoldv2` (matching Electron `getCM` with `isOA: 1`), persists it to `store.db`,
+/// and returns the parsed messages sorted oldest-first.
+///
+/// When `full_backfill` is `false` (startup sync) and `store.db` already has local
+/// messages for `send2me_id`, paging stops as soon as a page only contains messages
+/// already present in `store.db`.
+pub(crate) async fn sync_my_documents_cloud(
+    api: &ZaloApi,
+    store_path: &Path,
+    send2me_id: &str,
+    max_pages: usize,
+    full_backfill: bool,
+) -> Vec<Incoming> {
+    if send2me_id.is_empty() || max_pages == 0 {
+        return Vec::new();
+    }
+    let existing_gids: std::collections::HashSet<i64> = if full_backfill {
+        std::collections::HashSet::new()
+    } else {
+        let sp = store_path.to_path_buf();
+        let sid = send2me_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let Ok(store) = LocalStore::open(&sp) else {
+                return std::collections::HashSet::new();
+            };
+            store
+                .messages(&sid)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| m.global_msg_id)
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let mut all: Vec<Incoming> = Vec::new();
+    let mut seen_gids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    let mut use_old = false;
+
+    for page in 0..max_pages {
+        let resp = if use_old {
+            api.get_my_cloud_older(
+                send2me_id,
+                cursor.as_deref().unwrap_or("9223372036854775808"),
+                50,
+            )
+            .await
+        } else {
+            api.get_my_cloud_recent(send2me_id, cursor.as_deref(), 50)
+                .await
+        };
+        let Ok(val) = resp else {
+            if page == 0 {
+                if let Err(err) = resp {
+                    eprintln!("zalo-gpui my-documents cloud sync failed: {err}");
+                }
+            }
+            break;
+        };
+        let root_owned = val
+            .get("data")
+            .and_then(|d| match d {
+                Value::Object(_) => Some(d.clone()),
+                Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+                _ => None,
+            })
+            .unwrap_or(val);
+        let root = &root_owned;
+        let items = root
+            .get("groupMsgs")
+            .or_else(|| root.get("msgs"))
+            .and_then(Value::as_array);
+        let Some(items) = items else {
+            break;
+        };
+        let mut min_gid: Option<i64> = None;
+        let mut added_this_page = 0usize;
+        let mut unseen_locally_this_page = 0usize;
+        for raw in items {
+            if let Some(mut inc) = parse_item(raw, false, send2me_id) {
+                inc.thread_id = send2me_id.to_owned();
+                inc.is_group = false;
+                if let Some(gid) = inc.global_msg_id {
+                    min_gid = Some(min_gid.map_or(gid, |m| m.min(gid)));
+                    if !seen_gids.insert(gid) {
+                        continue;
+                    }
+                    if !existing_gids.contains(&gid) {
+                        unseen_locally_this_page += 1;
+                    }
+                } else {
+                    unseen_locally_this_page += 1;
+                }
+                all.push(inc);
+                added_this_page += 1;
+            }
+        }
+        let has_more = json_flag(root, "hasMore");
+        let resp_is_old = json_flag(root, "isOld");
+        let next_cursor = json_str(root, "lastMsgId")
+            .filter(|s| !s.is_empty() && s != "0")
+            .or_else(|| min_gid.map(|g| g.to_string()));
+        if !has_more {
+            break;
+        }
+        if !full_backfill && !existing_gids.is_empty() && unseen_locally_this_page == 0 {
+            break;
+        }
+        let switching_to_old = !use_old && resp_is_old;
+        if resp_is_old {
+            use_old = true;
+        }
+        if added_this_page == 0 && next_cursor == cursor && !switching_to_old {
+            break;
+        }
+        if next_cursor.is_some() {
+            cursor = next_cursor;
+        } else {
+            break;
+        }
+    }
+
+    if all.is_empty() {
+        return all;
+    }
+    all.sort_by_key(|m| (m.at_ms, m.global_msg_id.unwrap_or(0)));
+    let latest_at = all.last().map(|m| m.at_ms).unwrap_or(0);
+    let sp = store_path.to_path_buf();
+    let sid = send2me_id.to_owned();
+    let persisted = tokio::task::spawn_blocking(move || {
+        if let Ok(mut store) = LocalStore::open(&sp) {
+            let _ = store.upsert_threads_batch(&[ThreadRecord {
+                thread_id: sid.clone(),
+                kind: ThreadKind::User,
+                title: "My Documents".to_owned(),
+                peer_user_id: Some(sid),
+                unread: 0,
+                updated_at: latest_at,
+            }]);
+        }
+        store_all(&sp, &mut all);
+        all
+    })
+    .await
+    .unwrap_or_default();
+    eprintln!("zalo-gpui my-documents cloud synced {} msgs", persisted.len());
+    persisted
+}
+
 pub(crate) fn preload_messages(root: &Value, self_uin: &str) -> Vec<Incoming> {
     let mut synced = Vec::new();
     for (key, group) in [("msgs", false), ("groupMsgs", true)] {

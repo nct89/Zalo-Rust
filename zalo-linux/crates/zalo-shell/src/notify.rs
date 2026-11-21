@@ -91,6 +91,8 @@ pub struct DesktopNotice {
     pub body: String,
     /// Timeout in milliseconds. `5000` is the unread notice.
     pub expire_ms: i32,
+    /// Optional local PNG/image file path passed via `image-path` hint.
+    pub icon_path: Option<String>,
 }
 
 /// Arguments of `Notify` that do not depend on the bus.
@@ -125,6 +127,7 @@ pub fn unread_notice(count: u32) -> Option<DesktopNotice> {
         summary: "Zalo".to_owned(),
         body,
         expire_ms: 5000,
+        icon_path: None,
     })
 }
 
@@ -147,6 +150,9 @@ pub fn notify_desktop(notice: &DesktopNotice) -> Result<u32, ShellError> {
     let desktop_entry = active_app_id();
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
     hints.insert("desktop-entry", Value::from(desktop_entry.as_str()));
+    if let Some(path) = notice.icon_path.as_deref().filter(|p| !p.is_empty()) {
+        hints.insert("image-path", Value::from(path));
+    }
     let actions = ["default", "Mở Zalo"];
     let connection = session()?;
     let reply = connection

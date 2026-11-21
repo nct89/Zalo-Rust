@@ -92,7 +92,10 @@ impl ShellView {
             .child(div().w(px(1.)).h_full().absolute().right_0().bg(line))
             .child(self.search_bar(cx))
             .when(lists_chats(self.rail), |el| {
-                el.child(self.list_tabs(cx)).child(self.conv_rows(cx))
+                el.child(self.list_tabs(cx))
+                    .when_some(self.sync_banner_el(cx), |el, banner| el.child(banner))
+                    .when_some(self.backup_banner_el(cx), |el, banner| el.child(banner))
+                    .child(self.conv_rows(cx))
             })
             .when(self.rail == Rail::Contacts, |el| {
                 el.child(self.contacts_nav(cx))
@@ -280,22 +283,40 @@ impl ShellView {
 
     fn conv_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
-        let rows = self.listed_convs();
+        let indices = std::rc::Rc::new(self.listed_conv_indices());
+        let count = indices.len();
         let show_back = self.list_filter == crate::shell::ListFilter::Strangers;
+        let indices_for_list = std::rc::Rc::clone(&indices);
         div()
-            .id("conv-scroll")
             .flex()
             .flex_col()
             .flex_1()
+            .min_h(px(0.))
             .w_full()
-            .overflow_y_scroll()
             .when(show_back, |el| {
-                el.child(self.stranger_back_bar(rows.len(), cx))
+                el.child(self.stranger_back_bar(count, cx))
             })
-            .children(rows.into_iter().map(|row| {
-                let on = selected == Some(row.id);
-                self.conv_row(row, on, cx)
-            }))
+            .child(
+                gpui::uniform_list(
+                    "conv-scroll",
+                    count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        range
+                            .filter_map(|ix| {
+                                let conv_ix = *indices_for_list.get(ix)?;
+                                this.convs.get(conv_ix)
+                            })
+                            .map(|row| {
+                                let on = selected == Some(row.id);
+                                this.conv_row(row.clone(), on, cx)
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(self.conv_scroll.clone())
+                .flex_1()
+                .w_full(),
+            )
     }
 
     fn stranger_back_bar(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -671,7 +692,11 @@ impl ShellView {
                                             .text_color(rgb(ink))
                                             .when(unread > 0, |el| el.font_family(FAMILY_SEMIBOLD))
                                             .truncate()
-                                            .child(row.name.clone()),
+                                            .child(if cloud_row {
+                                                "My Documents".to_owned()
+                                            } else {
+                                                row.name.clone()
+                                            }),
                                     )
                                     .child(
                                         // `#conv-title-action`: "Open in Separate Window" + "…" replace
@@ -1037,6 +1062,7 @@ pub(crate) fn avatar_paint(is_group: bool, has_photo: bool, cloud: bool, faces: 
 
 /// One cell inside a group collage. Electron draws these as overlapping
 /// circles (`zavatar-multi`), not as slices of one circle.
+#[derive(Clone)]
 pub(crate) enum CollageFace {
     Photo(std::sync::Arc<gpui::RenderImage>),
     /// Coloured disc. `text` is empty when the member has no display name.
@@ -1308,11 +1334,11 @@ fn collage_cell(face: &CollageFace, diameter: f32, border: f32, x: f32, y: f32) 
             div()
                 .size_full()
                 .rounded(radius)
-                .bg(rgb(0xeef0f3))
+                .bg(rgb(token_rgb("--layer-background-subtle", "#eef0f3")))
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(rgb(0x081b3a))
+                .text_color(rgb(token_rgb("--text-primary", "#081b3a")))
                 .text_size(px(text_px))
                 .font_family(FAMILY_SEMIBOLD)
                 .child(label)
@@ -1321,11 +1347,11 @@ fn collage_cell(face: &CollageFace, diameter: f32, border: f32, x: f32, y: f32) 
         CollageFace::Placeholder => div()
             .size_full()
             .rounded(radius)
-            .bg(rgb(0xeef0f3))
+            .bg(rgb(token_rgb("--layer-background-subtle", "#eef0f3")))
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgb(0x8a94a6))
+            .text_color(rgb(token_rgb("--text-secondary", "#8a94a6")))
             .child(fonts::icon_el(ic::USER, "☺", diameter * 0.55))
             .into_any_element(),
     };
@@ -1406,7 +1432,7 @@ fn avatar(
                     .rounded(px(6.))
                     .bg(rgb(0x2fcc70))
                     .border_2()
-                    .border_color(rgb(0xffffff)),
+                    .border_color(rgb(token_rgb("--layer-background", "#ffffff"))),
             )
         })
 }

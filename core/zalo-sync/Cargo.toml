@@ -1,0 +1,21 @@
+[package]
+name = "zalo-sync"
+description = "Zalo PC Sync 2 (phone-to-PC message sync: socket 590/591/592, libzproto_wasm_bg, protobuf SyncChunk, session manager and sync-full engine)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version = "1.86"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+wasmi = { version = "1", default-features = false, features = ["std"] }
+zstd = "0.13"

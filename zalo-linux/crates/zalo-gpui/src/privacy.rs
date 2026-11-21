@@ -811,12 +811,16 @@ fn styled_guide_paragraph(segments: &[(String, bool)], ink: u32) -> gpui::Styled
 
 /// Miniature search-bar card matching Zalo PC's hidden-chat guide illustration.
 fn hidden_guide_preview() -> impl IntoElement {
+    let paper = crate::color::token_rgb("--layer-background", "#ffffff");
+    let field = crate::color::token_rgb("--input-field-bg-filled", "#e8eaef");
+    let ink = crate::color::token_rgb("--text-primary", "#142646");
+    let muted = crate::color::token_rgb("--text-secondary", "#758297");
     div()
         .w_full()
         .rounded(px(4.))
         .border_1()
         .border_color(crate::color::border_subtle())
-        .bg(rgb(0xff_ff_ff))
+        .bg(rgb(paper))
         .px(px(16.))
         .py(px(12.))
         .flex()
@@ -839,7 +843,7 @@ fn hidden_guide_preview() -> impl IntoElement {
                         .h(px(30.))
                         .px(px(12.))
                         .rounded(px(15.))
-                        .bg(rgb(0xe8_ea_ef))
+                        .bg(rgb(field))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -849,7 +853,7 @@ fn hidden_guide_preview() -> impl IntoElement {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_color(rgb(0x75_82_97))
+                                .text_color(rgb(muted))
                                 .child(crate::fonts::icon_el(
                                     crate::fonts::ic::SEARCH_FIELD,
                                     "⌕",
@@ -859,7 +863,7 @@ fn hidden_guide_preview() -> impl IntoElement {
                         .child(
                             div()
                                 .text_size(px(12.5))
-                                .text_color(rgb(0x75_82_97))
+                                .text_color(rgb(muted))
                                 .truncate()
                                 .child("Tìm bạn bè, nhóm và tin nhắn"),
                         ),
@@ -870,7 +874,7 @@ fn hidden_guide_preview() -> impl IntoElement {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(rgb(0x14_26_46))
+                        .text_color(rgb(ink))
                         .child(crate::fonts::icon_el(
                             crate::fonts::ic::ADD_CONTACT,
                             "+",
@@ -883,7 +887,7 @@ fn hidden_guide_preview() -> impl IntoElement {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(rgb(0x14_26_46))
+                        .text_color(rgb(ink))
                         .child(crate::fonts::icon_el(
                             crate::fonts::ic::GROUP_ADD,
                             "☰",

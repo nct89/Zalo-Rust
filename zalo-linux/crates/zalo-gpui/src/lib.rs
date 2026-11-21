@@ -11,6 +11,7 @@ mod account;
 mod audio_play;
 mod autoreply;
 mod background;
+mod backup_worker;
 mod board;
 mod bridge;
 mod call;
@@ -37,6 +38,7 @@ mod login;
 mod login_flow;
 mod media;
 mod media_store;
+mod noise_id;
 mod notice;
 mod pc_export;
 mod photo_window;
@@ -58,12 +60,14 @@ mod shell;
 mod shortcuts;
 mod sidebar;
 mod stickers;
+mod sync_worker;
 mod titlebar;
 mod video;
 mod viewer;
 mod voice;
 mod widgets;
 mod window_frame;
+mod ws_rpc;
 mod x11_frame;
 
 pub use call::restore_saved_mic_volume;
@@ -147,6 +151,7 @@ pub fn open_login_window(cx: &mut App) {
     let (width, height) = crate::login_window_size();
     let outer = crate::window_frame::outer_size(width, height);
     let bounds = bounds_in_work_area(outer);
+    crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -377,6 +382,10 @@ fn bounds_in_work_area(size: gpui::Size<gpui::Pixels>) -> Bounds<gpui::Pixels> {
 /// and xfwm never maps the window. Park a restored window inside
 /// `_NET_WORKAREA` instead.
 pub fn open_shell_window(cx: &mut App) {
+    // Load SQLite snapshot, profiles, links, and prefs *before* GPUI maps the
+    // X11 window so the window never sits mapped and unpainted (black) while
+    // waiting on synchronous disk I/O inside `ShellView::new`.
+    let startup = crate::shell::ShellStartupData::load();
     let (min_w, min_h) = crate::main_window_min();
     let (size, maximized) = saved_shell_bounds(cx);
     let bounds = if maximized {
@@ -389,6 +398,7 @@ pub fn open_shell_window(cx: &mut App) {
     } else {
         WindowBounds::Windowed(bounds)
     };
+    crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
             window_bounds: Some(window_bounds),
@@ -401,7 +411,7 @@ pub fn open_shell_window(cx: &mut App) {
             app_id: Some("zalo-gpui".into()),
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| ShellView::new(window, cx)),
+        move |window, cx| cx.new(|cx| ShellView::new_with_data(window, cx, startup)),
     )
     .expect("open shell window");
 }
@@ -410,6 +420,7 @@ pub fn open_shell_window(cx: &mut App) {
 pub fn open_installer_window(cx: &mut App) {
     let outer = crate::window_frame::outer_size(440.0, 214.0);
     let bounds = bounds_in_work_area(outer);
+    crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),

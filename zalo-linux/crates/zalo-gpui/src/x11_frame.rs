@@ -34,7 +34,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::shape::{self, SK, SO};
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, EventMask,
-    MapState, PropMode, Rectangle,
+    ExposeEvent, MapState, PropMode, Rectangle, EXPOSE_EVENT,
 };
 use x11rb::wrapper::ConnectionExt as _;
 
@@ -81,6 +81,10 @@ struct State {
     scanned: Option<Instant>,
     /// Last time a locked notice was pushed to its screen corner.
     snapped: Option<Instant>,
+    /// Last seen `(width, height, maximized, scale_x100)` for the active window.
+    last_sig: Option<(i32, i32, bool, u16)>,
+    /// Time of the last geometry/window change so we stop polling X11 once settled.
+    sig_changed_at: Instant,
     shapes: HashMap<u32, ShapeKey>,
 }
 
@@ -90,43 +94,151 @@ fn state() -> &'static Mutex<State> {
         Mutex::new(State {
             scanned: None,
             snapped: None,
+            last_sig: None,
+            sig_changed_at: Instant::now(),
             shapes: HashMap::new(),
         })
     })
+}
+
+/// Reset the settle timer when a new window is about to open so `sync_window`
+/// never skips applying `_MOTIF_WM_HINTS` / `XShape` to reopened windows.
+pub fn reset_settle() {
+    if let Ok(mut guard) = state().lock() {
+        guard.scanned = None;
+        guard.last_sig = None;
+        guard.sig_changed_at = Instant::now();
+    }
+}
+
+/// Stamp `_MOTIF_WM_HINTS` (decorations off) on a brand-new CSD window *before*
+/// xfwm4 processes `MapRequest`, preventing xfwm4 from painting a server frame
+/// and then clearing the composited backing pixmap to black when stripping it.
+pub fn anticipate_csd_window() {
+    reset_settle();
+    if cfg!(test)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("DISPLAY").is_none()
+    {
+        return;
+    }
+    let known: HashSet<u32> = state()
+        .lock()
+        .ok()
+        .map(|g| g.shapes.keys().copied().collect())
+        .unwrap_or_default();
+    let _ = std::thread::Builder::new()
+        .name("zalo-csd-frame".into())
+        .spawn(move || {
+            let Some((conn, screen)) = x11rb::connect(None).ok() else {
+                return;
+            };
+            let Some(root) = conn.setup().roots.get(screen).map(|s| s.root) else {
+                return;
+            };
+            let intern = |name: &[u8]| -> Option<u32> {
+                conn.intern_atom(false, name)
+                    .ok()?
+                    .reply()
+                    .ok()
+                    .map(|r| r.atom)
+                    .filter(|a| *a != 0)
+            };
+            let Some(wm_pid) = intern(b"_NET_WM_PID") else {
+                return;
+            };
+            let Some(wm_name) = intern(b"_NET_WM_NAME") else {
+                return;
+            };
+            let Some(utf8) = intern(b"UTF8_STRING") else {
+                return;
+            };
+            let Some(motif) = intern(b"_MOTIF_WM_HINTS") else {
+                return;
+            };
+            let pid = std::process::id();
+            for _ in 0..35 {
+                for window in owned_clients(&conn, root, wm_pid, pid) {
+                    if known.contains(&window) {
+                        continue;
+                    }
+                    let name = window_name(&conn, window, wm_name, utf8);
+                    if name.starts_with("Zalo Call") || name.starts_with("Zalo Notice") {
+                        continue;
+                    }
+                    if write_motif(&conn, window, motif) {
+                        let _ = conn.flush();
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(3));
+            }
+        });
 }
 
 /// Apply the OS frame for every Zalo window of this process.
 ///
 /// Throttled: `wrap_csd` runs on every frame. Unit tests never open a display.
 pub fn sync(scale: f32) {
+    let _ = sync_window(0, 0, false, scale);
+}
+
+/// Geometry-aware X11 frame sync. Returns `true` when `_MOTIF_WM_HINTS` or
+/// `XShape` was newly applied so the caller can immediately refresh the
+/// composited surface (preventing a black startup frame on XFCE/xfwm4).
+///
+/// Once the window's geometry has been shaped and settled for 1.5 s, subsequent
+/// calls with identical `(width, height, maximized, scale)` return immediately
+/// with zero X11 syscalls (avoiding frame stalls during scrolling).
+pub fn sync_window(width: i32, height: i32, maximized: bool, scale: f32) -> bool {
     if cfg!(test) || std::env::var_os("DISPLAY").is_none() {
-        return;
+        return false;
     }
-    // xfwm centers a new window and then ignores its CreateWindow position.
-    // The shape scan below is throttled, and an idle popup often renders
-    // only once, so that gate used to swallow the only chance to move the
-    // notice off the middle of the Zalo window.
     snap_locked_if_due(scale);
     let Ok(mut guard) = state().try_lock() else {
-        return;
+        return false;
     };
     let now = Instant::now();
-    if guard
-        .scanned
-        .is_some_and(|at| now.duration_since(at) < Duration::from_millis(250))
+    let sig = (
+        width,
+        height,
+        maximized,
+        (scale.max(1.0) * 100.0).round() as u16,
+    );
+    let sig_changed = width > 0 && height > 0 && guard.last_sig != Some(sig);
+    if sig_changed {
+        guard.last_sig = Some(sig);
+        guard.sig_changed_at = now;
+    }
+    let settled = !sig_changed
+        && !guard.shapes.is_empty()
+        && now.duration_since(guard.sig_changed_at) >= Duration::from_millis(1500);
+    if settled {
+        return false;
+    }
+    let throttle = if guard.shapes.is_empty() || sig_changed {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_millis(250)
+    };
+    if !sig_changed
+        && guard
+            .scanned
+            .is_some_and(|at| now.duration_since(at) < throttle)
     {
-        return;
+        return false;
     }
     guard.scanned = Some(now);
     let known = guard.shapes.clone();
     drop(guard);
 
-    let Some(shapes) = apply(scale, &known) else {
-        return;
+    let Some((shapes, changed)) = apply(scale, &known) else {
+        return false;
     };
     if let Ok(mut guard) = state().lock() {
         guard.shapes = shapes;
     }
+    changed
 }
 
 /// Rectangles that fill a `width`×`height` window with a circular corner of
@@ -235,7 +347,7 @@ fn compositor_present(conn: &impl Connection, screen: usize) -> bool {
     cookie.reply().ok().is_some_and(|owner| owner.owner != 0)
 }
 
-fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<HashMap<u32, ShapeKey>> {
+fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<(HashMap<u32, ShapeKey>, bool)> {
     let (conn, screen) = x11rb::connect(None).ok()?;
     let root = conn.setup().roots.get(screen)?.root;
     let atom = |name: &str| -> Option<u32> {
@@ -255,6 +367,7 @@ fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<HashMap<u32, Shap
     let utf8 = atom("UTF8_STRING")?;
     let above = atom("_NET_WM_STATE_ABOVE");
     let skip_taskbar = atom("_NET_WM_STATE_SKIP_TASKBAR");
+    let skip_pager = atom("_NET_WM_STATE_SKIP_PAGER");
     let ids = prop32(&conn, root, client_list)?;
     let pid = std::process::id();
     let composited = compositor_present(&conn, screen);
@@ -268,6 +381,8 @@ fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<HashMap<u32, Shap
         0
     };
     let mut shapes = HashMap::new();
+    let mut changed = false;
+    let mut newly_framed: Vec<(u32, u16, u16)> = Vec::new();
     for window in ids {
         let Some(owner) = prop32(&conn, window, wm_pid).and_then(|v| v.first().copied()) else {
             continue;
@@ -308,12 +423,18 @@ fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<HashMap<u32, Shap
         };
         let previous = known.get(&window).copied();
         let motif_done = previous.is_some_and(|prev| prev.motif);
-        if !motif_done && !write_motif(&conn, window, motif) {
-            continue;
+        if !motif_done {
+            if !write_motif(&conn, window, motif) {
+                continue;
+            }
+            changed = true;
         }
         let raised = if name_notice {
             let already = previous.is_some_and(|prev| prev.raised);
-            already || raise_notice(&conn, root, window, wm_state, above, skip_taskbar)
+            if !already {
+                write_notice_no_focus(&conn, window);
+            }
+            already || raise_notice(&conn, root, window, wm_state, above, skip_taskbar, skip_pager)
         } else {
             false
         };
@@ -331,19 +452,59 @@ fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<HashMap<u32, Shap
                 && prev.radius == key.radius
                 && prev.composited == key.composited
         });
-        if !same_shape && !write_shape(&conn, window, geo.width, geo.height, radius, composited) {
-            continue;
+        if !same_shape {
+            if !write_shape(&conn, window, geo.width, geo.height, radius, composited) {
+                continue;
+            }
+            changed = true;
         }
-        // The frame is a sibling-sized parent. Its bounding rectangle stays
-        // square even after the client is shaped, and with the compositor off
-        // that square is the plate under the rounded UI.
-        shape_frame(
-            &conn, root, window, geo.x, geo.y, geo.width, geo.height, radius, composited,
-        );
+        if !same_shape || !motif_done {
+            // The frame is a sibling-sized parent. Its bounding rectangle stays
+            // square even after the client is shaped, and with the compositor off
+            // that square is the plate under the rounded UI.
+            shape_frame(
+                &conn, root, window, geo.x, geo.y, geo.width, geo.height, radius, composited,
+            );
+            send_expose(&conn, window, geo.width, geo.height);
+            if !motif_done {
+                newly_framed.push((window, geo.width, geo.height));
+            }
+        }
         shapes.insert(window, key);
     }
     let _ = conn.flush();
-    Some(shapes)
+    if !newly_framed.is_empty() {
+        // xfwm4 strips the server frame asynchronously and clears the newly
+        // redirected composited pixmap to black without re-sending Expose;
+        // follow-up Expose events force GPUI's X11 refresh loop to present.
+        std::thread::spawn(move || {
+            for delay_ms in [120u64, 350] {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let Ok((conn, _)) = x11rb::connect(None) else {
+                    break;
+                };
+                for &(win, w, h) in &newly_framed {
+                    send_expose(&conn, win, w, h);
+                }
+                let _ = conn.flush();
+            }
+        });
+    }
+    Some((shapes, changed))
+}
+
+fn send_expose(conn: &impl Connection, window: u32, width: u16, height: u16) {
+    let ev = ExposeEvent {
+        response_type: EXPOSE_EVENT,
+        sequence: 0,
+        window,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        count: 0,
+    };
+    let _ = conn.send_event(false, window, EventMask::EXPOSURE, ev);
 }
 
 /// `_MOTIF_WM_HINTS`: flags = decorations, decorations = none.
@@ -465,7 +626,98 @@ fn shape_frame(
     let _ = write_shape_pair(conn, parent, &bounding, &input);
 }
 
-/// `_NET_WM_STATE_ADD` for above + skip-taskbar. `0` means that atom is absent.
+/// Mark a notification window as non-focusable, frameless, and typed as
+/// `_NET_WM_WINDOW_TYPE_NOTIFICATION` (matching Electron `focusable: false`,
+/// `type: 'notification'`, `showInactive()`).
+///
+/// * `WM_HINTS` with `InputHint = 1, input = 0` (ICCCM No Input model) tells
+///   every X11 WM never to grant keyboard focus to this popup.
+/// * `_NET_WM_USER_TIME = 0` (EWMH) requests no initial focus on map.
+/// * `_NET_WM_WINDOW_TYPE_NOTIFICATION` keeps xfwm4/KWin/Mutter from decorating
+///   or centering the popup or stealing focus.
+/// * `_MOTIF_WM_HINTS` keeps decorations off on WMs that ignore window type.
+fn write_notice_no_focus(conn: &impl Connection, window: u32) {
+    // ICCCM WM_HINTS: 9 CARD32s; flags = InputHint (1), input = False (0).
+    let wm_hints: [u32; 9] = [1, 0, 0, 0, 0, 0, 0, 0, 0];
+    let _ = conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        AtomEnum::WM_HINTS,
+        AtomEnum::WM_HINTS,
+        &wm_hints,
+    );
+    let intern = |name: &[u8]| -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+            .filter(|a| *a != 0)
+    };
+    if let Some(user_time) = intern(b"_NET_WM_USER_TIME") {
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            user_time,
+            AtomEnum::CARDINAL,
+            &[0u32],
+        );
+    }
+    if let (Some(wm_type), Some(notif_type)) = (
+        intern(b"_NET_WM_WINDOW_TYPE"),
+        intern(b"_NET_WM_WINDOW_TYPE_NOTIFICATION"),
+    ) {
+        let _ = conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            wm_type,
+            AtomEnum::ATOM,
+            &[notif_type],
+        );
+    }
+    if let Some(motif) = intern(b"_MOTIF_WM_HINTS") {
+        let _ = write_motif(conn, window, motif);
+    }
+}
+
+/// Apply all non-focusable notification properties plus `_NET_WM_STATE`
+/// (`ABOVE` + `SKIP_TASKBAR` + `SKIP_PAGER`).
+fn configure_notice_hints(conn: &impl Connection, root: u32, window: u32, mapped: bool) {
+    write_notice_no_focus(conn, window);
+    let intern = |name: &[u8]| -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+            .filter(|a| *a != 0)
+    };
+    let Some(wm_state) = intern(b"_NET_WM_STATE") else {
+        return;
+    };
+    let above = intern(b"_NET_WM_STATE_ABOVE");
+    let skip_taskbar = intern(b"_NET_WM_STATE_SKIP_TASKBAR");
+    let skip_pager = intern(b"_NET_WM_STATE_SKIP_PAGER");
+    if mapped {
+        let _ = raise_notice(conn, root, window, wm_state, above, skip_taskbar, skip_pager);
+    } else {
+        let states: Vec<u32> = [above, skip_taskbar, skip_pager]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !states.is_empty() {
+            let _ = conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                wm_state,
+                AtomEnum::ATOM,
+                &states,
+            );
+        }
+    }
+}
+
+/// `_NET_WM_STATE_ADD` for above + skip-taskbar + skip-pager. `0` means that atom is absent.
 fn raise_notice(
     conn: &impl Connection,
     root: u32,
@@ -473,29 +725,153 @@ fn raise_notice(
     wm_state: u32,
     above: Option<u32>,
     skip_taskbar: Option<u32>,
+    skip_pager: Option<u32>,
 ) -> bool {
     let above = above.unwrap_or(0);
     let skip_taskbar = skip_taskbar.unwrap_or(0);
-    if above == 0 && skip_taskbar == 0 {
+    let skip_pager = skip_pager.unwrap_or(0);
+    if above == 0 && skip_taskbar == 0 && skip_pager == 0 {
         return false;
     }
-    let event = ClientMessageEvent::new(32, window, wm_state, [1u32, above, skip_taskbar, 1, 0]);
-    conn.send_event(
-        false,
-        root,
-        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-        event,
-    )
-    .is_ok()
+    let mut ok = true;
+    if above != 0 || skip_taskbar != 0 {
+        let event = ClientMessageEvent::new(32, window, wm_state, [1u32, above, skip_taskbar, 1, 0]);
+        ok &= conn
+            .send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .is_ok();
+    }
+    if skip_pager != 0 {
+        let event = ClientMessageEvent::new(32, window, wm_state, [1u32, skip_pager, 0, 1, 0]);
+        ok &= conn
+            .send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                event,
+            )
+            .is_ok();
+    }
+    ok
+}
+
+/// Lightweight X11 sync dedicated to the `Zalo Notice` popup.
+///
+/// Runs independently of the main window's `settled` gate and finds the popup
+/// via `query_tree` even when a WM omits `_NET_WM_WINDOW_TYPE_NOTIFICATION`
+/// windows from `_NET_CLIENT_LIST`.
+pub fn sync_notice(scale: f32) {
+    if cfg!(test) || std::env::var_os("DISPLAY").is_none() {
+        return;
+    }
+    snap_locked_if_due(scale);
+    static CONFIGURED: OnceLock<Mutex<Option<(u32, u16, u16, bool)>>> = OnceLock::new();
+    let s = scale.max(1.0);
+    let want_w = (crate::notice::NOTICE_W * s).round().clamp(1.0, 4096.0) as u16;
+    let want_h = (crate::notice::NOTICE_H * s).round().clamp(1.0, 4096.0) as u16;
+    let Some((conn, screen)) = x11rb::connect(None).ok() else {
+        return;
+    };
+    let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
+        return;
+    };
+    let Some(window) = find_notice(&conn, root, want_w, want_h) else {
+        return;
+    };
+    let composited = compositor_present(&conn, screen);
+    let sig = (window, want_w, want_h, composited);
+    let already = CONFIGURED
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .is_some_and(|guard| *guard == Some(sig));
+    if already {
+        return;
+    }
+    configure_notice_hints(&conn, root, window, notice_viewable(&conn, window));
+    let radius = if composited {
+        (4.0 * s).round().clamp(1.0, 32.0) as u16
+    } else {
+        0
+    };
+    let _ = write_shape(&conn, window, want_w, want_h, radius, composited);
+    let _ = conn.flush();
+    if let Ok(mut guard) = CONFIGURED.get_or_init(|| Mutex::new(None)).lock() {
+        *guard = Some(sig);
+    }
+}
+
+/// Current X11 root pointer coordinates `(x, y)` in device pixels.
+/// Returns `None` on Wayland, headless tests, or when `DISPLAY` is unset.
+pub fn query_pointer_root() -> Option<(i32, i32)> {
+    if cfg!(test)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("DISPLAY").is_none()
+    {
+        return None;
+    }
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen)?.root;
+    let reply = conn.query_pointer(root).ok()?.reply().ok()?;
+    Some((i32::from(reply.root_x), i32::from(reply.root_y)))
+}
+
+/// True screen origin of the open `Zalo Notice` window in logical pixels.
+pub fn notice_root_origin(scale: f32) -> Option<(f32, f32)> {
+    if cfg!(test)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("DISPLAY").is_none()
+    {
+        return None;
+    }
+    let s = scale.max(1.0);
+    let want_w = (crate::notice::NOTICE_W * s).round().clamp(1.0, 4096.0) as u16;
+    let want_h = (crate::notice::NOTICE_H * s).round().clamp(1.0, 4096.0) as u16;
+    let (conn, screen) = x11rb::connect(None).ok()?;
+    let root = conn.setup().roots.get(screen)?.root;
+    let window = find_notice(&conn, root, want_w, want_h)?;
+    let pos = conn.translate_coordinates(window, root, 0, 0).ok()?.reply().ok()?;
+    Some((f32::from(pos.dst_x) / s, f32::from(pos.dst_y) / s))
+}
+
+/// Move the open `Zalo Notice` window to `(x, y)` (logical pixels) without
+/// unmapping, stealing focus, or handing pointer grab to the WM.
+pub fn move_notice_to(x: f32, y: f32, scale: f32) -> bool {
+    if cfg!(test)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("DISPLAY").is_none()
+    {
+        return false;
+    }
+    let s = scale.max(1.0);
+    let want_x = (x * s).round() as i32;
+    let want_y = (y * s).round() as i32;
+    let want_w = (crate::notice::NOTICE_W * s).round().clamp(1.0, 4096.0) as u16;
+    let want_h = (crate::notice::NOTICE_H * s).round().clamp(1.0, 4096.0) as u16;
+    let Some((conn, screen)) = x11rb::connect(None).ok() else {
+        return false;
+    };
+    let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
+        return false;
+    };
+    let Some(window) = find_notice(&conn, root, want_w, want_h) else {
+        return false;
+    };
+    move_notice_window(&conn, root, window, want_x, want_y, want_w, want_h, true);
+    true
 }
 
 /// Push a locked notice toward its corner, at most once every 40 ms.
 ///
 /// No-op when nothing is locked (the user is dragging, or no popup is open).
 fn snap_locked_if_due(scale: f32) {
-    if crate::notice::locked_origin().is_none() {
+    let Some((lx, ly)) = crate::notice::locked_origin() else {
         return;
-    }
+    };
     let now = Instant::now();
     let due = match state().try_lock() {
         Ok(mut guard) => {
@@ -512,104 +888,6 @@ fn snap_locked_if_due(scale: f32) {
     if !due {
         return;
     }
-    let Some((conn, screen)) = x11rb::connect(None).ok() else {
-        return;
-    };
-    let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
-        return;
-    };
-    let atom = |name: &str| -> Option<u32> {
-        conn.intern_atom(false, name.as_bytes())
-            .ok()?
-            .reply()
-            .ok()
-            .map(|reply| reply.atom)
-    };
-    let Some(client_list) = atom("_NET_CLIENT_LIST") else {
-        return;
-    };
-    let Some(wm_pid) = atom("_NET_WM_PID") else {
-        return;
-    };
-    let Some(wm_name) = atom("_NET_WM_NAME") else {
-        return;
-    };
-    let Some(utf8) = atom("UTF8_STRING") else {
-        return;
-    };
-    let moveresize = atom("_NET_MOVERESIZE_WINDOW").unwrap_or(0);
-    if moveresize == 0 {
-        return;
-    }
-    let Some(ids) = prop32(&conn, root, client_list) else {
-        return;
-    };
-    let pid = std::process::id();
-    for window in ids {
-        let Some(owner) = prop32(&conn, window, wm_pid).and_then(|values| values.first().copied())
-        else {
-            continue;
-        };
-        if owner != pid {
-            continue;
-        }
-        let name = window_name(&conn, window, wm_name, utf8);
-        if !name.starts_with("Zalo Notice") {
-            continue;
-        }
-        snap_notice(&conn, root, window, moveresize, scale);
-    }
-    let _ = conn.flush();
-}
-
-/// Move a locked notice to its screen corner.
-///
-/// xfwm reparents the client and then ignores a plain `ConfigureWindow`:
-/// the frame stays where the WM placed it (often the middle of the monitor,
-/// on top of the main window). `_NET_MOVERESIZE_WINDOW` is the request xfwm
-/// actually applies. NorthWest gravity, with X, Y, width and height present.
-fn snap_notice(conn: &impl Connection, root: u32, window: u32, moveresize: u32, scale: f32) {
-    let Some((lx, ly)) = crate::notice::locked_origin() else {
-        return;
-    };
-    let s = scale.max(1.0);
-    let want_x = (lx * s).round() as i32;
-    let want_y = (ly * s).round() as i32;
-    let Ok(cookie) = conn.translate_coordinates(window, root, 0, 0) else {
-        return;
-    };
-    let Ok(pos) = cookie.reply() else {
-        return;
-    };
-    if (i32::from(pos.dst_x) - want_x).abs() <= 2 && (i32::from(pos.dst_y) - want_y).abs() <= 2 {
-        return;
-    }
-    // Gravity in the low byte. Bits 8–11 are X, Y, width, height.
-    let flags = 1u32 | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
-    let event = ClientMessageEvent::new(
-        32,
-        window,
-        moveresize,
-        [flags, want_x as u32, want_y as u32, 352u32, 82u32],
-    );
-    let _ = conn.send_event(
-        false,
-        root,
-        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
-        event,
-    );
-}
-
-/// Withdraw a just-mapped notice and map it again on its corner.
-///
-/// GPUI maps the window before the first draw, and xfwm then centers it.
-/// Hints plus `_NET_MOVERESIZE_WINDOW` while the window is withdrawn land it
-/// on the corner before that first draw, so the card does not appear in the
-/// middle of the screen and then jump.
-pub fn park_notice(scale: f32) {
-    let Some((lx, ly)) = crate::notice::locked_origin() else {
-        return;
-    };
     let s = scale.max(1.0);
     let want_x = (lx * s).round() as i32;
     let want_y = (ly * s).round() as i32;
@@ -627,16 +905,52 @@ pub fn park_notice(scale: f32) {
     if notice_is_at(&conn, window, root, want_x, want_y) {
         return;
     }
-    place_notice_window(&conn, root, window, want_x, want_y, want_w, want_h, true);
+    move_notice_window(&conn, root, window, want_x, want_y, want_w, want_h, true);
 }
 
-/// Set the notice position before xfwm handles the first `MapRequest`.
+/// Stamp non-focusable notification hints and land the notice on its corner
+/// without unmapping/remapping (which would flash and trigger WM focus logic).
+pub fn park_notice(scale: f32) {
+    if cfg!(test) || std::env::var_os("DISPLAY").is_none() {
+        return;
+    }
+    let Some((lx, ly)) = crate::notice::locked_origin() else {
+        return;
+    };
+    let s = scale.max(1.0);
+    let want_x = (lx * s).round() as i32;
+    let want_y = (ly * s).round() as i32;
+    let want_w = (crate::notice::NOTICE_W * s).round().clamp(1.0, 4096.0) as u16;
+    let want_h = (crate::notice::NOTICE_H * s).round().clamp(1.0, 4096.0) as u16;
+    let Some((conn, screen)) = x11rb::connect(None).ok() else {
+        return;
+    };
+    let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
+        return;
+    };
+    let Some(window) = find_notice(&conn, root, want_w, want_h) else {
+        return;
+    };
+    let viewable = notice_viewable(&conn, window);
+    place_notice_window(
+        &conn, root, window, want_x, want_y, want_w, want_h, viewable,
+    );
+    let composited = compositor_present(&conn, screen);
+    let radius = if composited {
+        (4.0 * s).round().clamp(1.0, 32.0) as u16
+    } else {
+        0
+    };
+    let _ = write_shape(&conn, window, want_w, want_h, radius, composited);
+    let _ = conn.flush();
+}
+
+/// Stamp non-focusable notification hints (`WM_HINTS.input=0`,
+/// `_NET_WM_USER_TIME=0`, `USPosition`) before the WM handles `MapRequest`.
 ///
-/// GPUI maps inside `Window::new`, and xfwm then centers a window that has
-/// no position hint. This thread stamps `USPosition` while the window is
-/// still withdrawn, so the card does not appear in the middle and jump.
+/// Never unmaps/remaps a mapped window so the WM cannot steal focus or flash.
 pub fn anticipate_notice(scale: f32) {
-    if cfg!(test) {
+    if cfg!(test) || std::env::var_os("DISPLAY").is_none() {
         return;
     }
     let Some((lx, ly)) = crate::notice::locked_origin() else {
@@ -656,19 +970,27 @@ pub fn anticipate_notice(scale: f32) {
             let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
                 return;
             };
-            for _ in 0..100 {
+            let mut stamped = false;
+            for _ in 0..30 {
                 if let Some(window) = find_notice(&conn, root, want_w, want_h) {
                     let viewable = notice_viewable(&conn, window);
                     if !viewable {
-                        place_notice_window(
-                            &conn, root, window, want_x, want_y, want_w, want_h, false,
-                        );
-                    } else if notice_is_at(&conn, window, root, want_x, want_y) {
-                        return;
+                        if !stamped {
+                            place_notice_window(
+                                &conn, root, window, want_x, want_y, want_w, want_h, false,
+                            );
+                            stamped = true;
+                        }
                     } else {
-                        place_notice_window(
-                            &conn, root, window, want_x, want_y, want_w, want_h, true,
-                        );
+                        if !stamped || !notice_is_at(&conn, window, root, want_x, want_y) {
+                            place_notice_window(
+                                &conn, root, window, want_x, want_y, want_w, want_h, true,
+                            );
+                            stamped = true;
+                        }
+                        if notice_is_at(&conn, window, root, want_x, want_y) {
+                            return;
+                        }
                     }
                 }
                 std::thread::sleep(Duration::from_millis(4));
@@ -683,8 +1005,8 @@ fn notice_viewable(conn: &impl Connection, window: u32) -> bool {
         .is_some_and(|attrs| attrs.map_state == MapState::VIEWABLE)
 }
 
-/// `USPosition` + `PPosition` so xfwm keeps the programmed corner.
-/// `remap` withdraws and maps again; leave it false while GPUI has not mapped yet.
+/// Apply non-focusable notification hints and position `(x, y)` without
+/// unmapping or remapping.
 fn place_notice_window(
     conn: &impl Connection,
     root: u32,
@@ -693,11 +1015,24 @@ fn place_notice_window(
     y: i32,
     width: u16,
     height: u16,
-    remap: bool,
+    mapped: bool,
 ) {
-    if remap {
-        let _ = conn.unmap_window(window);
-    }
+    configure_notice_hints(conn, root, window, mapped);
+    move_notice_window(conn, root, window, x, y, width, height, mapped);
+}
+
+/// Move a notice window via `WM_NORMAL_HINTS` + `ConfigureWindow` (plus
+/// `_NET_MOVERESIZE_WINDOW` once mapped) without unmapping or stealing focus.
+fn move_notice_window(
+    conn: &impl Connection,
+    root: u32,
+    window: u32,
+    x: i32,
+    y: i32,
+    width: u16,
+    height: u16,
+    mapped: bool,
+) {
     let ww = u32::from(width);
     let hh = u32::from(height);
     // USPosition | USSize | PPosition | PSize | PMinSize | PMaxSize | PWinGravity.
@@ -716,10 +1051,7 @@ fn place_notice_window(
         window,
         &ConfigureWindowAux::new().x(x).y(y).width(ww).height(hh),
     );
-    // A window xfwm has already managed ignores ConfigureWindow. The EWMH
-    // request is what moves that frame. Skip it before the first map so the
-    // position hint is the only placement input.
-    if remap {
+    if mapped && !notice_is_at(conn, window, root, x, y) {
         if let Some(moveresize) = conn
             .intern_atom(false, b"_NET_MOVERESIZE_WINDOW")
             .ok()
@@ -741,9 +1073,6 @@ fn place_notice_window(
                 event,
             );
         }
-    }
-    if remap {
-        let _ = conn.map_window(window);
     }
     let _ = conn.flush();
 }
@@ -1012,5 +1341,11 @@ mod tests {
     #[test]
     fn sync_does_not_touch_the_display_under_test() {
         sync(1.0);
+        sync_notice(1.0);
+        park_notice(1.0);
+        anticipate_notice(1.0);
+        assert_eq!(query_pointer_root(), None);
+        assert_eq!(notice_root_origin(1.0), None);
+        assert!(!move_notice_to(10.0, 20.0, 1.0));
     }
 }

@@ -143,18 +143,42 @@ pub fn parse_alpha(css: &str, base: u32) -> Option<u32> {
 
 /// Theme token as `0xRRGGBB` (dark table when [`set_dark`]), or the fallback.
 /// Translucent tokens are flattened over the panel background.
+///
+/// Results are cached per `(dark, name)` so repeated per-frame lookups never
+/// re-parse `rgba(...)` / `hsla(...)` strings.
 pub fn token_rgb(name: &str, fallback: &str) -> u32 {
+    use std::collections::HashMap;
+    use std::sync::{OnceLock, RwLock};
+
+    static LIGHT_CACHE: OnceLock<RwLock<HashMap<String, Option<u32>>>> = OnceLock::new();
+    static DARK_CACHE: OnceLock<RwLock<HashMap<String, Option<u32>>>> = OnceLock::new();
+
     let dark = is_dark();
+    let cache = if dark {
+        DARK_CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(96)))
+    } else {
+        LIGHT_CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(96)))
+    };
+
+    if let Ok(guard) = cache.read() {
+        if let Some(&cached) = guard.get(name) {
+            return cached.or_else(|| parse_hex(fallback)).unwrap_or(0);
+        }
+    }
+
     let table = if dark {
         zalo_design::dark(name).or_else(|| zalo_design::light(name))
     } else {
         zalo_design::light(name)
     };
     let base = if dark { 0x22_26_2b } else { 0xff_ff_ff };
-    table
-        .and_then(|v| parse_hex(v).or_else(|| parse_alpha(v, base)))
-        .or_else(|| parse_hex(fallback))
-        .unwrap_or(0)
+    let resolved = table.and_then(|v| parse_hex(v).or_else(|| parse_alpha(v, base)));
+
+    if let Ok(mut guard) = cache.write() {
+        guard.insert(name.to_owned(), resolved);
+    }
+
+    resolved.or_else(|| parse_hex(fallback)).unwrap_or(0)
 }
 
 #[cfg(test)]

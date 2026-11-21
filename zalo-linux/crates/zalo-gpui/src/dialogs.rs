@@ -2127,7 +2127,7 @@ impl ShellView {
         for (idx, f) in self.friends.iter().enumerate() {
             if !f.name.is_empty()
                 && f.name != "Zalo"
-                && f.name != "Cloud của tôi"
+                && !crate::shell::is_my_documents(&f.name, &f.uid, self.send2me_id.as_deref())
                 && !all
                     .iter()
                     .any(|p| (!f.uid.is_empty() && p.uid == f.uid) || p.name == f.name)
@@ -2155,11 +2155,15 @@ impl ShellView {
             }
         }
         if all.is_empty() {
-            for c in self
-                .convs
-                .iter()
-                .filter(|c| !c.is_group && c.name != "Cloud của tôi" && c.name != "Zalo")
-            {
+            for c in self.convs.iter().filter(|c| {
+                !c.is_group
+                    && !crate::shell::is_my_documents(
+                        &c.name,
+                        &c.thread_id,
+                        self.send2me_id.as_deref(),
+                    )
+                    && c.name != "Zalo"
+            }) {
                 all.push(Person {
                     uid: c.thread_id.clone(),
                     name: c.name.clone(),
@@ -2636,6 +2640,13 @@ impl ShellView {
     pub(crate) fn apply_profile_aliases(&mut self) {
         let mut titles: Vec<(String, String)> = Vec::new();
         for c in &mut self.convs {
+            if crate::shell::is_my_documents(&c.name, &c.thread_id, self.send2me_id.as_deref()) {
+                if c.name != "My Documents" {
+                    c.name = "My Documents".to_owned();
+                    titles.push((c.thread_id.clone(), c.name.clone()));
+                }
+                continue;
+            }
             if c.is_group {
                 let profile_name = self
                     .profiles

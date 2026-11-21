@@ -1818,9 +1818,9 @@ impl ShellView {
                     .size(px(80.))
                     .rounded(px(40.))
                     .border_2()
-                    .border_color(rgb(0xffffff))
+                    .border_color(rgb(token_rgb("--layer-background", "#ffffff")))
                     .overflow_hidden()
-                    .bg(rgb(0xffffff))
+                    .bg(rgb(token_rgb("--layer-background", "#ffffff")))
                     .child(self.dialog_avatar(person, 76.)),
             )
             .child(
@@ -1832,7 +1832,7 @@ impl ShellView {
                     .rounded(px(12.))
                     .bg(rgb(subtle))
                     .border_2()
-                    .border_color(rgb(0xffffff))
+                    .border_color(rgb(token_rgb("--layer-background", "#ffffff")))
                     .flex()
                     .items_center()
                     .justify_center()

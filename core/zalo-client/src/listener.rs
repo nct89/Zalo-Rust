@@ -105,6 +105,22 @@ pub const CMD_PULL_REACT_GROUP: u16 = 611;
 pub const CMD_PUSH_REACT: u16 = 612;
 /// A reaction was cleared (`CTRL_PUSH_CLEAR_REACT`).
 pub const CMD_CLEAR_REACT: u16 = 613;
+/// Sync 2 (phone → PC): request sync session (`TRANSFER_MSG_REQUEST`).
+pub const CMD_SYNC_REQUEST: u16 = 590;
+/// Sync 2 (phone → PC): dispose/delete sync session (`TRANSFER_MSG_ACK_DELETE`).
+pub const CMD_SYNC_ACK_DELETE: u16 = 591;
+/// Sync 2 (phone → PC): wake up mobile master device (`TRANSFER_MSG_WAKEUP`).
+pub const CMD_SYNC_WAKEUP: u16 = 592;
+/// Backup (PC → phone): initialize backup session with metadata + bkid + client_salt.
+pub const CMD_BACKUP_INIT: u16 = 630;
+/// Backup (PC → phone): create backup session (`bkid` + `server_nonce`).
+pub const CMD_BACKUP_CREATE_SESSION: u16 = 631;
+/// Backup (PC → phone): fetch existing backup metadata (`1001` = none).
+pub const CMD_BACKUP_GET_METADATA: u16 = 632;
+/// Backup (PC → phone): signal mobile device to restore backup.
+pub const CMD_BACKUP_SIGNAL_RESTORE: u16 = 633;
+/// Backup (PC → phone): fetch server backup configs (`retention_time`).
+pub const CMD_BACKUP_GET_CONFIGS: u16 = 634;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLOSE_DUPLICATE: u16 = 3000;
@@ -473,7 +489,22 @@ impl EventDecoder {
     fn decode_body(&self, frame: &Frame) -> Result<Value, ListenerError> {
         let body = frame.body_json()?;
         if body.get("encrypt").is_some() {
-            decode_event_data(&body, self.cipher_key.as_deref())
+            let decoded = decode_event_data(&body, self.cipher_key.as_deref())?;
+            if is_rpc_envelope_cmd(frame.cmd)
+                && body.get("error_code").is_some()
+                && decoded.get("error_code").is_none()
+            {
+                let mut envelope = serde_json::Map::new();
+                if let Some(code) = body.get("error_code") {
+                    envelope.insert("error_code".to_owned(), code.clone());
+                }
+                if let Some(msg) = body.get("error_message") {
+                    envelope.insert("error_message".to_owned(), msg.clone());
+                }
+                envelope.insert("data".to_owned(), decoded);
+                return Ok(Value::Object(envelope));
+            }
+            Ok(decoded)
         } else {
             Ok(body)
         }
@@ -633,6 +664,20 @@ pub fn offline_pull_frame(
             "lastId": last_id,
             "preIds": [],
         }),
+    )
+}
+
+fn is_rpc_envelope_cmd(cmd: u16) -> bool {
+    matches!(
+        cmd,
+        CMD_SYNC_REQUEST
+            | CMD_SYNC_ACK_DELETE
+            | CMD_SYNC_WAKEUP
+            | CMD_BACKUP_INIT
+            | CMD_BACKUP_CREATE_SESSION
+            | CMD_BACKUP_GET_METADATA
+            | CMD_BACKUP_SIGNAL_RESTORE
+            | CMD_BACKUP_GET_CONFIGS
     )
 }
 
@@ -1950,6 +1995,32 @@ mod tests {
                 assert_eq!(items[0]["isGroup"], 1);
             }
             other => panic!("expected group batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rpc_envelope_preserves_outer_error_code_for_sync_and_backup_cmds() {
+        let mut decoder = EventDecoder::new();
+        let frame_632 = Frame::json(
+            CMD_BACKUP_GET_METADATA,
+            0,
+            &json!({
+                "error_code": 1001,
+                "error_message": "No backup",
+                "encrypt": 0,
+                "data": { "reqId": "bk_req_1" }
+            }),
+        );
+        let events = decoder.handle_all(&frame_632).expect("decode 632");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ListenerEvent::Event { cmd, sub_cmd, data } => {
+                assert_eq!(*cmd, CMD_BACKUP_GET_METADATA);
+                assert_eq!(*sub_cmd, 0);
+                assert_eq!(data["error_code"], 1001);
+                assert_eq!(data["data"]["reqId"], "bk_req_1");
+            }
+            other => panic!("expected Event, got {other:?}"),
         }
     }
 

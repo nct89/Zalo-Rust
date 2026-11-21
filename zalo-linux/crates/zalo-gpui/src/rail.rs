@@ -155,7 +155,7 @@ impl ShellView {
                     ic::DOCS
                 },
                 "☁",
-                "Cloud của tôi",
+                "My Documents",
                 selected == Rail::Docs,
                 Some(Rail::Docs),
                 cx,
@@ -392,7 +392,11 @@ impl ShellView {
                 div()
                     .relative()
                     .h(px(196.))
-                    .bg(rgb(0xe5_f8_ff))
+                    .bg(rgb(if crate::color::is_dark() {
+                        0x1c_2b_3c
+                    } else {
+                        0xe5_f8_ff
+                    }))
                     .when_some(image, |el, img| {
                         el.child(gpui::img(img).w(px(336.)).h(px(196.)).object_fit(gpui::ObjectFit::Cover))
                     })
@@ -408,9 +412,19 @@ impl ShellView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .bg(hsla(0., 0., 1., 0.55))
-                            .text_color(rgb(0x08_1b_3a))
-                            .hover(|st| st.bg(hsla(0., 0., 1., 0.85)))
+                            .bg(if crate::color::is_dark() {
+                                hsla(0., 0., 0., 0.55)
+                            } else {
+                                hsla(0., 0., 1., 0.65)
+                            })
+                            .text_color(rgb(token_rgb("--text-primary", "#081b3a")))
+                            .hover(|st| {
+                                st.bg(if crate::color::is_dark() {
+                                    hsla(0., 0., 0., 0.8)
+                                } else {
+                                    hsla(0., 0., 1., 0.9)
+                                })
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.rail_popup = None;
                                 cx.notify();

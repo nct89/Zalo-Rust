@@ -209,6 +209,7 @@ impl LocalStore {
     fn from_connection(conn: Connection) -> Result<Self, StorageError> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -697,6 +698,125 @@ impl LocalStore {
         self.conn
             .execute("DELETE FROM outbox WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Inserts or updates a batch of threads inside a single SQLite transaction,
+    /// ensuring placeholder `users` rows exist for any `peer_user_id` so foreign
+    /// key constraints never drop synced 1-1 conversations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the SQLite transaction fails.
+    pub fn upsert_threads_batch(&mut self, threads: &[ThreadRecord]) -> Result<usize, StorageError> {
+        if threads.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut user_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO users (user_id, display_name, zalo_name, updated_at)
+                 VALUES (?1, ?2, '', ?3)",
+            )?;
+            let mut thread_stmt = tx.prepare_cached(
+                "INSERT INTO threads (thread_id, kind, title, peer_user_id, unread, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    title = CASE WHEN threads.title = '' THEN excluded.title ELSE threads.title END,
+                    peer_user_id = COALESCE(threads.peer_user_id, excluded.peer_user_id),
+                    updated_at = MAX(threads.updated_at, excluded.updated_at)",
+            )?;
+            for thread in threads {
+                if let Some(peer_uid) = thread.peer_user_id.as_deref().filter(|s| !s.is_empty()) {
+                    let display_name = if thread.title.is_empty() {
+                        peer_uid
+                    } else {
+                        thread.title.as_str()
+                    };
+                    user_stmt.execute(params![peer_uid, display_name, thread.updated_at])?;
+                }
+                thread_stmt.execute(params![
+                    thread.thread_id,
+                    thread.kind.as_str(),
+                    thread.title,
+                    thread.peer_user_id,
+                    thread.unread,
+                    thread.updated_at
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(threads.len())
+    }
+
+    /// Inserts a batch of synced messages (and optional attachment JSON) inside a
+    /// single SQLite transaction, deduplicating by `(thread_id, global_msg_id)`
+    /// and `(thread_id, cli_msg_id)`, and ensuring placeholder `users` rows exist
+    /// for every `sender_id` so foreign key constraints never drop messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the SQLite transaction fails.
+    pub fn insert_messages_batch(
+        &mut self,
+        items: &[(MessageRecord, Option<String>)],
+    ) -> Result<usize, StorageError> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut inserted = 0usize;
+        {
+            let mut user_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO users (user_id, display_name, zalo_name, updated_at)
+                 VALUES (?1, ?2, '', ?3)",
+            )?;
+            let mut has_global_stmt = tx.prepare_cached(
+                "SELECT 1 FROM messages WHERE thread_id = ?1 AND global_msg_id = ?2 LIMIT 1",
+            )?;
+            let mut insert_stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO messages (
+                    thread_id, sender_id, cli_msg_id, global_msg_id, body, sent_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            let mut attach_stmt = tx.prepare_cached(
+                "INSERT INTO attachments (message_id, data) VALUES (?1, ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET data = excluded.data",
+            )?;
+            for (msg, attach) in items {
+                if let Some(gid) = msg.global_msg_id {
+                    let exists = has_global_stmt
+                        .query_row(params![msg.thread_id, gid], |_| Ok(()))
+                        .optional()?
+                        .is_some();
+                    if exists {
+                        continue;
+                    }
+                }
+                if let Some(sender) = msg.sender_id.as_deref().filter(|s| !s.is_empty()) {
+                    user_stmt.execute(params![sender, sender, msg.sent_at])?;
+                }
+                let changed = insert_stmt.execute(params![
+                    msg.thread_id,
+                    msg.sender_id,
+                    msg.cli_msg_id,
+                    msg.global_msg_id,
+                    msg.body,
+                    msg.sent_at
+                ])?;
+                if changed > 0 {
+                    inserted += 1;
+                    if let Some(data) = attach.as_deref() {
+                        let row_id = tx.last_insert_rowid();
+                        if row_id > 0 {
+                            attach_stmt.execute(params![row_id, data])?;
+                        }
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// Increments the failed-attempt counter on an outbox entry.

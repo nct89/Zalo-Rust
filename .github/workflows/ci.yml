@@ -89,7 +89,8 @@ jobs:
           -p zalo-protocol
           -p zalo-client
           -p zalo-storage
-          -p zalo-sync2
+          -p zalo-sync
+          -p zalo-backup
           -p zalo-design
           -p zimage
           -p zjxl

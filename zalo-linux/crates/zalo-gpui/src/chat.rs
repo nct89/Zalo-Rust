@@ -309,6 +309,9 @@ impl ShellView {
     }
 
     fn pinned_bar(&self, conv: &ChatConv, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.pinned_msgs.is_empty() {
+            return div().into_any_element();
+        }
         let Some(msg) = self
             .messages_of(conv.id)
             .iter()
@@ -1132,6 +1135,7 @@ impl ShellView {
                     .child(text),
             );
         }
+        let pill_bg = token_rgb("--layer-background", "#ffffff");
         cell.child(
             div()
                 .absolute()
@@ -1142,8 +1146,11 @@ impl ShellView {
                 .items_center()
                 .gap(px(2.))
                 .p(px(2.))
-                .rounded(px(3.))
-                .bg(rgb(0xffffff))
+                .rounded(px(4.))
+                .bg(rgb(pill_bg))
+                .border_1()
+                .border_color(crate::color::border_subtle())
+                .shadow_sm()
                 .child(preview_action(
                     ("preview-edit", index as u64),
                     ic::EDIT_PHOTO,
@@ -1220,6 +1227,7 @@ impl ShellView {
         let border = rgb(token_rgb("--border", "#d9d9d9"));
         let subtle = rgb(token_rgb("--layer-background-subtle", "#ebecf0"));
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+        let muted = token_rgb("--text-secondary", "#5a6981");
         let title = str_vi("STR_ADD_MORE_MEDIA_TITLE", "Đính kèm thêm ảnh/file");
         div()
             .id("preview-add")
@@ -1230,6 +1238,7 @@ impl ShellView {
             .border_dashed()
             .border_color(border)
             .bg(subtle)
+            .text_color(rgb(muted))
             .flex()
             .items_center()
             .justify_center()
@@ -1789,61 +1798,37 @@ enum HeaderAction {
     AddMember,
 }
 
+#[derive(Clone)]
+enum MsgRowItem {
+    LoadOlder(usize),
+    DateChip(String),
+    Bubble {
+        msg_idx: usize,
+        album_start: usize,
+        album_end: usize,
+        first: bool,
+        last: bool,
+        has_status_pill: bool,
+    },
+    BottomSpacer,
+}
+
 impl ShellView {
-    fn message_view(&self, conv: Option<&ChatConv>, cx: &mut Context<Self>) -> impl IntoElement {
-        let chat_bg = token_rgb("--layer-background-CSC", "#ebecf0");
-        let Some(row) = conv else {
-            return div()
-                .id("message-view")
-                .flex()
-                .flex_1()
-                .w_full()
-                .bg(rgb(chat_bg))
-                .into_any_element();
-        };
+    fn build_msg_rows(&self, row: &ChatConv) -> (usize, Vec<MsgRowItem>) {
         let all = self.messages_of(row.id);
         let hidden = all.len().saturating_sub(self.msg_window);
         let msgs: &[ChatMsg] = &all[hidden..];
-        let is_group = row.is_group;
-        let mut last_day: Option<i64> = None;
-        let mut items: Vec<gpui::AnyElement> = Vec::new();
+        let mut items: Vec<MsgRowItem> = Vec::with_capacity(msgs.len() + 8);
         if hidden > 0 {
-            items.push(
-                div()
-                    .id("load-older")
-                    .flex()
-                    .justify_center()
-                    .w_full()
-                    .mt(px(8.))
-                    .child(
-                        div()
-                            .id("load-older-btn")
-                            .px(px(12.))
-                            .h(px(28.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(14.))
-                            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
-                            .text_size(px(13.))
-                            .text_color(rgb(token_rgb("--B55", "#0068ff")))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.msg_window += crate::shell::MSG_WINDOW;
-                                if let Some(id) = this.selected {
-                                    this.warm_media(id);
-                                }
-                                cx.notify();
-                            }))
-                            .child(format!("Xem tin nhắn cũ hơn ({hidden})")),
-                    )
-                    .into_any_element(),
-            );
+            items.push(MsgRowItem::LoadOlder(hidden));
         }
         let last_own_id = msgs
             .iter()
             .rev()
             .find(|m| m.from_me && !m.recalled)
             .map(|m| m.id);
+        let mut last_day: Option<i64> = None;
+        let now_ms = data::now_ms();
         let mut i = 0;
         while i < msgs.len() {
             let msg = &msgs[i];
@@ -1851,11 +1836,11 @@ impl ShellView {
             let new_day = day != last_day;
             if new_day {
                 let chip = if msg.at_ms > 0 {
-                    data::day_label(msg.at_ms, data::now_ms())
+                    data::day_label(msg.at_ms, now_ms)
                 } else {
                     format!("{} {}", msg.time, crate::preview::thread_day(row.id))
                 };
-                items.push(date_chip(&chip).into_any_element());
+                items.push(MsgRowItem::DateChip(chip));
                 last_day = day;
             }
             let album_end = data::photo_album_end(msgs, i);
@@ -1870,30 +1855,65 @@ impl ShellView {
             let next = msgs.get(span);
             let first = prev.is_none_or(|p| !same_block(p, head)) || i == 0;
             let last = next.is_none_or(|n| !same_block(tail, n));
-            let shown = tail.clone();
-            let status_pill = (row.live && shown.from_me && Some(shown.id) == last_own_id)
-                .then(|| self.outgoing_status(row, &shown));
-            let album: Vec<ChatMsg> = if span > i + 1 {
-                msgs[i..span].to_vec()
-            } else {
-                Vec::new()
-            };
-            items.push(self.bubble(
-                shown,
-                is_group,
+            let has_status_pill = row.live && tail.from_me && Some(tail.id) == last_own_id;
+            items.push(MsgRowItem::Bubble {
+                msg_idx: hidden + span - 1,
+                album_start: hidden + i,
+                album_end: if span > i + 1 { hidden + span } else { hidden + i },
                 first,
                 last,
-                status_pill,
-                &album,
-                cx,
-            ));
+                has_status_pill,
+            });
             i = span;
         }
-        // Scroll padding does not extend the scroll extent, so the last
-        // bubble sat on the composer. Keep a gap under the last card.
         if !msgs.is_empty() {
-            items.push(div().h(px(48.)).w_full().flex_none().into_any_element());
+            items.push(MsgRowItem::BottomSpacer);
         }
+        (hidden, items)
+    }
+
+    fn sync_msg_list(&self, conv_id: u64, next_count: usize, hidden: usize) {
+        let (prev_conv, old_count, prev_hidden) = self.msg_list_state.get();
+        if prev_conv != Some(conv_id) {
+            self.msg_list.reset(next_count);
+            self.msg_list_state.set((Some(conv_id), next_count, hidden));
+        } else if old_count != next_count || prev_hidden != hidden {
+            if hidden < prev_hidden && next_count >= old_count {
+                // Older messages were prepended at the top ("Xem tin nhắn cũ hơn"):
+                // splice the top prefix so the viewport stays anchored on the current message.
+                let delta = next_count - old_count;
+                let replace_top = old_count.min(1);
+                self.msg_list.splice(0..replace_top, delta + replace_top);
+            } else if next_count > old_count && old_count > 0 {
+                // New messages appended at the bottom: splice the trailing items so
+                // scroll position stays intact (and ListAlignment::Bottom stays pinned if at bottom).
+                let tail_start = old_count.saturating_sub(2);
+                self.msg_list
+                    .splice(tail_start..old_count, next_count - tail_start);
+            } else {
+                self.msg_list.reset(next_count);
+            }
+            self.msg_list_state.set((Some(conv_id), next_count, hidden));
+        }
+    }
+
+    fn message_view(&self, conv: Option<&ChatConv>, cx: &mut Context<Self>) -> impl IntoElement {
+        let chat_bg = token_rgb("--layer-background-CSC", "#ebecf0");
+        let Some(row) = conv else {
+            return div()
+                .id("message-view")
+                .flex()
+                .flex_1()
+                .w_full()
+                .bg(rgb(chat_bg))
+                .into_any_element();
+        };
+        let (hidden, items) = self.build_msg_rows(row);
+        self.sync_msg_list(row.id, items.len(), hidden);
+        let items = std::rc::Rc::new(items);
+        let row_owned = row.clone();
+        let conv_id = row.id;
+        let is_group = row.is_group;
         let wall_image = wallpaper_file(
             &self.prefs.str("chatWallpaper", ""),
             &self.prefs.str("chatWallpaperPath", ""),
@@ -1906,6 +1926,14 @@ impl ShellView {
             .flex_1()
             .w_full()
             .min_h(px(0.))
+            .when(self.react_picker.is_some(), |el| {
+                el.on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                    if this.react_picker.is_some() {
+                        this.close_react_picker();
+                        cx.notify();
+                    }
+                }))
+            })
             .when_some(wall_image, |el, image| {
                 el.child(
                     div()
@@ -1916,19 +1944,88 @@ impl ShellView {
                 )
             })
             .child(
-                div()
-                    .id("message-view")
-                    .relative()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.msg_scroll)
-                    .px(px(16.))
-                    .py(px(12.))
-                    .children(items),
+                gpui::list(
+                    self.msg_list.clone(),
+                    cx.processor(move |this, ix: usize, _window, cx| {
+                        let Some(item) = items.get(ix) else {
+                            return div().into_any_element();
+                        };
+                        let inner = match item {
+                            MsgRowItem::LoadOlder(hidden_n) => div()
+                                .id("load-older")
+                                .flex()
+                                .justify_center()
+                                .w_full()
+                                .pt(px(8.))
+                                .pb(px(4.))
+                                .child(
+                                    div()
+                                        .id("load-older-btn")
+                                        .px(px(12.))
+                                        .h(px(28.))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(14.))
+                                        .bg(rgb(token_rgb("--layer-background", "#ffffff")))
+                                        .text_size(px(13.))
+                                        .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.msg_window += crate::shell::MSG_WINDOW;
+                                            if let Some(id) = this.selected {
+                                                this.warm_media(id);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child(format!("Xem tin nhắn cũ hơn ({hidden_n})")),
+                                )
+                                .into_any_element(),
+                            MsgRowItem::DateChip(chip) => date_chip(chip).into_any_element(),
+                            MsgRowItem::Bubble {
+                                msg_idx,
+                                album_start,
+                                album_end,
+                                first,
+                                last,
+                                has_status_pill,
+                            } => {
+                                let all = this.messages_of(conv_id);
+                                let Some(shown) = all.get(*msg_idx).cloned() else {
+                                    return div().into_any_element();
+                                };
+                                let status_pill = (*has_status_pill)
+                                    .then(|| this.outgoing_status(&row_owned, &shown));
+                                let album: Vec<ChatMsg> =
+                                    if *album_end > *album_start + 1 && *album_end <= all.len() {
+                                        all[*album_start..*album_end].to_vec()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                this.bubble(
+                                    shown,
+                                    is_group,
+                                    *first,
+                                    *last,
+                                    status_pill,
+                                    &album,
+                                    cx,
+                                )
+                            }
+                            MsgRowItem::BottomSpacer => {
+                                div().h(px(48.)).w_full().flex_none().into_any_element()
+                            }
+                        };
+                        div()
+                            .w_full()
+                            .px(px(16.))
+                            .when(ix == 0, |el| el.pt(px(12.)))
+                            .child(inner)
+                            .into_any_element()
+                    }),
+                )
+                .flex_1()
+                .w_full()
+                .min_h(px(0.)),
             )
             .into_any_element()
     }
@@ -2099,7 +2196,7 @@ impl ShellView {
         div()
             .size(px(16.))
             .rounded(px(8.))
-            .bg(rgb(0xffffff))
+            .bg(rgb(token_rgb("--layer-background-subtle", "#ebecf0")))
             .flex()
             .items_center()
             .justify_center()
@@ -2259,31 +2356,60 @@ impl ShellView {
             .when(msg.from_me, |el| el.mr(px(8.)))
             .when(!msg.from_me, |el| el.ml(px(8.)))
             .child(self.hover_actions(&msg, &group, cx));
-        let react_label = self
+        let react_summary = self
             .reactions
             .get(&row_id)
             .filter(|v| !v.is_empty())
             .map(|list| {
-                let mut glyphs: Vec<&'static str> = Vec::new();
+                let mut indices: Vec<usize> = Vec::new();
                 for r in list {
-                    let g = crate::read_sync::reaction_emoji(&r.r_icon, r.r_type);
-                    if !glyphs.contains(&g) && glyphs.len() < 3 {
-                        glyphs.push(g);
+                    let idx = crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type);
+                    if !indices.contains(&idx) && indices.len() < 3 {
+                        indices.push(idx);
                     }
                 }
-                if list.len() > 1 {
-                    format!("{} {}", glyphs.join(""), list.len())
-                } else {
-                    glyphs.join("")
-                }
+                (indices, list.len())
             });
-        let has_reacts = react_label.is_some();
+        let has_reacts = react_summary.is_some();
         let my_reacted = self.my_reaction(row_id).is_some();
-        let react_menu_msg = msg.clone();
+        let react_hold_msg = msg.clone();
         let react_tip = if my_reacted {
-            "Bỏ cảm xúc · Chuột phải đổi"
+            "Nhấn bỏ cảm xúc · Giữ để đổi"
         } else {
-            "Thích · Chuột phải chọn cảm xúc"
+            "Nhấn để thích · Giữ để chọn cảm xúc"
+        };
+        let react_content = match react_summary {
+            Some((indices, total)) => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.))
+                .children(indices.into_iter().map(|idx| {
+                    match media::reaction_icon_by_index(idx) {
+                        Some(image) => img(image)
+                            .size(px(15.))
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        None => div()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(ink))
+                            .child(crate::read_sync::REACTION_PRESETS[idx].0)
+                            .into_any_element(),
+                    }
+                }))
+                .when(total > 1, |el| {
+                    el.child(
+                        div()
+                            .ml(px(2.))
+                            .text_size(px(11.5))
+                            .line_height(px(16.))
+                            .text_color(rgb(ink))
+                            .child(total.to_string()),
+                    )
+                })
+                .into_any_element(),
+            None => like_el(15.).into_any_element(),
         };
         let react = div()
             .id(("react", row_id))
@@ -2309,33 +2435,71 @@ impl ShellView {
             })
             .tooltip(move |_, cx| tip(react_tip, cx))
             .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                    this.open_react_picker(react_menu_msg.clone(), event.position, window);
+                gpui::MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
+                    this.react_hold_msg = Some(row_id);
+                    this.react_hold_opened = false;
+                    this.react_hold_gen = this.react_hold_gen.wrapping_add(1);
+                    let gen = this.react_hold_gen;
+                    let press_pos = e.position;
+                    let hold_target = react_hold_msg.clone();
+                    let weak = cx.weak_entity();
+                    window
+                        .spawn(cx, async move |cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(200))
+                                .await;
+                            let _ = weak.update_in(cx, |view, window, cx| {
+                                if view.react_hold_gen == gen
+                                    && view.react_hold_msg == Some(row_id)
+                                {
+                                    view.react_hold_opened = true;
+                                    view.open_react_picker(hold_target, press_pos, window, true);
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
+                }),
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let was_quick =
+                        this.react_hold_msg == Some(row_id) && !this.react_hold_opened;
+                    this.react_hold_gen = this.react_hold_gen.wrapping_add(1);
+                    this.react_hold_msg = None;
+                    if was_quick {
+                        if let Some(m) = this
+                            .messages
+                            .get(&click_msg.conv)
+                            .and_then(|l| l.iter().find(|m| m.id == click_msg.id))
+                            .cloned()
+                        {
+                            this.apply_like(&m);
+                        }
+                        this.close_react_picker();
+                    } else if this.react_hold_opened {
+                        this.react_hold_opened = false;
+                        if let Some(p) = this.react_picker.as_mut() {
+                            p.holding = false;
+                        }
+                    }
                     cx.notify();
                 }),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(m) = this
-                    .messages
-                    .get(&click_msg.conv)
-                    .and_then(|l| l.iter().find(|m| m.id == click_msg.id))
-                    .cloned()
-                {
-                    this.apply_like(&m);
-                }
-                cx.notify();
-            }))
-            .child(match react_label {
-                Some(txt) => div()
-                    .text_size(px(12.))
-                    .line_height(px(18.))
-                    .text_color(rgb(ink))
-                    .child(txt)
-                    .into_any_element(),
-                None => like_el(14.).into_any_element(),
-            });
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    if this.react_hold_msg == Some(row_id) && !this.react_hold_opened {
+                        this.react_hold_msg = None;
+                        this.react_hold_gen = this.react_hold_gen.wrapping_add(1);
+                    }
+                }),
+            )
+            .child(react_content);
         let menu_msg = msg.clone();
         let selecting = self
             .select_msgs
@@ -2411,7 +2575,7 @@ impl ShellView {
             .flex_row()
             .flex_none()
             .w_full()
-            .mt(px(if first { 12. } else { 4. }))
+            .pt(px(if first { 12. } else { 4. }))
             .when(selecting.is_some(), |el| el.pl(px(40.)))
             .when(msg.from_me, |el| el.justify_end().pl(px(88.)))
             .when(!msg.from_me, |el| {
@@ -2666,14 +2830,12 @@ impl ShellView {
             .mb(px(8.))
             .invisible()
             .group_hover(group.clone(), |st| st.visible())
-            .child(
-                mk("mqa-react", ic::TB_STICKER, "Thả cảm xúc").on_click(cx.listener(
-                    move |this, event: &ClickEvent, window, cx| {
-                        this.open_react_picker(react_btn.clone(), event.position(), window);
-                        cx.notify();
-                    },
-                )),
-            )
+            .child(mk("mqa-react", ic::TB_STICKER, "Thả cảm xúc").on_click(cx.listener(
+                move |this, event: &ClickEvent, window, cx| {
+                    this.open_react_picker(react_btn.clone(), event.position(), window, false);
+                    cx.notify();
+                },
+            )))
             .child(
                 mk("mqa-quote", ic::MSG_QUOTE, "Trả lời").on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -2795,7 +2957,11 @@ impl ShellView {
             self.msg_window = new_window;
             self.warm_media(msg.conv);
         }
-        self.msg_scroll.scroll_to_item(child_idx);
+        if let Some(conv) = self.conv(msg.conv).cloned() {
+            let (hidden, items) = self.build_msg_rows(&conv);
+            self.sync_msg_list(conv.id, items.len(), hidden);
+        }
+        self.msg_list.scroll_to_reveal_item(child_idx);
     }
 
     pub(crate) fn msg_search_has_filter(&self) -> bool {
@@ -2944,7 +3110,11 @@ impl ShellView {
             self.msg_window = new_window;
             self.warm_media(conv_id);
         }
-        self.msg_scroll.scroll_to_item(child_idx);
+        if let Some(conv) = self.conv(conv_id).cloned() {
+            let (hidden, items) = self.build_msg_rows(&conv);
+            self.sync_msg_list(conv.id, items.len(), hidden);
+        }
+        self.msg_list.scroll_to_reveal_item(child_idx);
     }
 
     /// Right drawer "Search in Conversation" matching Zalo Electron/macOS:
@@ -5261,13 +5431,18 @@ fn bubble_font() -> Font {
 }
 
 fn bubble_text(text: &str, color: u32) -> gpui::AnyElement {
-    if crate::emoji::contains_pictogram(text) {
-        return pictogram_text(text, color);
+    use crate::emoji::PictogramPart;
+    let parts = crate::emoji::split_pictograms(text);
+    if parts
+        .iter()
+        .all(|part| matches!(part, PictogramPart::Text(_)))
+    {
+        return wrapped_text(text, color);
     }
-    wrapped_text(text, color)
+    pictogram_parts(parts, color)
 }
 
-fn pictogram_text(text: &str, color: u32) -> gpui::AnyElement {
+fn pictogram_parts(parts: Vec<crate::emoji::PictogramPart>, color: u32) -> gpui::AnyElement {
     use crate::emoji::PictogramPart;
     div()
         .max_w(px(media::BUBBLE_INNER))
@@ -5281,26 +5456,21 @@ fn pictogram_text(text: &str, color: u32) -> gpui::AnyElement {
         .line_height(px(22.))
         .text_color(rgb(color))
         .font(bubble_font())
-        .children(
-            crate::emoji::split_pictograms(text)
-                .into_iter()
-                .enumerate()
-                .map(|(i, part)| match part {
-                    PictogramPart::Text(run) => div()
-                        .id(("emo-run", i as u64))
-                        .whitespace_normal()
-                        .child(media::wrap_bubble_text(&run, media::BUBBLE_INNER))
-                        .into_any_element(),
-                    PictogramPart::Tile(item) => div()
-                        .id(("emo-tile", i as u64))
-                        .child(
-                            img(item.path.clone())
-                                .size(px(20.))
-                                .object_fit(ObjectFit::Contain),
-                        )
-                        .into_any_element(),
-                }),
-        )
+        .children(parts.into_iter().enumerate().map(|(i, part)| match part {
+            PictogramPart::Text(run) => div()
+                .id(("emo-run", i as u64))
+                .whitespace_normal()
+                .child(media::wrap_bubble_text(&run, media::BUBBLE_INNER))
+                .into_any_element(),
+            PictogramPart::Tile(item) => div()
+                .id(("emo-tile", i as u64))
+                .child(
+                    img(item.path.clone())
+                        .size(px(20.))
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+        }))
         .into_any_element()
 }
 
@@ -5828,8 +5998,8 @@ fn date_chip(label: &str) -> impl IntoElement {
         .flex()
         .justify_center()
         .w_full()
-        .mt(px(16.))
-        .mb(px(4.))
+        .pt(px(16.))
+        .pb(px(4.))
         .child(
             div()
                 .px(px(10.))
@@ -5913,15 +6083,23 @@ impl ShellView {
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
     let blue = token_rgb("--B55", "#0068ff");
     let (name, initial, fill) = match conv {
-        Some(row) => (
-            row.name.clone(),
-            crate::sidebar::avatar_initials(&row.name),
-            if row.is_group {
-                0x0068ff
+        Some(row) => {
+            let display = if cloud {
+                "My Documents".to_owned()
             } else {
-                crate::sidebar::avatar_color(&row.thread_id)
-            },
-        ),
+                row.name.clone()
+            };
+            let init = crate::sidebar::avatar_initials(&display);
+            (
+                display,
+                init,
+                if row.is_group {
+                    0x0068ff
+                } else {
+                    crate::sidebar::avatar_color(&row.thread_id)
+                },
+            )
+        }
         None => ("Zalo".to_owned(), "Z".to_owned(), 0x0068ff),
     };
     let is_group = conv.is_some_and(|row| row.is_group);
@@ -5984,7 +6162,7 @@ impl ShellView {
                             .rounded(px(6.))
                             .bg(rgb(0x2fcc70))
                             .border_2()
-                            .border_color(rgb(0xffffff)),
+                            .border_color(rgb(token_rgb("--layer-background", "#ffffff"))),
                     )
                 }),
         )

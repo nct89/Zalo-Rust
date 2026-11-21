@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use gpui::{
     div, prelude::*, px, rgb, Context, Entity, IntoElement, ParentElement, Render, RenderImage,
-    ScrollHandle, SharedString, Styled, Window,
+    SharedString, Styled, Window,
 };
 use std::sync::{Arc, Mutex};
 
@@ -60,15 +60,35 @@ pub(crate) fn poke_notice_wake(cx: &mut gpui::App) {
     }
 }
 
+/// Focus the main Zalo window and open the conversation from a clicked notice.
+pub(crate) fn open_notice_thread(thread_key: &str, cx: &mut gpui::App) {
+    let key = thread_key.to_owned();
+    crate::show_main_window(cx);
+    cx.activate(true);
+    let weak = notice_wake().lock().ok().and_then(|guard| guard.clone());
+    if let Some(weak) = weak {
+        let _ = weak.update(cx, |view, cx| {
+            if let Some(id) = view
+                .convs
+                .iter()
+                .find(|c| c.thread_id == key)
+                .map(|c| c.id)
+            {
+                view.select_conv(id);
+                cx.notify();
+            }
+        });
+    }
+}
+
 /// Avatar URL for `key`, also trying the `g_` form.
 fn profile_avatar(profiles: &crate::profiles::Profiles, key: &str) -> Option<String> {
-    let url = profiles
+    profiles
         .map
         .get(key)
         .or_else(|| profiles.map.get(&alt_profile_key(key)))
         .map(|p| p.avatar.clone())
-        .filter(|u| u.starts_with("https://"));
-    url
+        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
 }
 
 /// Root view of the main shell.
@@ -95,7 +115,7 @@ pub struct ShellView {
     /// Message popup waiting for the next frame. It opens a screen window.
     pending_notice: Option<crate::notice::NoticeContent>,
     /// Thread of the popup on screen, so a late avatar decode can fill it.
-    notice_thread: Option<String>,
+    pub(crate) notice_thread: Option<String>,
     /// Decoded chat wallpaper `(path, image)`.
     pub(crate) wall_image: RefCell<Option<(String, Arc<RenderImage>)>>,
     /// Composer had a selection when its context menu opened.
@@ -254,8 +274,16 @@ pub struct ShellView {
     pub(crate) media_failed: HashSet<u64>,
     /// Jobs collected by [`Self::warm_media`]; drained in `render` (needs `cx`).
     pub(crate) media_queue: Vec<crate::fetch::Job>,
-    /// `#message-view` scroll; jumps to the newest bubble on open / send.
-    pub(crate) msg_scroll: ScrollHandle,
+    /// Virtualized `#conv-scroll` handle (only visible conversation rows are rendered).
+    pub(crate) conv_scroll: gpui::UniformListScrollHandle,
+    /// Virtualized `#message-view` list state (`ListAlignment::Bottom`, only visible bubbles are rendered).
+    pub(crate) msg_list: gpui::ListState,
+    /// Last `(conv_id, item_count, hidden_count)` synced into `msg_list`.
+    pub(crate) msg_list_state: std::cell::Cell<(Option<u64>, usize, usize)>,
+    /// Server-known pinned `thread_id`s preserved even before their conversation is loaded.
+    pub(crate) server_pinned_threads: HashSet<String>,
+    /// Server-known archived ("Other") `thread_id`s preserved even before their conversation is loaded.
+    pub(crate) server_archived_threads: HashSet<String>,
     /// How many of the newest messages the chat builds (grows by 60 on
     /// "Load older messages"). Building all 200+ bubbles every frame lagged.
     pub(crate) msg_window: usize,
@@ -270,6 +298,9 @@ pub struct ShellView {
     pub(crate) avatars_queued: bool,
     /// One `getprofiles/v2` pass for senders that still have no photo.
     profile_gaps_started: bool,
+    /// Group ids already queried via `fetch_missing_groups` this run (prevents
+    /// infinite re-fetch loops on left/unavailable groups).
+    group_gaps_tried: HashSet<String>,
     /// Daily profile fetch is in flight. Gap fill waits so it is not wiped.
     profiles_fetching: bool,
     /// Also load every friend's avatar (group picker open).
@@ -316,8 +347,12 @@ pub struct ShellView {
     pub(crate) privacy: crate::settings::PrivacyState,
     /// XDG GlobalShortcuts portal handle + bound status.
     pub(crate) shortcuts: crate::shortcuts::ShortcutState,
-    /// Local Xuất / Nhập zip. The PC-to-phone backup engine is not in this client.
+    /// Local Xuất / Nhập zip (`pc_export.rs`, independent of Sync 2 and PC→Phone Backup).
     pub(crate) export_ui: crate::pc_export::TransferUi,
+    /// Phone → PC Message Sync (Sync 2: `590`/`591`/`592` + `libzproto_wasm_bg`).
+    pub(crate) sync_ui: crate::sync_worker::SyncUiState,
+    /// PC → Phone Message Backup (`630`–`634` + `/api/backuppc2mb/upload` + `libzproto_backup_wasm_bg`).
+    pub(crate) backup_ui: crate::backup_worker::BackupUiState,
     /// Quick-reply popup open above the composer (`cmp-qr`).
     pub(crate) quick_menu: bool,
     /// Composer formatting + urgency strip open (`cmp-fmt`).
@@ -328,6 +363,16 @@ pub struct ShellView {
     pub(crate) urgency_msgs: HashMap<u64, u8>,
     /// Floating 6-emoji reaction picker bar (`👍 ❤️ 😆 😮 😢 😠`).
     pub(crate) react_picker: Option<crate::context_menu::ReactPicker>,
+    /// Message id whose default reaction button is currently pressed (press-and-hold).
+    pub(crate) react_hold_msg: Option<u64>,
+    /// True once the press-and-hold timer opened `react_picker` for the current press.
+    pub(crate) react_hold_opened: bool,
+    /// Generation counter cancelling stale press-and-hold timers.
+    pub(crate) react_hold_gen: u64,
+    /// Cached last window title pushed via `window.set_window_title` (avoids per-frame X11 IPC).
+    last_window_title: String,
+    /// Cache key for `warm_links`/`warm_polls`/`warm_info_media` so scroll frames skip rescanning messages.
+    last_warm_key: Option<(u64, usize, usize, bool, Option<String>)>,
     /// Friend-online dots and the open chat's last-visit line.
     pub(crate) presence: crate::presence::Presence,
     /// Info-column media store preview for the open thread.
@@ -422,9 +467,39 @@ fn initial_thread(convs: &[ChatConv]) -> Option<u64> {
         .map(|row| row.id)
 }
 
+/// Disk state preloaded *before* GPUI maps the X11 shell window so startup
+/// does not block the UI thread while the newly mapped window is black.
+pub(crate) struct ShellStartupData {
+    snap: data::Snapshot,
+    profiles: crate::profiles::Profiles,
+    prefs: crate::prefs::Prefs,
+    link_previews: HashMap<String, crate::links::LinkPreview>,
+}
+
+impl ShellStartupData {
+    pub(crate) fn load() -> Self {
+        Self {
+            snap: data::load_snapshot(),
+            profiles: crate::profiles::Profiles::load(crate::profiles::cache_path().as_deref()),
+            prefs: crate::prefs::Prefs::load(prefs_dir()),
+            link_previews: crate::links::load(crate::links::cache_path().as_deref()),
+        }
+    }
+}
+
 impl ShellView {
     /// Load `store.db` / `session.json` when present. Tests use preview fixtures.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with_data(window, cx, ShellStartupData::load())
+    }
+
+    /// Construct the shell using preloaded startup data so no blocking disk I/O
+    /// runs after GPUI has already mapped the window.
+    pub(crate) fn new_with_data(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        startup: ShellStartupData,
+    ) -> Self {
         window.set_window_title("Zalo");
         cx.observe_window_appearance(window, |_, window, _| {
             window.refresh();
@@ -519,7 +594,12 @@ impl ShellView {
             },
         )
         .detach();
-        let snap = data::load_snapshot();
+        let ShellStartupData {
+            snap,
+            profiles,
+            prefs,
+            link_previews,
+        } = startup;
         let mut this = Self {
             rail: Rail::Chats,
             list_filter: ListFilter::All,
@@ -540,7 +620,7 @@ impl ShellView {
             input_has_sel: false,
             members_view: None,
             select_msgs: None,
-            link_previews: crate::links::load(crate::links::cache_path().as_deref()),
+            link_previews,
             link_pending: HashSet::new(),
             link_thumbs: HashMap::new(),
             composer_link: None,
@@ -621,7 +701,7 @@ impl ShellView {
             kick_to_login: false,
             left_for_login: false,
             next_msg_id: snap.next_msg_id,
-            prefs: crate::prefs::Prefs::load(prefs_dir()),
+            prefs,
             window_saved: (0, 0, false),
             settings_cache: None,
             pending_photos: Vec::new(),
@@ -642,14 +722,19 @@ impl ShellView {
             media_pending: HashSet::new(),
             media_failed: HashSet::new(),
             media_queue: Vec::new(),
-            msg_scroll: ScrollHandle::new(),
+            conv_scroll: gpui::UniformListScrollHandle::new(),
+            msg_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(300.)),
+            msg_list_state: std::cell::Cell::new((None, 0, 0)),
+            server_pinned_threads: HashSet::new(),
+            server_archived_threads: HashSet::new(),
             msg_window: MSG_WINDOW,
-            profiles: crate::profiles::Profiles::load(crate::profiles::cache_path().as_deref()),
+            profiles,
             avatars: HashMap::new(),
             avatar_miss: HashSet::new(),
             profiles_refresh: false,
             avatars_queued: true,
             profile_gaps_started: false,
+            group_gaps_tried: HashSet::new(),
             profiles_fetching: false,
             avatar_all: false,
             dialog: None,
@@ -677,11 +762,18 @@ impl ShellView {
             privacy: Default::default(),
             shortcuts: Default::default(),
             export_ui: Default::default(),
+            sync_ui: Default::default(),
+            backup_ui: Default::default(),
             quick_menu: false,
             format_open: false,
             urgency: 0,
             urgency_msgs: HashMap::new(),
             react_picker: None,
+            react_hold_msg: None,
+            react_hold_opened: false,
+            react_hold_gen: 0,
+            last_window_title: String::new(),
+            last_warm_key: None,
             presence: crate::presence::Presence::default(),
             media_shelf: crate::media_store::Shelf::default(),
         };
@@ -690,7 +782,7 @@ impl ShellView {
         }
         if let Some(id) = this.selected {
             this.warm_media(id);
-            this.msg_scroll.scroll_to_bottom();
+            this.scroll_msgs_to_bottom();
         }
         // Older caches have no `friend` flag: refresh once so Contacts is real.
         // A group list with members but no `creatorId` cannot put the owner
@@ -729,6 +821,26 @@ impl ShellView {
         };
         crate::i18n::set_english(this.english);
         this.apply_theme(window);
+        if !cfg!(test) {
+            window.activate_window();
+            let weak = cx.weak_entity();
+            window
+                .spawn(cx, async move |cx| {
+                    // X11/XFCE (`xfwm4`) strips server decorations asynchronously after
+                    // `_MOTIF_WM_HINTS` is applied on the first frame; nudge repaints so
+                    // the window paints immediately without waiting for mouse hover.
+                    for delay_ms in [50u64, 180, 400] {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(delay_ms))
+                            .await;
+                        let _ = weak.update_in(cx, |_, window, cx| {
+                            window.refresh();
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
+        }
         if let Ok(page) = std::env::var("ZALO_GPUI_SETTINGS") {
             if let Some(p) =
                 crate::settings::SettingsPage::ALL.get(page.parse::<usize>().unwrap_or(0))
@@ -1358,6 +1470,8 @@ impl ShellView {
         }
         self.left_for_login = true;
         self.kick_to_login = false;
+        self.sync_ui.reset();
+        self.backup_ui.reset();
         // Stop the shared realtime hub & WebSocket immediately so the logged-out
         // account cannot emit notifications and a subsequent login starts clean.
         crate::background::stop();
@@ -1423,9 +1537,23 @@ impl ShellView {
         .detach();
     }
 
+    /// Scrolls `#message-view` to the bottom bubble.
+    pub(crate) fn scroll_msgs_to_bottom(&self) {
+        let count = self.msg_list.item_count();
+        self.msg_list.scroll_to(gpui::ListOffset {
+            item_ix: count,
+            offset_in_item: px(0.),
+        });
+    }
+
+    /// True when `#message-view` is pinned at (or near) the bottom.
+    pub(crate) fn is_msgs_at_bottom(&self) -> bool {
+        let count = self.msg_list.item_count();
+        count == 0 || self.msg_list.logical_scroll_top().item_ix >= count.saturating_sub(1)
+    }
+
     fn apply_media(&mut self, done: Vec<crate::fetch::Done>) {
-        let max = f32::from(self.msg_scroll.max_offset().height);
-        let at_bottom = -f32::from(self.msg_scroll.offset().y) >= max - 48.0;
+        let at_bottom = self.is_msgs_at_bottom();
         for item in done {
             match item.image {
                 Some(image) => {
@@ -1446,7 +1574,7 @@ impl ShellView {
             // Keep failed ids pending so a dead URL is not retried every open.
         }
         if at_bottom {
-            self.msg_scroll.scroll_to_bottom();
+            self.scroll_msgs_to_bottom();
         }
     }
 
@@ -1482,7 +1610,9 @@ impl ShellView {
         title: String,
         body: String,
         initial: String,
+        accent: u32,
         image: Option<Arc<RenderImage>>,
+        collage: Vec<crate::sidebar::CollageFace>,
     ) {
         let body = crate::notice::notice_line(&body);
         let body = {
@@ -1500,7 +1630,9 @@ impl ShellView {
             title,
             body,
             initial,
+            accent,
             image,
+            collage,
             thread_key,
         });
     }
@@ -1514,6 +1646,18 @@ impl ShellView {
             .set("notifyCorner", serde_json::Value::String("custom".into()));
         self.prefs.set("notifyX", serde_json::json!(x));
         self.prefs.set("notifyY", serde_json::json!(y));
+    }
+
+    fn notice_duration(&self) -> std::time::Duration {
+        let secs = self
+            .prefs
+            .json("notifyDuration")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+            })
+            .unwrap_or(crate::notice::DEFAULT_DURATION_SECS);
+        std::time::Duration::from_secs(crate::notice::clamp_duration_secs(secs))
     }
 
     fn flush_notice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1532,7 +1676,16 @@ impl ShellView {
             .json("notifyY")
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
-        crate::notice::present(cx, window.scale_factor(), content, &corner, x, y);
+        let duration = self.notice_duration();
+        crate::notice::present(
+            cx,
+            window.scale_factor(),
+            content,
+            &corner,
+            x,
+            y,
+            duration,
+        );
     }
 
     pub(crate) fn set_rail(&mut self, rail: Rail) {
@@ -1550,10 +1703,11 @@ impl ShellView {
         self.forward_of = None;
         self.settings_open = false;
         if rail == Rail::Docs {
+            self.ensure_my_documents_conv();
             if let Some(id) = self.cloud_id() {
                 self.selected = Some(id);
                 self.warm_media(id);
-                self.msg_scroll.scroll_to_bottom();
+                self.scroll_msgs_to_bottom();
             }
         }
     }
@@ -1725,6 +1879,14 @@ impl ShellView {
             RtEvent::Reactions(list) => self.apply_reactions(list),
             RtEvent::Pinned(raw_ids) => self.apply_server_pinned(&raw_ids),
             RtEvent::Archived(raw_ids) => self.apply_server_archived(&raw_ids),
+            RtEvent::RemoteConfigs { sync, backup } => {
+                self.sync_ui.config = sync;
+                self.backup_ui.config = backup;
+                self.on_backup_services_ready();
+            }
+            RtEvent::SyncAfterLogin(payload) => {
+                self.handle_transfer_after_login(payload, cx);
+            }
             RtEvent::Messages(list, live) => {
                 let active = window.is_window_active();
                 for m in list {
@@ -1747,19 +1909,24 @@ impl ShellView {
         let conv_id = match self.convs.iter().position(|c| c.thread_id == m.thread_id) {
             Some(i) => self.convs[i].id,
             None => {
-                let name = self
-                    .profiles
-                    .map
-                    .get(&m.thread_id)
-                    .map(|p| p.name.clone())
-                    .filter(|n| !n.is_empty() && !crate::profiles::is_id_label(&m.thread_id, n))
-                    .unwrap_or_else(|| {
-                        if m.is_group {
-                            "Nhóm".to_owned()
-                        } else {
-                            m.sender_name.clone()
-                        }
-                    });
+                let is_docs = self
+                    .send2me_id
+                    .as_deref()
+                    .is_some_and(|sid| !sid.is_empty() && sid == m.thread_id);
+                let name = if is_docs {
+                    "My Documents".to_owned()
+                } else {
+                    self.profile_ref(&m.thread_id)
+                        .map(|p| p.name.clone())
+                        .filter(|n| !n.is_empty() && !crate::profiles::is_id_label(&m.thread_id, n))
+                        .unwrap_or_else(|| {
+                            if m.is_group {
+                                "Nhóm".to_owned()
+                            } else {
+                                m.sender_name.clone()
+                            }
+                        })
+                };
                 if m.is_group
                     && name != "Nhóm"
                     && !crate::profiles::is_id_label(&m.thread_id, &name)
@@ -1781,14 +1948,26 @@ impl ShellView {
                         live: data::live_allowed(&m.thread_id),
                     },
                 );
+                if self.server_pinned_threads.contains(&m.thread_id) {
+                    self.pinned.insert(id);
+                }
+                if self.server_archived_threads.contains(&m.thread_id) {
+                    self.archived.insert(id);
+                }
                 self.avatars_queued = true;
-                // A group with no real server name still needs getmg-v2.
+                // A group with no real server name (or missing both own photo
+                // and member list for collage) still needs getmg-v2 / getgi/v2.
                 if m.is_group {
-                    let named = self.profiles.map.get(&m.thread_id).is_some_and(|p| {
+                    let ready = self.profile_ref(&m.thread_id).is_some_and(|p| {
                         let label = p.name.trim();
-                        !label.is_empty() && !crate::profiles::is_id_label(&m.thread_id, label)
+                        let named = !label.is_empty()
+                            && label != "Nhóm"
+                            && !crate::profiles::is_id_label(&m.thread_id, label);
+                        let has_visual =
+                            crate::sidebar::is_real_avatar(&p.avatar) || !p.member_ids.is_empty();
+                        named && has_visual
                     });
-                    if !named {
+                    if !ready {
                         self.profile_gaps_started = false;
                     }
                 }
@@ -2048,26 +2227,56 @@ impl ShellView {
                 } else {
                     m.text.clone()
                 };
-                let initial = conv
-                    .name
-                    .chars()
-                    .next()
-                    .map(|ch| ch.to_string())
-                    .unwrap_or_else(|| "Z".into());
+                let title = if conv.is_group {
+                    let prof_name = self
+                        .profile_ref(&conv.thread_id)
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("");
+                    crate::profiles::group_display_name(&conv.thread_id, &conv.name, prof_name)
+                } else {
+                    conv.name.clone()
+                };
+                let initial = {
+                    let init = crate::sidebar::avatar_initials(&title);
+                    if init.is_empty() {
+                        "Z".into()
+                    } else {
+                        init
+                    }
+                };
+                let accent = crate::sidebar::avatar_color(&conv.thread_id);
                 self.notice_thread = Some(conv.thread_id.clone());
                 let image = self.shown_photo(&conv.thread_id);
+                let collage = if conv.is_group && image.is_none() {
+                    self.group_collage_faces(&conv.thread_id)
+                } else {
+                    Vec::new()
+                };
                 if image.is_none() {
                     self.avatar_miss.remove(&conv.thread_id);
                     self.avatar_miss.remove(&alt_profile_key(&conv.thread_id));
+                    if conv.is_group {
+                        for uid in self.group_collage_uids(&conv.thread_id) {
+                            self.avatar_miss.remove(&uid);
+                        }
+                    }
                     self.avatars_queued = true;
                 }
-                self.show_msg_notice(conv.name.clone(), body, initial, image);
+                if conv.is_group
+                    && (title == "Nhóm"
+                        || crate::profiles::is_id_label(&conv.thread_id, &title)
+                        || (image.is_none() && collage.is_empty()))
+                {
+                    self.group_gaps_tried.remove(&conv.thread_id);
+                    self.profile_gaps_started = false;
+                }
+                self.show_msg_notice(title, body, initial, accent, image, collage);
             }
         }
         if self.selected == Some(conv_id) {
             self.warm_media(conv_id);
             if live || newest {
-                self.msg_scroll.scroll_to_bottom();
+                self.scroll_msgs_to_bottom();
             }
         }
     }
@@ -2078,6 +2287,10 @@ impl ShellView {
         let ids = |key: &str| -> Vec<String> {
             serde_json::from_str::<Vec<String>>(&self.prefs.raw(key)).unwrap_or_default()
         };
+        let pinned_list = ids("pinned");
+        let archived_list = ids("other");
+        self.server_pinned_threads = pinned_list.iter().cloned().collect();
+        self.server_archived_threads = archived_list.iter().cloned().collect();
         let map: std::collections::HashMap<String, u64> = self
             .convs
             .iter()
@@ -2086,9 +2299,9 @@ impl ShellView {
         let to_ids = |list: Vec<String>| -> HashSet<u64> {
             list.iter().filter_map(|t| map.get(t).copied()).collect()
         };
-        self.pinned = to_ids(ids("pinned"));
+        self.pinned = to_ids(pinned_list);
         self.muted = to_ids(ids("muted"));
-        self.archived = to_ids(ids("other"));
+        self.archived = to_ids(archived_list);
         self.hidden = to_ids(ids("hidden"));
         self.removed = to_ids(ids("removed"));
         self.starred = parse_starred_ids(&self.prefs.raw("starredMsgs"));
@@ -2096,22 +2309,52 @@ impl ShellView {
 
     /// Persist the per-conversation flags (see [`Self::load_conv_flags`]).
     pub(crate) fn save_conv_flags(&mut self) {
-        let threads = |set: &HashSet<u64>| -> serde_json::Value {
+        let loaded_live: HashSet<String> = self
+            .convs
+            .iter()
+            .filter(|c| data::live_allowed(&c.thread_id))
+            .map(|c| c.thread_id.clone())
+            .collect();
+        let threads = |set: &HashSet<u64>, extra: Option<&HashSet<String>>| -> serde_json::Value {
             let mut v: Vec<String> = self
                 .convs
                 .iter()
                 .filter(|c| set.contains(&c.id) && data::live_allowed(&c.thread_id))
                 .map(|c| c.thread_id.clone())
                 .collect();
+            if let Some(extra_set) = extra {
+                for tid in extra_set {
+                    if !loaded_live.contains(tid) && data::live_allowed(tid) {
+                        v.push(tid.clone());
+                    }
+                }
+            }
             v.sort();
+            v.dedup();
             serde_json::json!(v)
         };
+        // Keep server_pinned_threads / server_archived_threads consistent with manual toggles on loaded convs.
+        for c in &self.convs {
+            if !data::live_allowed(&c.thread_id) {
+                continue;
+            }
+            if self.pinned.contains(&c.id) {
+                self.server_pinned_threads.insert(c.thread_id.clone());
+            } else {
+                self.server_pinned_threads.remove(&c.thread_id);
+            }
+            if self.archived.contains(&c.id) {
+                self.server_archived_threads.insert(c.thread_id.clone());
+            } else {
+                self.server_archived_threads.remove(&c.thread_id);
+            }
+        }
         let (p, m, o, h, r) = (
-            threads(&self.pinned),
-            threads(&self.muted),
-            threads(&self.archived),
-            threads(&self.hidden),
-            threads(&self.removed),
+            threads(&self.pinned, Some(&self.server_pinned_threads)),
+            threads(&self.muted, None),
+            threads(&self.archived, Some(&self.server_archived_threads)),
+            threads(&self.hidden, None),
+            threads(&self.removed, None),
         );
         self.prefs.set("pinned", p);
         self.prefs.set("muted", m);
@@ -2236,12 +2479,62 @@ impl ShellView {
         }
     }
 
+    pub(crate) fn ensure_my_documents_conv(&mut self) {
+        if !self.has_session {
+            return;
+        }
+        let Some(sid) = self
+            .send2me_id
+            .clone()
+            .filter(|s| !s.is_empty())
+        else {
+            return;
+        };
+        if let Some(conv) = self.convs.iter_mut().find(|c| c.thread_id == sid) {
+            if conv.name != "My Documents" {
+                conv.name = "My Documents".to_owned();
+            }
+            let id = conv.id;
+            if self.server_pinned_threads.contains(&sid) {
+                self.pinned.insert(id);
+            }
+            return;
+        }
+        let id = data::hash_id(&sid);
+        self.convs.push(ChatConv {
+            id,
+            thread_id: sid.clone(),
+            name: "My Documents".to_owned(),
+            preview: String::new(),
+            time: String::new(),
+            unread: 0,
+            is_group: false,
+            online: false,
+            live: true,
+        });
+        if self.server_pinned_threads.contains(&sid) {
+            self.pinned.insert(id);
+        }
+        if self.server_archived_threads.contains(&sid) {
+            self.archived.insert(id);
+        }
+    }
+
     pub(crate) fn apply_server_pinned(&mut self, raw_ids: &[String]) {
+        self.server_pinned_threads = raw_ids
+            .iter()
+            .filter_map(|r| crate::read_sync::normalize_thread_id(r))
+            .collect();
+        self.ensure_my_documents_conv();
         Self::sync_live_set(&self.convs, &mut self.pinned, raw_ids);
         self.save_conv_flags();
     }
 
     pub(crate) fn apply_server_archived(&mut self, raw_ids: &[String]) {
+        self.server_archived_threads = raw_ids
+            .iter()
+            .filter_map(|r| crate::read_sync::normalize_thread_id(r))
+            .collect();
         Self::sync_live_set(&self.convs, &mut self.archived, raw_ids);
         self.save_conv_flags();
     }
@@ -2457,7 +2750,40 @@ impl ShellView {
         if list.len() != old_len {
             self.messages.insert(id, list);
             self.warm_media(id);
-            self.msg_scroll.scroll_to_bottom();
+            self.scroll_msgs_to_bottom();
+        }
+    }
+
+    /// Reloads conversations and messages from `LocalStore` (called after Sync 2 persists batches),
+    /// preserving the currently selected conversation thread.
+    pub(crate) fn reload_from_store(&mut self) {
+        let prev_thread = self
+            .selected
+            .and_then(|id| self.convs.iter().find(|c| c.id == id))
+            .map(|c| c.thread_id.clone());
+        let snap = data::load_snapshot();
+        if snap.send2me_id.as_deref().is_some_and(|s| !s.is_empty()) {
+            self.send2me_id = snap.send2me_id;
+        }
+        self.convs = snap.convs;
+        self.messages = snap.messages;
+        self.ensure_my_documents_conv();
+        self.load_conv_flags();
+        if let Some(tid) = prev_thread {
+            self.selected = self
+                .convs
+                .iter()
+                .find(|c| c.thread_id == tid)
+                .map(|c| c.id)
+                .or_else(|| initial_thread(&self.convs));
+        } else if self.selected.is_none() {
+            self.selected = initial_thread(&self.convs);
+        }
+        self.apply_profile_aliases();
+        self.profile_gaps_started = false;
+        self.avatars_queued = true;
+        if self.has_session && self.profiles.stale(data::now_ms()) {
+            self.profiles_refresh = true;
         }
     }
 
@@ -2594,15 +2920,20 @@ impl ShellView {
                         view.profile_gaps_started = false;
                         match result {
                             Ok(p) => {
-                                if let Some(path) = crate::profiles::cache_path() {
-                                    p.save(&path);
-                                }
                                 if view.display_name.is_none() {
-                                    view.display_name = p.map.get(crate::profiles::ME).map(|m| m.name.clone()).filter(|n| !n.is_empty());
+                                    view.display_name = p
+                                        .map
+                                        .get(crate::profiles::ME)
+                                        .map(|m| m.name.clone())
+                                        .filter(|n| !n.is_empty());
                                 }
-                                view.profiles = p;
+                                view.profiles.merge(p);
+                                if let Some(path) = crate::profiles::cache_path() {
+                                    view.profiles.save(&path);
+                                }
                                 view.apply_profile_aliases();
                                 view.avatars_queued = true;
+                                view.refresh_notice_avatar(cx);
                             }
                             Err(err) => {
                                 eprintln!("zalo-gpui profiles: {err}");
@@ -2622,15 +2953,27 @@ impl ShellView {
         }
         // Friends first while Danh bạ is open, so the visible rows get photos
         // before the rest of the cache. Then threads, recent senders, me.
-        let mut keys: Vec<String> = Vec::new();
+        let mut keys: Vec<String> = Vec::with_capacity(self.convs.len() + 64);
+        let mut key_set: HashSet<String> = HashSet::with_capacity(self.convs.len() + 64);
+        let mut push_key = |k: String| {
+            if !k.is_empty() && key_set.insert(k.clone()) {
+                keys.push(k);
+            }
+        };
         if self.rail == Rail::Contacts {
             let groups = self.contact_tab == crate::sidebar::ContactTab::Groups;
-            keys.extend(self.contact_rows(groups).into_iter().map(|(uid, _, _)| uid));
+            for (uid, _, _) in self.contact_rows(groups) {
+                push_key(uid);
+            }
         }
-        keys.extend(self.convs.iter().map(|c| c.thread_id.clone()));
-        keys.push(crate::profiles::ME.into());
+        for c in &self.convs {
+            push_key(c.thread_id.clone());
+        }
+        push_key(crate::profiles::ME.into());
         if self.avatar_all {
-            keys.extend(self.profiles.map.keys().cloned());
+            for k in self.profiles.map.keys() {
+                push_key(k.clone());
+            }
         }
         // Groups with no photo of their own use up to four member photos,
         // the same collage Zalo PC paints instead of a letter. The open
@@ -2646,45 +2989,50 @@ impl ShellView {
             if !conv.is_group {
                 continue;
             }
-            let own_photo = profile_avatar(&self.profiles, &conv.thread_id).is_some();
+            let own_photo = profile_avatar(&self.profiles, &conv.thread_id)
+                .is_some_and(|url| crate::sidebar::is_real_avatar(&url));
             let open_here = open_group.as_deref() == Some(conv.thread_id.as_str());
             if own_photo && !open_here {
                 continue;
             }
-            let Some(profile) = self.profiles.map.get(&conv.thread_id) else {
+            let Some(profile) = self.profile_ref(&conv.thread_id) else {
                 continue;
             };
-            let limit = if open_here { 40 } else { 4 };
-            for uid in profile.member_ids.iter().take(limit) {
-                if !keys.contains(uid) {
-                    keys.push(uid.clone());
+            if open_here {
+                for uid in profile.member_ids.iter().take(40) {
+                    push_key(uid.clone());
+                }
+            } else {
+                for uid in self.group_collage_uids(&conv.thread_id) {
+                    push_key(uid);
                 }
             }
         }
         for msgs in self.messages.values() {
             for m in msgs.iter().rev().take(80) {
-                if !m.sender_uid.is_empty() && !keys.contains(&m.sender_uid) {
-                    keys.push(m.sender_uid.clone());
+                if !m.sender_uid.is_empty() {
+                    push_key(m.sender_uid.clone());
                 }
             }
         }
         if let Some(key) = self.notice_thread.clone() {
             if self.shown_photo(&key).is_none() {
+                if key.starts_with("g_") {
+                    for uid in self.group_collage_uids(&key).into_iter().rev() {
+                        keys.retain(|item| item != &uid);
+                        keys.insert(0, uid);
+                    }
+                }
                 keys.retain(|item| item != &key);
                 keys.insert(0, key);
             }
         }
-        let mut seen = HashSet::new();
         let pending: Vec<(String, String)> = keys
             .into_iter()
-            .filter(|k| {
-                seen.insert(k.clone())
-                    && !self.avatars.contains_key(k)
-                    && !self.avatar_miss.contains(k)
-            })
+            .filter(|k| !self.avatars.contains_key(k) && !self.avatar_miss.contains(k))
             .filter_map(|k| {
                 let url = profile_avatar(&self.profiles, &k)?;
-                (url.starts_with("https://") && !url.contains("/default")).then_some((k, url))
+                crate::sidebar::is_real_avatar(&url).then_some((k, url))
             })
             .collect();
         // One batch paints before the next starts. A full friend list is
@@ -2754,33 +3102,45 @@ impl ShellView {
         let Some(dir) = self.session_dir.clone() else {
             return;
         };
-        let mut want = Vec::new();
+        self.profile_gaps_started = true;
+        let mut want_set: HashSet<&str> = HashSet::with_capacity(512);
         for msgs in self.messages.values() {
             for msg in msgs {
                 if !msg.sender_uid.is_empty() {
-                    want.push(msg.sender_uid.clone());
+                    want_set.insert(msg.sender_uid.as_str());
                 }
             }
         }
         for profile in self.profiles.map.values() {
-            want.extend(profile.member_ids.iter().cloned());
+            for uid in &profile.member_ids {
+                if !uid.is_empty() {
+                    want_set.insert(uid.as_str());
+                }
+            }
         }
         for conv in &self.convs {
             if !conv.thread_id.is_empty() && !conv.thread_id.starts_with("g_") {
-                want.push(conv.thread_id.clone());
+                want_set.insert(conv.thread_id.as_str());
             }
         }
+        let want: Vec<String> = want_set.into_iter().map(str::to_owned).collect();
         let missing: Vec<String> = crate::profiles::missing_avatar_uids(&self.profiles, &want)
             .into_iter()
             .take(80)
             .collect();
         let thread_ids: Vec<String> = self.convs.iter().map(|c| c.thread_id.clone()).collect();
-        let groups = crate::profiles::groups_needing_info(&self.profiles, &thread_ids);
+        let groups: Vec<String> = crate::profiles::groups_needing_info(&self.profiles, &thread_ids)
+            .into_iter()
+            .filter(|id| !self.group_gaps_tried.contains(id))
+            .collect();
+        for id in &groups {
+            self.group_gaps_tried.insert(id.clone());
+        }
         if missing.is_empty() && groups.is_empty() {
             return;
         }
-        self.profile_gaps_started = true;
         let dir_groups = dir.clone();
+        let dir_members = dir.clone();
         let group_count = groups.len();
         eprintln!("zalo-gpui profile gaps: {group_count} nhóm, {} người", missing.len());
         let _ = std::io::Write::flush(&mut std::io::stderr());
@@ -2794,8 +3154,10 @@ impl ShellView {
                 crate::profiles::fetch_missing_groups(&dir_groups, &groups)
             });
             let got_groups = groups_task.await;
+            let mut followup_uids: Vec<String> = Vec::new();
             let _ = this.update(cx, |view, cx| {
                 let mut changed = false;
+                let mut added_members: Vec<String> = Vec::new();
                 match got_groups {
                     Ok((groups, members)) => {
                         for (id, got) in groups {
@@ -2804,7 +3166,8 @@ impl ShellView {
                                 slot.name = got.name;
                                 changed = true;
                             }
-                            if got.avatar.starts_with("https://")
+                            if (got.avatar.starts_with("https://")
+                                || got.avatar.starts_with("http://"))
                                 && slot.avatar != got.avatar
                             {
                                 slot.avatar = got.avatar;
@@ -2815,7 +3178,16 @@ impl ShellView {
                                 changed = true;
                             }
                             if !got.member_ids.is_empty() && slot.member_ids != got.member_ids {
+                                added_members.extend(got.member_ids.iter().take(8).cloned());
                                 slot.member_ids = got.member_ids;
+                                changed = true;
+                            }
+                            if !got.creator_id.is_empty() && slot.creator_id != got.creator_id {
+                                slot.creator_id = got.creator_id;
+                                changed = true;
+                            }
+                            if !got.admin_ids.is_empty() && slot.admin_ids != got.admin_ids {
+                                slot.admin_ids = got.admin_ids;
                                 changed = true;
                             }
                         }
@@ -2835,15 +3207,57 @@ impl ShellView {
                         }
                     }
                 }
+                if !added_members.is_empty() {
+                    followup_uids =
+                        crate::profiles::missing_avatar_uids(&view.profiles, &added_members)
+                            .into_iter()
+                            .take(40)
+                            .collect();
+                }
                 if changed {
                     view.apply_profile_aliases();
                     if let Some(path) = crate::profiles::cache_path() {
                         view.profiles.save(&path);
                     }
                     view.avatars_queued = true;
+                    view.refresh_notice_avatar(cx);
                 }
                 cx.notify();
             });
+            if !followup_uids.is_empty() {
+                let extra = cx
+                    .background_executor()
+                    .spawn(async move { crate::profiles::fetch_missing(&dir_members, &followup_uids) })
+                    .await;
+                if let Ok(map) = extra {
+                    let _ = this.update(cx, |view, cx| {
+                        let mut changed = false;
+                        for (uid, got) in map {
+                            let slot = view.profiles.map.entry(uid).or_default();
+                            if (got.avatar.starts_with("https://")
+                                || got.avatar.starts_with("http://"))
+                                && !crate::sidebar::is_real_avatar(&slot.avatar)
+                            {
+                                slot.avatar = got.avatar;
+                                changed = true;
+                            }
+                            if slot.name.is_empty() && !got.name.is_empty() {
+                                slot.name = got.name;
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            view.apply_profile_aliases();
+                            if let Some(path) = crate::profiles::cache_path() {
+                                view.profiles.save(&path);
+                            }
+                            view.avatars_queued = true;
+                            view.refresh_notice_avatar(cx);
+                            cx.notify();
+                        }
+                    });
+                }
+            }
             let got = users_task.await;
             let _ = this.update(cx, |view, cx| {
                 let mut changed = false;
@@ -2851,8 +3265,9 @@ impl ShellView {
                     Ok(map) => {
                         for (uid, got) in map {
                             let slot = view.profiles.map.entry(uid).or_default();
-                            if got.avatar.starts_with("https://")
-                                && !slot.avatar.starts_with("https://")
+                            if (got.avatar.starts_with("https://")
+                                || got.avatar.starts_with("http://"))
+                                && !crate::sidebar::is_real_avatar(&slot.avatar)
                             {
                                 slot.avatar = got.avatar;
                                 changed = true;
@@ -2876,6 +3291,7 @@ impl ShellView {
                         view.profiles.save(&path);
                     }
                     view.avatars_queued = true;
+                    view.refresh_notice_avatar(cx);
                 }
                 cx.notify();
             });
@@ -2883,20 +3299,61 @@ impl ShellView {
         .detach();
     }
 
-    /// Fill the open popup once this thread's photo has been decoded.
+    /// Fill the open popup once this thread's title, photo, or group collage updates.
     fn refresh_notice_avatar(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.notice_thread.clone() else {
             return;
         };
-        let Some(image) = self.shown_photo(&key) else {
-            return;
+        let is_group = key.starts_with("g_")
+            || self
+                .convs
+                .iter()
+                .any(|c| c.thread_id == key && c.is_group);
+        let title = if is_group {
+            let current = self
+                .convs
+                .iter()
+                .find(|c| c.thread_id == key)
+                .map(|c| c.name.as_str())
+                .unwrap_or("");
+            let prof_name = self
+                .profile_ref(&key)
+                .map(|p| p.name.as_str())
+                .unwrap_or("");
+            let resolved = crate::profiles::group_display_name(&key, current, prof_name);
+            (!resolved.is_empty()
+                && resolved != "Nhóm"
+                && !crate::profiles::is_id_label(&key, &resolved))
+            .then_some(resolved)
+        } else {
+            None
         };
+        let image = self.shown_photo(&key);
+        let collage = if is_group && image.is_none() {
+            self.group_collage_faces(&key)
+        } else {
+            Vec::new()
+        };
+        if title.is_none() && image.is_none() && collage.is_empty() {
+            return;
+        }
         if let Some(pending) = self.pending_notice.as_mut() {
-            if pending.thread_key == key && pending.image.is_none() {
-                pending.image = Some(image.clone());
+            if pending.thread_key == key {
+                if let Some(name) = title.as_ref() {
+                    pending.initial = crate::sidebar::avatar_initials(name);
+                    pending.title = name.clone();
+                }
+                if let Some(img) = image.as_ref() {
+                    if pending.image.is_none() {
+                        pending.image = Some(img.clone());
+                        pending.collage.clear();
+                    }
+                } else if pending.image.is_none() && !collage.is_empty() {
+                    pending.collage = collage.clone();
+                }
             }
         }
-        crate::notice::patch_avatar(cx, &key, image);
+        crate::notice::patch_notice(cx, &key, title, image, collage);
     }
 
     /// Profile stored under `key` or its `g_` / bare twin.
@@ -2911,11 +3368,37 @@ impl ShellView {
     pub(crate) fn shown_photo(&self, id: &str) -> Option<Arc<RenderImage>> {
         if self
             .profile_ref(id)
-            .is_some_and(|profile| profile.avatar.contains("/default"))
+            .is_some_and(|profile| !crate::sidebar::is_real_avatar(&profile.avatar))
         {
             return None;
         }
         self.avatar_of(id)
+    }
+
+    /// Exact member UIDs that [`Self::group_collage_faces`] displays for `thread_id`.
+    fn group_collage_uids(&self, thread_id: &str) -> Vec<String> {
+        let Some(profile) = self.profile_ref(thread_id) else {
+            return Vec::new();
+        };
+        let total = if profile.members > 0 {
+            profile.members
+        } else {
+            u32::try_from(profile.member_ids.len()).unwrap_or(u32::MAX)
+        };
+        let me = self.self_uid();
+        crate::sidebar::collage_picks(
+            &profile.member_ids,
+            total,
+            me,
+            &profile.creator_id,
+            &profile.admin_ids,
+        )
+        .into_iter()
+        .filter_map(|pick| match pick {
+            crate::sidebar::CollagePick::Face(i) => profile.member_ids.get(i).cloned(),
+            _ => None,
+        })
+        .collect()
     }
 
     /// Overlapping collage cells for a group that has no photo of its own.
@@ -3194,14 +3677,10 @@ impl ShellView {
         self.convs
             .iter()
             .find(|row| {
-                row.name == "Cloud của tôi"
-                    || self
-                        .send2me_id
-                        .as_deref()
-                        .is_some_and(|id| id == row.thread_id)
+                is_my_documents(&row.name, &row.thread_id, self.send2me_id.as_deref())
             })
             .map(|row| row.id)
-            .or_else(|| Some(preview::cloud_of_mine_id()))
+            .or_else(|| (!self.has_session).then(preview::cloud_of_mine_id))
     }
 
     /// Numeric Zalo user id (`uidMe`) of the logged-in account (`send2me_id`),
@@ -3276,16 +3755,19 @@ impl ShellView {
         (count > 0).then_some((count, unread, latest_time))
     }
 
-    pub(crate) fn listed_convs(&self) -> Vec<ChatConv> {
+    /// Indices into `self.convs` in display order (avoids cloning all `ChatConv`
+    /// rows on every scroll/render frame).
+    pub(crate) fn listed_conv_indices(&self) -> Vec<usize> {
         let raw_query = self.search_query.trim();
         let query = raw_query.to_lowercase();
         let pin_match = self.pin_matches(raw_query);
-        let mut rows: Vec<_> = self
+        let mut indices: Vec<usize> = self
             .convs
             .iter()
-            .filter(|row| self.conv_visible_in_tab(row, &query, pin_match))
-            .filter(|row| !is_left_group_name(&row.name))
-            .filter(|row| {
+            .enumerate()
+            .filter(|(_, row)| self.conv_visible_in_tab(row, &query, pin_match))
+            .filter(|(_, row)| !is_left_group_name(&row.name))
+            .filter(|(_, row)| {
                 conv_matches_list_filter(
                     self.list_filter,
                     &query,
@@ -3294,32 +3776,42 @@ impl ShellView {
                     self.conv_label(row.id),
                 )
             })
-            .filter(|row| {
+            .filter(|(_, row)| {
                 query.is_empty()
                     || (pin_match && self.conv_hidden(row.id))
                     || row.name.to_lowercase().contains(&query)
                     || row.preview.to_lowercase().contains(&query)
             })
-            .cloned()
+            .map(|(i, _)| i)
             .collect();
-        rows.sort_by_key(|row| {
-            if self.pinned.contains(&row.id) {
+        indices.sort_by_key(|&i| {
+            if self.pinned.contains(&self.convs[i].id) {
                 0u8
             } else {
                 1
             }
         });
-        rows
+        indices
+    }
+
+    pub(crate) fn listed_convs(&self) -> Vec<ChatConv> {
+        self.listed_conv_indices()
+            .into_iter()
+            .map(|i| self.convs[i].clone())
+            .collect()
     }
 
     /// Esc: close the topmost overlay (menu → viewer → dialog → popup →
     /// settings → reply bar). Returns false when nothing was open.
     pub(crate) fn escape_overlay(&mut self) -> bool {
         if self.menu.take().is_some()
-            || self.react_picker.take().is_some()
             || self.viewer.take().is_some()
             || self.dialog.take().is_some()
         {
+            return true;
+        }
+        if self.react_picker.is_some() {
+            self.close_react_picker();
             return true;
         }
         if self.forward_of.take().is_some() || self.rail_popup.take().is_some() {
@@ -3396,7 +3888,7 @@ impl ShellView {
         self.sticker_open = false;
         self.settings_open = false;
         self.menu = None;
-        self.react_picker = None;
+        self.close_react_picker();
         self.reply_to = None;
         self.forward_of = None;
         self.marked_read.insert(id);
@@ -3419,7 +3911,7 @@ impl ShellView {
             self.send_seen_if_due(&thread);
         }
         self.warm_media(id);
-        self.msg_scroll.scroll_to_bottom();
+        self.scroll_msgs_to_bottom();
     }
 
     /// Selects an existing thread or opens a live direct/group conversation row,
@@ -3609,7 +4101,7 @@ impl ShellView {
             conv.unread = 0;
         }
         self.messages.entry(msg.conv).or_default().push(msg);
-        self.msg_scroll.scroll_to_bottom();
+        self.scroll_msgs_to_bottom();
     }
 
     pub(crate) fn maybe_live(&self, action: LiveAction) {
@@ -4199,8 +4691,21 @@ impl Render for ShellView {
             }
         }
         let info = self.info_open;
-        self.warm_links(cx);
-        self.warm_polls(cx);
+        let warm_key = self.selected.map(|id| {
+            (
+                id,
+                self.messages_of(id).len(),
+                self.msg_window,
+                info,
+                self.composer_link.clone(),
+            )
+        });
+        let warm_changed = self.last_warm_key != warm_key;
+        if warm_changed {
+            self.last_warm_key = warm_key;
+            self.warm_links(cx);
+            self.warm_polls(cx);
+        }
         self.publish_badge();
         let shares = crate::photo_window::take_shares();
         if !shares.is_empty() {
@@ -4209,7 +4714,7 @@ impl Render for ShellView {
                 self.open_share(msg, cx);
             }
         }
-        if info {
+        if info && warm_changed {
             if let Some(id) = self.selected {
                 self.warm_info_media(id);
                 self.warm_group_pending(id, cx);
@@ -4271,7 +4776,10 @@ impl Render for ShellView {
             Some(name) => format!("Zalo - {name}"),
             None => "Zalo".to_owned(),
         };
-        window.set_window_title(&main_title);
+        if self.last_window_title != main_title {
+            self.last_window_title = main_title.clone();
+            window.set_window_title(&main_title);
+        }
         let root_bg = token_rgb("--layer-background", "#ffffff");
         let root_ink = token_rgb("--text-primary", "#081b3a");
         let solo_title = selected
@@ -4466,6 +4974,9 @@ impl Render for ShellView {
                 .when(forward, |el| el.child(self.forward_overlay(cx)))
                 .when_some(toast, |el, text| el.child(toast_el(text)))
                 .when(self.export_ui.popup_open(), |el| el.child(self.transfer_popup(cx)))
+                .when(self.backup_ui.popup_open(), |el| {
+                    el.child(self.backup_popup_overlay(cx))
+                })
                 .when(self.locked, |el| el.child(self.lock_overlay(cx))),
         )
     }
@@ -4744,9 +5255,9 @@ pub(crate) fn is_stranger_conv(
     if !profiles.values().any(|p| p.friend) {
         return false;
     }
-    if send2me_id.is_some_and(|id| id == conv.thread_id)
+    if is_my_documents(&conv.name, &conv.thread_id, send2me_id)
         || uin.is_some_and(|id| id == conv.thread_id)
-        || matches!(conv.name.as_str(), "Cloud của tôi" | "Zalo")
+        || conv.name == "Zalo"
     {
         return false;
     }

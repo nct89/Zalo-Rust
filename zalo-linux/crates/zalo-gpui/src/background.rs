@@ -47,7 +47,10 @@ pub fn stop() {
 /// Starts the shared listener if no active session is running.
 pub fn subscribe(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
     if let Ok(mut sink) = SINK.lock() {
-        *sink = Some(tx);
+        *sink = Some(tx.clone());
+    }
+    if let Some((sync, backup)) = crate::ws_rpc::WsRpcHub::global().remote_configs() {
+        let _ = tx.unbounded_send(RtEvent::RemoteConfigs { sync, backup });
     }
     HIDDEN_UNREAD.store(0, Ordering::Relaxed);
     ensure_started(dir);
@@ -126,6 +129,21 @@ fn background_event(dir: &std::path::Path, event: RtEvent) {
             let prefs = crate::prefs::Prefs::load(Some(dir.to_path_buf()));
             let notify = !prefs.bool("notifyOff", false);
             let sound = prefs.bool("notifySound", true);
+            let peek_guard = prefs.bool("peekGuard", false);
+            let duration_secs = prefs
+                .json("notifyDuration")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
+                .unwrap_or(crate::notice::DEFAULT_DURATION_SECS);
+            let expire_ms = (crate::notice::clamp_duration_secs(duration_secs) * 1000) as i32;
+            let profiles = if notify {
+                let path = dir.join("profiles.json");
+                crate::profiles::Profiles::load(path.is_file().then_some(path.as_path()))
+            } else {
+                crate::profiles::Profiles::default()
+            };
             for m in list.iter().filter(|m| !m.from_me) {
                 let n = HIDDEN_UNREAD.fetch_add(1, Ordering::Relaxed) + 1;
                 zalo_shell::set_unread_badge(i64::from(n));
@@ -133,22 +151,121 @@ fn background_event(dir: &std::path::Path, event: RtEvent) {
                     if sound {
                         play_notify_sound();
                     }
-                    let who = if m.sender_name.is_empty() {
-                        "Zalo".to_owned()
+                    let summary = resolve_bg_summary(&profiles, m);
+                    let body: String = if peek_guard {
+                        "Tin nhắn mới".to_owned()
+                    } else if m.is_group && !m.sender_name.is_empty() {
+                        format!("{}: {}", m.sender_name, m.text)
+                            .chars()
+                            .take(200)
+                            .collect()
                     } else {
-                        m.sender_name.clone()
+                        m.text.chars().take(200).collect()
                     };
+                    let icon_path = resolve_bg_avatar_png(dir, &profiles, &m.thread_id, m.is_group);
                     let _ = zalo_shell::notify_desktop(&zalo_shell::DesktopNotice {
                         app_name: "Zalo".into(),
-                        summary: who,
-                        body: m.text.chars().take(200).collect(),
-                        expire_ms: 5000,
+                        summary,
+                        body,
+                        expire_ms,
+                        icon_path,
                     });
                 }
             }
         }
         _ => {}
     }
+}
+
+fn bg_profile<'a>(
+    profiles: &'a crate::profiles::Profiles,
+    key: &str,
+) -> Option<&'a crate::profiles::Profile> {
+    if let Some(p) = profiles.map.get(key) {
+        return Some(p);
+    }
+    let alt = if let Some(rest) = key.strip_prefix("g_") {
+        rest.to_owned()
+    } else {
+        format!("g_{key}")
+    };
+    profiles.map.get(&alt)
+}
+
+fn resolve_bg_summary(
+    profiles: &crate::profiles::Profiles,
+    m: &crate::realtime::Incoming,
+) -> String {
+    if m.is_group {
+        if let Some(p) = bg_profile(profiles, &m.thread_id) {
+            let name = p.name.trim();
+            if !name.is_empty() && !crate::profiles::is_id_label(&m.thread_id, name) {
+                return name.to_owned();
+            }
+        }
+        return "Nhóm".to_owned();
+    }
+    let alias = profiles.alias_or(&m.thread_id, "");
+    if !alias.is_empty() {
+        return alias.to_owned();
+    }
+    if let Some(p) = bg_profile(profiles, &m.thread_id) {
+        if !p.name.trim().is_empty() {
+            return p.name.trim().to_owned();
+        }
+    }
+    if !m.sender_name.is_empty() {
+        m.sender_name.clone()
+    } else {
+        "Zalo".to_owned()
+    }
+}
+
+/// Produce a decoded 64×64 PNG path for `org.freedesktop.Notifications` `image-path`.
+/// Uses the thread's own photo when available; for groups without a custom photo,
+/// falls back to the first available collage member photo.
+fn resolve_bg_avatar_png(
+    dir: &std::path::Path,
+    profiles: &crate::profiles::Profiles,
+    thread_id: &str,
+    is_group: bool,
+) -> Option<String> {
+    let mut url = bg_profile(profiles, thread_id)
+        .map(|p| p.avatar.as_str())
+        .filter(|u| crate::sidebar::is_real_avatar(u))
+        .map(str::to_owned);
+    if url.is_none() && is_group {
+        if let Some(p) = bg_profile(profiles, thread_id) {
+            url = p.member_ids.iter().take(4).find_map(|uid| {
+                bg_profile(profiles, uid)
+                    .map(|mp| mp.avatar.as_str())
+                    .filter(|u| crate::sidebar::is_real_avatar(u))
+                    .map(str::to_owned)
+            });
+        }
+    }
+    let url = url?;
+    let cached = crate::media::cache_path_for(&url)?;
+    if !cached.is_file() {
+        let _ = crate::fetch::run_batch(
+            Some(dir),
+            vec![crate::fetch::Job {
+                msg_id: 1,
+                path: None,
+                url: url.clone(),
+                max_edge: 64,
+            }],
+        );
+    }
+    let bytes = std::fs::read(&cached).ok()?;
+    let rgba = crate::media::decode_rgba(&bytes, 64)?;
+    let out_dir = crate::media::photo_cache_dir()?;
+    let out_path = out_dir.join(format!("notify-{}.png", crate::media::url_key(&url)));
+    if !out_path.is_file() {
+        rgba.save_with_format(&out_path, image::ImageFormat::Png)
+            .ok()?;
+    }
+    Some(out_path.to_string_lossy().into_owned())
 }
 
 /// First close to the tray in this run: say where Zalo went.
@@ -161,6 +278,7 @@ pub fn tell_tray_once() {
         summary: "Zalo vẫn đang chạy".into(),
         body: "Zalo đã thu nhỏ xuống khay hệ thống. Bấm biểu tượng Zalo để mở lại.".into(),
         expire_ms: 5000,
+        icon_path: None,
     });
 }
 
