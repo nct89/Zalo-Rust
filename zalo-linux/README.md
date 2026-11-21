@@ -16,7 +16,7 @@ zalo-linux/
 
 ## Build & Test
 
-Requires **Rust 1.86+** (`rustup`) and standard Linux X11/Wayland/PulseAudio/OpenSSL development libraries. Run from either the repository root or `zalo-linux/`:
+Requires **Rust 1.85+** (`rustup`) and standard Linux X11/Wayland/PulseAudio/OpenSSL development libraries. Run from either the repository root or `zalo-linux/`:
 
 ```bash
 # Universal build (Wayland + X11 + SNI/XEmbed tray)
