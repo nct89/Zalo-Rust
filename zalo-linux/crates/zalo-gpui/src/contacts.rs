@@ -1,7 +1,8 @@
 //! Contacts pages, after Zalo PC: "Friends (n)" / "Groups & Communities (n)" in
 //! a white card with a search field and sort toggle (friends grouped A–Z),
 //! and "Friend Requests" with received (Accept / Decline) and sent
-//! (Revoke request) cards.
+//! (Revoke request) cards. An empty request list is the mailbox illustration.
+//! An empty group-invitation list is the list illustration plus the help link.
 //!
 //! Data: friends and groups come from the profile cache (`get_friends`,
 //! `get_group_list` + `getmg-v2`); requests from
@@ -9,11 +10,13 @@
 //! `/api/friend/requested/list`.
 
 use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use gpui::{
-    div, prelude::*, px, rgb, ClickEvent, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled,
+    div, img, prelude::*, px, rgb, ClickEvent, Context, InteractiveElement, IntoElement,
+    ObjectFit, ParentElement, RenderImage, StatefulInteractiveElement, Styled,
 };
+use image::Frame;
 use serde_json::Value;
 
 use crate::color::token_rgb;
@@ -253,6 +256,30 @@ pub fn fold_key(text: &str) -> String {
         .collect()
 }
 
+/// Electron `assets/invitation-emptystate.*.png`, shown at 123×100.
+fn friend_empty_art() -> Option<Arc<RenderImage>> {
+    static ART: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
+    ART.get_or_init(|| decode_asset(include_bytes!("../assets/invitation-empty.png")))
+        .clone()
+}
+
+/// Electron `assets/group-invitation-empty.*.png`, shown at 128×128.
+fn group_empty_art() -> Option<Arc<RenderImage>> {
+    static ART: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
+    ART.get_or_init(|| decode_asset(include_bytes!("../assets/group-invitation-empty.png")))
+        .clone()
+}
+
+fn decode_asset(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let rgba = crate::media::decode_rgba(bytes, 256)?;
+    Some(Arc::new(RenderImage::new([Frame::new(
+        crate::media::rgba_to_bgra(rgba),
+    )])))
+}
+
+/// Help article Electron opens from "Tìm hiểu thêm" on the invitation page.
+const GROUP_INVITE_HELP: &str = "https://help.zalo.me/huong-dan/chuyen-muc/tro-chuyen-nhom/khi-nao-ban-nhan-duoc-loi-moi-vao-nhom-va-cong-dong/";
+
 /// `dd/mm` from unix ms (request cards).
 fn short_date(ms: i64) -> String {
     if ms <= 0 {
@@ -263,6 +290,37 @@ fn short_date(ms: i64) -> String {
 }
 
 impl ShellView {
+    /// One contact row face. Friends are Electron size `m` (40). A group uses
+    /// the same photo / collage / glyph rule as the conversation list.
+    fn contact_face(&self, person: &Person, groups: bool) -> gpui::AnyElement {
+        const SIZE: f32 = 40.0;
+        if !groups {
+            return self.dialog_avatar(person, SIZE);
+        }
+        let photo = self.shown_photo(&person.uid);
+        let faces = if photo.is_none() {
+            self.group_collage_faces(&person.uid)
+        } else {
+            Vec::new()
+        };
+        let paint = crate::sidebar::avatar_paint(true, photo.is_some(), false, faces.len());
+        match paint {
+            crate::sidebar::AvatarPaint::Photo => photo
+                .map(|image| {
+                    gpui::img(image)
+                        .size(px(SIZE))
+                        .rounded(px(SIZE / 2.0))
+                        .object_fit(gpui::ObjectFit::Cover)
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| crate::sidebar::group_mark(SIZE).into_any_element()),
+            crate::sidebar::AvatarPaint::Collage => {
+                crate::sidebar::group_collage(&faces, SIZE).into_any_element()
+            }
+            _ => crate::sidebar::group_mark(SIZE).into_any_element(),
+        }
+    }
+
     /// Friends from `get_friends` (fallback: 1-1 threads), groups from the
     /// group profiles (fallback: group threads). `(uid, name, members)`.
     pub(crate) fn contact_rows(&self, groups: bool) -> Vec<(String, String, u32)> {
@@ -384,7 +442,7 @@ impl ShellView {
                     .items_center()
                     .gap(px(12.))
                     .h(px(64.))
-                    .px(px(20.))
+                    .px(px(16.))
                     .cursor_pointer()
                     .hover(|st| st.bg(rgb(hover)))
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -411,8 +469,8 @@ impl ShellView {
                         div()
                             .relative()
                             .flex_none()
-                            .size(px(48.))
-                            .child(self.dialog_avatar(&person, 48.))
+                            .size(px(40.))
+                            .child(self.contact_face(&person, groups))
                             .when(show, |el| {
                                 el.child(
                                     div()
@@ -959,8 +1017,11 @@ impl ShellView {
                 .into_any_element()
             })
             .collect();
-        let empty_note =
-            |text: &'static str| div().text_size(px(14.)).text_color(rgb(muted)).child(text);
+        let received_n = st.received.len();
+        let sent_n = st.sent.len();
+        // Electron draws the mailbox only when nothing was received, and it
+        // omits a section whose list is empty. "Lời mời đã gửi" appears only
+        // after a request was actually sent.
         div()
             .id("requests-page")
             .flex()
@@ -988,18 +1049,47 @@ impl ShellView {
                         .child(e),
                 )
             })
-            .child(section(format!("Lời mời đã nhận ({})", st.received.len())))
-            .child(if received.is_empty() {
-                empty_note("Bạn không có lời mời nào").into_any_element()
-            } else {
-                grid(received).into_any_element()
+            .when(!st.loading && received.is_empty(), |el| {
+                el.child(self.friend_request_empty(muted))
             })
-            .child(section(format!("Lời mời đã gửi ({})", st.sent.len())))
-            .child(if sent.is_empty() {
-                empty_note("Chưa gửi lời mời nào").into_any_element()
-            } else {
-                grid(sent).into_any_element()
+            .when(!st.loading && !received.is_empty(), |el| {
+                el.child(section(format!("Lời mời đã nhận ({received_n})")))
+                    .child(grid(received))
             })
+            .when(!st.loading && !sent.is_empty(), |el| {
+                el.child(section(format!("Lời mời đã gửi ({sent_n})")))
+                    .child(grid(sent))
+            })
+    }
+
+    /// `.empty__invitation`: 62 px top padding, mailbox 123×100, then the
+    /// secondary title 16 px below.
+    fn friend_request_empty(&self, muted: u32) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .w_full()
+            .pt(px(62.))
+            .when_some(friend_empty_art(), |el, art| {
+                el.child(
+                    img(art)
+                        .w(px(123.))
+                        .h(px(100.))
+                        .object_fit(ObjectFit::Contain),
+                )
+            })
+            .child(
+                div()
+                    .mt(px(16.))
+                    .text_size(px(14.))
+                    .text_color(rgb(muted))
+                    .child(crate::color::str_vi(
+                        "STR_CONTACT_TAB_TITLE_EMPTY_INVITATION",
+                        "Bạn không có lời mời nào",
+                    )),
+            )
+            .into_any_element()
     }
 
     /// Fetch `/api/group/inv-box/list` for "Group & Community Invitations".
@@ -1122,15 +1212,16 @@ impl ShellView {
         let loading = st.is_some_and(|s| s.loading);
         let err = st.and_then(|s| s.error.clone());
         let busy = st.map(|s| &s.busy);
+        let count = list.len();
         div()
             .id("contacts-invites")
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.))
-            .p(px(16.))
-            .gap(px(12.))
-            .overflow_y_scroll()
+            .when(loading || count > 0, |el| {
+                el.p(px(16.)).gap(px(12.)).overflow_y_scroll()
+            })
             .when(loading, |el| {
                 el.child(
                     div()
@@ -1142,20 +1233,24 @@ impl ShellView {
             .when_some(err, |el, e| {
                 el.child(div().text_size(px(13.5)).text_color(rgb(muted)).child(e))
             })
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .font_family(FAMILY_SEMIBOLD)
-                    .text_color(rgb(ink))
-                    .child(format!("Lời mời vào nhóm và cộng đồng ({})", list.len())),
-            )
-            .when(list.is_empty() && !loading, |el| {
+            .when(!loading && count == 0, |el| {
+                el.child(self.group_invite_empty(ink, cx))
+            })
+            .when(!loading && count > 0, |el| {
                 el.child(
                     div()
-                        .py(px(36.))
-                        .text_size(px(14.))
-                        .text_color(rgb(muted))
-                        .child("Bạn không có lời mời vào nhóm hoặc cộng đồng nào."),
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .h(px(88.))
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_family(FAMILY_SEMIBOLD)
+                                .text_color(rgb(ink))
+                                .child(format!("Lời mời đã nhận ({count})")),
+                        )
+                        .child(self.invite_learn_more(cx)),
                 )
             })
             .children(list.iter().enumerate().map(|(i, inv)| {
@@ -1266,6 +1361,77 @@ impl ShellView {
                             ),
                     )
             }))
+    }
+
+    /// `.group-invitation__content__empty`: 10% down, then the 128 px
+    /// illustration, the primary title, and the help line.
+    fn group_invite_empty(&self, ink: u32, cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .w_full()
+            .child(div().flex_none().w_full().h(gpui::relative(0.10)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .pt(px(62.))
+                    .when_some(group_empty_art(), |el, art| {
+                        el.child(
+                            img(art)
+                                .size(px(128.))
+                                .object_fit(ObjectFit::Contain),
+                        )
+                    })
+                    .child(
+                        div()
+                            .mt(px(16.))
+                            .mb(px(4.))
+                            .text_size(px(14.))
+                            .text_color(rgb(ink))
+                            .child(crate::color::str_vi(
+                                "STR_GROUP_COMMUNITY_INVITATION_EMPTY",
+                                "Không có lời mời vào nhóm và cộng đồng",
+                            )),
+                    )
+                    .child(self.invite_learn_more(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// "Khi nào tôi nhận được lời mời? Tìm hiểu thêm".
+    fn invite_learn_more(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let blue = token_rgb("--text-information", "#0068ff");
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .text_size(px(13.))
+            .child(
+                div()
+                    .text_color(rgb(muted))
+                    .child("Khi nào tôi nhận được lời mời? "),
+            )
+            .child(
+                div()
+                    .id("group-invite-learn-more")
+                    .text_color(rgb(blue))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, _| {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(GROUP_INVITE_HELP)
+                            .spawn();
+                    }))
+                    .child(crate::color::str_vi(
+                        "STR_GROUP_INVITATION_LEARN_MORE",
+                        "Tìm hiểu thêm",
+                    )),
+            )
+            .into_any_element()
     }
 }
 

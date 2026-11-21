@@ -7,7 +7,7 @@
 //! desktop notification is shown (unless notifications are off).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use futures::channel::mpsc::{unbounded, UnboundedSender};
@@ -15,13 +15,36 @@ use futures::StreamExt;
 
 use crate::realtime::RtEvent;
 
-static STARTED: AtomicBool = AtomicBool::new(false);
+struct ActiveHub {
+    gen: u64,
+    stop_tx: tokio::sync::watch::Sender<bool>,
+}
+
+static SESSION_GEN: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_HUB: Mutex<Option<ActiveHub>> = Mutex::new(None);
 static SINK: Mutex<Option<UnboundedSender<RtEvent>>> = Mutex::new(None);
 static HIDDEN_UNREAD: AtomicU32 = AtomicU32::new(0);
 static TOLD_TRAY: AtomicBool = AtomicBool::new(false);
 
+/// Stops the active realtime hub and listener (e.g. on logout or account switch).
+/// Subsequent [`subscribe`] / [`ensure_started`] calls will start a fresh session.
+pub fn stop() {
+    let next_gen = SESSION_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::realtime::invalidate_generation(next_gen);
+    if let Ok(mut sink) = SINK.lock() {
+        *sink = None;
+    }
+    if let Ok(mut hub) = ACTIVE_HUB.lock() {
+        if let Some(active) = hub.take() {
+            let _ = active.stop_tx.send(true);
+        }
+    }
+    HIDDEN_UNREAD.store(0, Ordering::Relaxed);
+    zalo_shell::set_unread_badge(0);
+}
+
 /// The shell window receives realtime events through `tx` from now on.
-/// Starts the shared listener the first time.
+/// Starts the shared listener if no active session is running.
 pub fn subscribe(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
     if let Ok(mut sink) = SINK.lock() {
         *sink = Some(tx);
@@ -32,16 +55,28 @@ pub fn subscribe(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
 
 /// Start the listener without a window (`--hidden`, or after login).
 pub fn ensure_started(dir: PathBuf) {
-    if STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
+    let (gen, stop_rx) = {
+        let Ok(mut hub) = ACTIVE_HUB.lock() else {
+            return;
+        };
+        if hub.is_some() {
+            return;
+        }
+        let gen = SESSION_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        *hub = Some(ActiveHub { gen, stop_tx });
+        (gen, stop_rx)
+    };
     let (tx, mut rx) = unbounded::<RtEvent>();
-    crate::realtime::start(dir.clone(), tx);
+    crate::realtime::start_with_shutdown(dir.clone(), tx, gen, stop_rx);
     let _ = std::thread::Builder::new()
         .name("zalo-gpui-hub".into())
         .spawn(move || {
             futures::executor::block_on(async move {
                 while let Some(event) = rx.next().await {
+                    if SESSION_GEN.load(Ordering::SeqCst) != gen {
+                        break;
+                    }
                     let sent = SINK
                         .lock()
                         .ok()
@@ -55,13 +90,18 @@ pub fn ensure_started(dir: PathBuf) {
                             ok.then_some(())
                         })
                         .is_some();
-                    if !sent {
+                    if !sent && SESSION_GEN.load(Ordering::SeqCst) == gen {
                         background_event(&dir, event);
                     }
                 }
             });
-            // Listener ended (session expired / re-login): the next window starts a new one.
-            STARTED.store(false, Ordering::SeqCst);
+            // Listener ended (session expired / logout / re-login): clear only if
+            // we are still the active generation so a newer login is never clobbered.
+            if let Ok(mut hub) = ACTIVE_HUB.lock() {
+                if hub.as_ref().is_some_and(|active| active.gen == gen) {
+                    *hub = None;
+                }
+            }
         });
 }
 
@@ -124,7 +164,7 @@ pub fn tell_tray_once() {
     });
 }
 
-/// Debounced incoming-message chime via `ffplay` (`notifySound` setting).
+/// Debounced incoming-message chime played in-process (`notifySound` setting).
 pub fn play_notify_sound() {
     static LAST_PLAYED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     if cfg!(test) {
@@ -142,21 +182,11 @@ pub fn play_notify_sound() {
     let sys = std::path::Path::new("/usr/share/sounds/freedesktop/stereo/message-new-instant.oga");
     let stock = crate::call::stock_sound_path("zalo_ringtone.mp3");
     let (path, cap) = if sys.is_file() {
-        (sys.to_path_buf(), "2.0")
+        (sys.to_path_buf(), std::time::Duration::from_secs(2))
     } else if let Some(s) = stock {
-        (s, "0.6")
+        (s, std::time::Duration::from_millis(600))
     } else {
         return;
     };
-    let _ = std::thread::Builder::new()
-        .name("zalo-notify-sound".into())
-        .spawn(move || {
-            let _ = std::process::Command::new("ffplay")
-                .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-t", cap])
-                .arg(path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        });
+    crate::audio_play::play_detached(path, None, Some(cap));
 }

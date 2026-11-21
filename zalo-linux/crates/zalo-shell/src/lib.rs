@@ -50,8 +50,8 @@ pub use bus::{
 };
 pub use error::ShellError;
 pub use filechooser::{
-    parse_dialog_output, pick_file, pick_folder, pick_image, zenity_filter, IMAGE_PATTERNS,
-    PORTAL_FILECHOOSER_INTERFACE,
+    parse_dialog_output, parse_dialog_paths, pick_file, pick_folder, pick_image, pick_images,
+    zenity_filter, IMAGE_PATTERNS, PORTAL_FILECHOOSER_INTERFACE,
 };
 pub use instance::{
     instance_command_from_args, instance_socket_path, ping_instance, profile_arg_from_args,

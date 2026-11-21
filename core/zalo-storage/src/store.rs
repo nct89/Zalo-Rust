@@ -52,6 +52,17 @@ CREATE TABLE IF NOT EXISTS attachments (
     data TEXT NOT NULL,
     FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    is_group INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    urgency INTEGER NOT NULL DEFAULT 0,
+    client_id INTEGER NOT NULL,
+    quote_json TEXT,
+    created_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// Whether a thread is a direct chat or a group.
@@ -131,6 +142,29 @@ pub struct MessageRecord {
     pub sent_at: i64,
 }
 
+/// One pending outgoing text message queued while offline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboxRecord {
+    /// SQLite row id (zero before insertion).
+    pub id: i64,
+    /// Destination thread id (`g_...` for groups or peer uid).
+    pub thread_id: String,
+    /// True for group threads.
+    pub is_group: bool,
+    /// Plain-text body.
+    pub body: String,
+    /// Urgency level (`0` normal, `1` important, `2` urgent).
+    pub urgency: u8,
+    /// Client-generated message id (`cliMsgId`) preserved across retries.
+    pub client_id: u64,
+    /// Optional serialized JSON quote target.
+    pub quote_json: Option<String>,
+    /// Unix milliseconds when queued.
+    pub created_at: i64,
+    /// Number of failed delivery attempts so far.
+    pub attempts: i64,
+}
+
 /// Open SQLite file, or an in-memory database, with the local schema applied.
 pub struct LocalStore {
     conn: Connection,
@@ -152,6 +186,17 @@ impl LocalStore {
         Self::from_connection(conn)
     }
 
+    /// Merges a WAL into the main database so a later copy sees committed rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the file cannot be opened.
+    pub fn checkpoint(path: &Path) -> Result<(), StorageError> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+        Ok(())
+    }
+
     /// Opens a private in-memory database and applies the schema.
     ///
     /// # Errors
@@ -162,6 +207,8 @@ impl LocalStore {
     }
 
     fn from_connection(conn: Connection) -> Result<Self, StorageError> {
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(SCHEMA)?;
         Ok(Self { conn })
     }
@@ -598,6 +645,89 @@ impl LocalStore {
         }
         Ok(out)
     }
+
+    /// Appends a pending outgoing message to the persistent offline outbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when SQLite cannot write the row.
+    pub fn enqueue_outbox(&self, rec: &OutboxRecord) -> Result<i64, StorageError> {
+        self.conn.execute(
+            "INSERT INTO outbox (thread_id, is_group, body, urgency, client_id, quote_json, created_at, attempts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                rec.thread_id,
+                i64::from(rec.is_group),
+                rec.body,
+                i64::from(rec.urgency),
+                rec.client_id as i64,
+                rec.quote_json,
+                rec.created_at,
+                rec.attempts,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Returns all queued outgoing messages in FIFO order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when SQLite cannot query `outbox`.
+    pub fn list_outbox(&self) -> Result<Vec<OutboxRecord>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thread_id, is_group, body, urgency, client_id, quote_json, created_at, attempts
+             FROM outbox
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], map_outbox)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Deletes a delivered or abandoned outbox entry by row `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when SQLite cannot delete the row.
+    pub fn remove_outbox(&self, id: i64) -> Result<(), StorageError> {
+        self.conn
+            .execute("DELETE FROM outbox WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Increments the failed-attempt counter on an outbox entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when SQLite cannot update the row.
+    pub fn bump_outbox_attempt(&self, id: i64) -> Result<(), StorageError> {
+        self.conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+}
+
+fn map_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRecord> {
+    let is_group: i64 = row.get(2)?;
+    let urgency: i64 = row.get(4)?;
+    let client_id: i64 = row.get(5)?;
+    Ok(OutboxRecord {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        is_group: is_group != 0,
+        body: row.get(3)?,
+        urgency: u8::try_from(urgency).unwrap_or(0),
+        client_id: client_id as u64,
+        quote_json: row.get(6)?,
+        created_at: row.get(7)?,
+        attempts: row.get(8)?,
+    })
 }
 
 fn map_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<UserRecord> {

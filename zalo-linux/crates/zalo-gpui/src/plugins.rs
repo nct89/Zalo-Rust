@@ -112,6 +112,16 @@ pub fn pick_photo() -> Result<Option<PathBuf>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Several images. Empty when the user cancels.
+///
+/// # Errors
+///
+/// Returns a short message when no portal and no dialog tool is available.
+pub fn pick_photos() -> Result<Vec<PathBuf>, String> {
+    zalo_shell::pick_images(crate::color::str_vi("STR_SEND_PHOTO", "Gửi hình ảnh"))
+        .map_err(|e| e.to_string())
+}
+
 /// File picker. `Ok(None)` when the user cancels.
 ///
 /// # Errors

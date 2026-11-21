@@ -1451,7 +1451,7 @@ impl EngineCore {
     }
 
     fn _group_not_supported(&mut self, title: &str, avatar: &str) {
-        let text = "Gọi nhóm chưa được hỗ trợ trên Linux";
+        let text = "Gọi nhóm chưa được hỗ trợ trong phiên bản này";
         self.ui
             .open(&json!({"title": title, "text": text, "avatar": avatar}));
         self.notice_close_text = text.to_owned();
@@ -1486,7 +1486,7 @@ impl EngineCore {
         };
         self.ui.incoming(&json!({
             "title": title,
-            "text": format!("{who} đang gọi nhóm. Gọi nhóm chưa được hỗ trợ trên Linux."),
+            "text": format!("{who} đang gọi nhóm. Gọi nhóm chưa được hỗ trợ trong phiên bản này."),
             "avatar": avatar,
             "noAnswer": true,
         }));

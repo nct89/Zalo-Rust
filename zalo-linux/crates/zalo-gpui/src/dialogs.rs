@@ -724,23 +724,32 @@ impl ShellView {
     }
 
     fn person_avatar(&self, p: &Person, size: f32) -> gpui::AnyElement {
-        match self.avatar_of(&p.uid) {
-            Some(i) => img(i)
-                .size(px(size))
-                .rounded(px(size / 2.0))
-                .into_any_element(),
-            None => div()
-                .size(px(size))
-                .rounded(px(size / 2.0))
-                .bg(rgb(token_rgb("--B55", "#0068ff")))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(0xffffff))
-                .font_family(FAMILY_SEMIBOLD)
-                .child(p.name.chars().next().unwrap_or('?').to_string())
-                .into_any_element(),
+        let stored = self
+            .profiles
+            .map
+            .get(&p.uid)
+            .map(|profile| profile.avatar.as_str())
+            .unwrap_or("");
+        let url = if p.avatar.trim().is_empty() {
+            stored
+        } else {
+            p.avatar.as_str()
+        };
+        if !url.contains("/default") {
+            if let Some(image) = self.avatar_of(&p.uid) {
+                return img(image)
+                    .size(px(size))
+                    .rounded(px(size / 2.0))
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .into_any_element();
+            }
         }
+        crate::sidebar::letter_disc(
+            &crate::sidebar::avatar_initials(&p.name),
+            crate::sidebar::avatar_color(&p.uid),
+            size,
+        )
+        .into_any_element()
     }
 
     fn add_friend_el(&self, d: &AddFriend, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2679,6 +2688,30 @@ impl ShellView {
         }
         for (id, name) in titles {
             crate::data::persist_thread_title(&id, &name);
+        }
+        let fallback = crate::color::str_vi("STR_ZALO_USER", "Người dùng Zalo");
+        let profiles = &self.profiles.map;
+        for msgs in self.messages.values_mut() {
+            for m in msgs.iter_mut() {
+                if m.from_me || m.sender_uid.is_empty() {
+                    continue;
+                }
+                let raw = m.sender.trim();
+                let unknown = raw.is_empty()
+                    || raw == fallback
+                    || crate::profiles::is_id_label(&m.sender_uid, raw);
+                if !unknown {
+                    continue;
+                }
+                let Some(name) = profiles
+                    .get(&m.sender_uid)
+                    .map(|p| p.name.trim().to_owned())
+                    .filter(|n| !n.is_empty() && !crate::profiles::is_id_label(&m.sender_uid, n))
+                else {
+                    continue;
+                };
+                m.sender = name;
+            }
         }
     }
 

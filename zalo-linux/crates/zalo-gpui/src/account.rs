@@ -2942,17 +2942,33 @@ impl ShellView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
+                let stored = if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
                     if d.conv_id == conv_id {
                         d.link_loading = false;
                         match res {
                             Ok(link) => {
+                                let url = if link.enabled {
+                                    link.url.clone()
+                                } else {
+                                    String::new()
+                                };
                                 d.link = link;
                                 d.tab_note = None;
+                                Some(url)
                             }
-                            Err(err) => d.tab_note = Some(group_side_note(&err)),
+                            Err(err) => {
+                                d.tab_note = Some(group_side_note(&err));
+                                None
+                            }
                         }
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some(url) = stored {
+                    view.info_join.insert(conv_id, url);
                 }
                 cx.notify();
             });
@@ -3001,14 +3017,32 @@ impl ShellView {
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
-                if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
+                let stored = if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
                     if d.conv_id == conv_id {
                         d.link_loading = false;
                         match res {
-                            Ok(link) => d.link = link,
-                            Err(err) => d.error = Some(err),
+                            Ok(link) => {
+                                let url = if link.enabled {
+                                    link.url.clone()
+                                } else {
+                                    String::new()
+                                };
+                                d.link = link;
+                                Some(url)
+                            }
+                            Err(err) => {
+                                d.error = Some(err);
+                                None
+                            }
                         }
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some(url) = stored {
+                    view.info_join.insert(conv_id, url);
                 }
                 cx.notify();
             });

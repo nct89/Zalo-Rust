@@ -81,6 +81,10 @@ const GET_MSG_BATCH: usize = 20;
 pub const CMD_TYPING: u16 = 602;
 /// Command: another client replaced this connection.
 pub const CMD_DUPLICATE: u16 = 3000;
+/// Electron `ERR_KICK_OUT` / `ERR_KICKOUT`. This ends the PC session.
+const ERR_KICK_OUT: i64 = 600;
+/// Chat and control polling use this code to force a logout as well.
+const ERR_FORCE_LOGOUT: i64 = -69;
 /// Delivered/seen status of our direct messages.
 pub const CMD_USER_STATUS: u16 = 502;
 /// Delivered/seen status of our group messages.
@@ -314,38 +318,59 @@ impl EventDecoder {
         self.cursors_dirty = false;
     }
 
-    /// Turns one frame into an event. `Ok(None)` is a frame with nothing to report
-    /// (ping replies, empty batches, and `HAS_MSG`, which only queues a `GET_MSG`).
+    /// Turns one frame into zero or more events.
+    ///
+    /// Most frames produce at most one event, while mixed offline/preload frames
+    /// containing both 1-1 `msgs` and `groupMsgs` produce two separate
+    /// [`ListenerEvent::Messages`] events (`group: false` then `group: true`) so
+    /// per-stream cursors (`LastIds`) and downstream routers never mix user and
+    /// group IDs.
     ///
     /// # Errors
     ///
     /// Returns [`ListenerError`] when the body cannot be parsed or decrypted.
-    pub fn handle(&mut self, frame: &Frame) -> Result<Option<ListenerEvent>, ListenerError> {
+    pub fn handle_all(&mut self, frame: &Frame) -> Result<Vec<ListenerEvent>, ListenerError> {
         if frame.cmd == CMD_HANDSHAKE && frame.sub_cmd == 1 {
-            return self.on_auth(frame);
+            return Ok(self.on_auth(frame)?.into_iter().collect());
+        }
+        // Kick sits on the wrapper, before decrypt. Close 3003 is not a command
+        // and is not handled here: Electron retries that close.
+        if frame.body_json().is_ok_and(|body| session_kicked(&body)) {
+            return Ok(vec![ListenerEvent::Replaced]);
         }
         match (frame.cmd, frame.sub_cmd) {
-            (CMD_PING, _) => Ok(None),
-            (CMD_DUPLICATE, _) => Ok(Some(ListenerEvent::Replaced)),
+            (CMD_PING, _) => Ok(Vec::new()),
+            (CMD_DUPLICATE, _) => Ok(vec![ListenerEvent::Replaced]),
             (CMD_HAS_MSG, _) => {
-                let data = self.decode_body(frame)?;
+                let Some(data) = self.decode_unless_kicked(frame)? else {
+                    return Ok(vec![ListenerEvent::Replaced]);
+                };
                 self.enqueue_get_msg(&data);
-                Ok(None)
+                Ok(Vec::new())
             }
-            (CMD_USER_MESSAGES | CMD_GROUP_MESSAGES, 0) => self.live_messages(frame),
+            (CMD_USER_MESSAGES | CMD_GROUP_MESSAGES, 0) => {
+                Ok(self.live_messages(frame)?.into_iter().collect())
+            }
             (CMD_TYPING, 0) => {
-                let data = self.decode_body(frame)?;
+                let Some(data) = self.decode_unless_kicked(frame)? else {
+                    return Ok(vec![ListenerEvent::Replaced]);
+                };
                 let list = typing_from(&data);
-                Ok((!list.is_empty()).then_some(ListenerEvent::Typing(list)))
+                Ok((!list.is_empty())
+                    .then_some(ListenerEvent::Typing(list))
+                    .into_iter()
+                    .collect())
             }
             (
                 CMD_USER_STATUS | CMD_GROUP_STATUS | CMD_USER_CLEAR_UNREAD | CMD_GROUP_CLEAR_UNREAD,
                 _,
             ) => {
-                let data = self.decode_body(frame)?;
+                let Some(data) = self.decode_unless_kicked(frame)? else {
+                    return Ok(vec![ListenerEvent::Replaced]);
+                };
                 self.note_page(frame.cmd, frame.sub_cmd, &data);
                 let status = crate::status::StatusUpdate::from_event(&data);
-                Ok(Some(if status.is_empty() {
+                Ok(vec![if status.is_empty() {
                     ListenerEvent::Event {
                         cmd: frame.cmd,
                         sub_cmd: frame.sub_cmd,
@@ -353,23 +378,43 @@ impl EventDecoder {
                     }
                 } else {
                     ListenerEvent::Status(status)
-                }))
+                }])
             }
             (cmd, sub_cmd) => {
-                let data = self.decode_body(frame)?;
+                let Some(data) = self.decode_unless_kicked(frame)? else {
+                    return Ok(vec![ListenerEvent::Replaced]);
+                };
                 self.note_page(cmd, sub_cmd, &data);
                 // An empty offline page (pagination only, or a `GET_MSG` ack) stays
                 // quiet. Surfacing it as `Event` would look like a live control.
                 if is_message_cmd(cmd) {
-                    return Ok(queued_messages(cmd, &data));
+                    return Ok(queued_messages_all(cmd, &data));
                 }
-                Ok(Some(ListenerEvent::Event { cmd, sub_cmd, data }))
+                Ok(vec![ListenerEvent::Event { cmd, sub_cmd, data }])
             }
         }
     }
 
+    /// Turns one frame into an event. `Ok(None)` is a frame with nothing to report
+    /// (ping replies, empty batches, and `HAS_MSG`, which only queues a `GET_MSG`).
+    ///
+    /// Prefer [`Self::handle_all`] when processing mixed offline/preload frames
+    /// that can carry both 1-1 `msgs` and `groupMsgs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ListenerError`] when the body cannot be parsed or decrypted.
+    pub fn handle(&mut self, frame: &Frame) -> Result<Option<ListenerEvent>, ListenerError> {
+        Ok(self.handle_all(frame)?.into_iter().next())
+    }
+
     fn on_auth(&mut self, frame: &Frame) -> Result<Option<ListenerEvent>, ListenerError> {
         let body = frame.body_json()?;
+        // A kicked handshake must not become Ready, even when it has no key.
+        // The socket loop then stops instead of retrying a dead session.
+        if session_kicked(&body) {
+            return Ok(Some(ListenerEvent::Replaced));
+        }
         let Some(key) = body
             .get("key")
             .and_then(Value::as_str)
@@ -377,8 +422,8 @@ impl EventDecoder {
         else {
             return Ok(None);
         };
-        self.cipher_key = Some(key.to_owned());
         let error = body.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+        self.cipher_key = Some(key.to_owned());
         if error == 0 && body.get("data").is_some() {
             if let Ok(plain) = decode_event_data(&body, Some(key)) {
                 let mut queues = Vec::new();
@@ -399,7 +444,9 @@ impl EventDecoder {
     }
 
     fn live_messages(&mut self, frame: &Frame) -> Result<Option<ListenerEvent>, ListenerError> {
-        let data = self.decode_body(frame)?;
+        let Some(data) = self.decode_unless_kicked(frame)? else {
+            return Ok(Some(ListenerEvent::Replaced));
+        };
         let group = frame.cmd == CMD_GROUP_MESSAGES;
         let items = message_items(&data, group);
         let status = crate::status::StatusUpdate::from_event(&data);
@@ -412,6 +459,15 @@ impl EventDecoder {
             history: false,
             status,
         }))
+    }
+
+    /// Decoded body, or `Ok(None)` when the payload is a session kick.
+    fn decode_unless_kicked(&self, frame: &Frame) -> Result<Option<Value>, ListenerError> {
+        let data = self.decode_body(frame)?;
+        if session_kicked(&data) {
+            return Ok(None);
+        }
+        Ok(Some(data))
     }
 
     fn decode_body(&self, frame: &Frame) -> Result<Value, ListenerError> {
@@ -506,6 +562,14 @@ impl EventDecoder {
     }
 }
 
+/// True when this JSON is Electron's session kick (`600` or polling `-69`).
+fn session_kicked(body: &Value) -> bool {
+    matches!(
+        body.get("error_code").and_then(Value::as_i64),
+        Some(ERR_KICK_OUT) | Some(ERR_FORCE_LOGOUT)
+    )
+}
+
 fn queue_key(cmd: u16, sub: u8) -> String {
     format!("{cmd}_{sub}")
 }
@@ -594,27 +658,17 @@ fn is_message_cmd(cmd: u16) -> bool {
 
 /// History batches (`510`/`513`/`571`/…). Live pushes `501`/`521` are handled apart
 /// so a backlog does not notify once per message.
-fn queued_messages(cmd: u16, data: &Value) -> Option<ListenerEvent> {
+///
+/// Mixed frames containing both 1-1 `msgs` and `groupMsgs` emit two separate
+/// [`ListenerEvent::Messages`] entries so `LastIds` tracks each stream cleanly.
+fn queued_messages_all(cmd: u16, data: &Value) -> Vec<ListenerEvent> {
     if !is_message_cmd(cmd) {
-        return None;
+        return Vec::new();
     }
-    let (group, items) = split_messages(cmd, data);
-    let status = crate::status::StatusUpdate::from_event(data);
-    if items.is_empty() && status.is_empty() {
-        return None;
-    }
-    Some(ListenerEvent::Messages {
-        group,
-        items,
-        history: true,
-        status,
-    })
-}
-
-fn split_messages(cmd: u16, event: &Value) -> (bool, Vec<Value>) {
-    let root = event.get("data").filter(|v| v.is_object()).unwrap_or(event);
-    let group_msgs = array_of(root, "groupMsgs");
+    let root = data.get("data").filter(|v| v.is_object()).unwrap_or(data);
+    let mut group_msgs = array_of(root, "groupMsgs");
     let msgs = array_of(root, "msgs");
+    let status = crate::status::StatusUpdate::from_event(data);
     let group_cmd = matches!(
         cmd,
         CMD_GROUP_CATCH_UP
@@ -624,28 +678,49 @@ fn split_messages(cmd: u16, event: &Value) -> (bool, Vec<Value>) {
             | CMD_QUEUE_711
     );
     if group_cmd {
-        if !group_msgs.is_empty() {
-            return (true, group_msgs);
+        let items = if !group_msgs.is_empty() {
+            group_msgs
+        } else {
+            msgs
+        };
+        if items.is_empty() && status.is_empty() {
+            return Vec::new();
         }
-        return (true, msgs);
+        return vec![ListenerEvent::Messages {
+            group: true,
+            items,
+            history: true,
+            status,
+        }];
     }
-    if !group_msgs.is_empty() && msgs.is_empty() {
-        return (true, group_msgs);
-    }
-    if !group_msgs.is_empty() && !msgs.is_empty() {
-        // Mixed offline/preload frame carrying both 1-1 `msgs` and `groupMsgs`.
-        // Mark group items explicitly so downstream parsers route them to `g_<id>`.
-        let mut combined = msgs;
-        for mut item in group_msgs {
-            if let Some(obj) = item.as_object_mut() {
-                obj.entry("isGroup".to_owned())
-                    .or_insert_with(|| Value::from(1));
-            }
-            combined.push(item);
+    for item in &mut group_msgs {
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("isGroup".to_owned(), Value::from(1));
         }
-        return (false, combined);
     }
-    (false, msgs)
+    let mut out = Vec::new();
+    if !msgs.is_empty() || (!status.is_empty() && group_msgs.is_empty()) {
+        out.push(ListenerEvent::Messages {
+            group: false,
+            items: msgs,
+            history: true,
+            status: status.clone(),
+        });
+    }
+    if !group_msgs.is_empty() {
+        let group_status = if out.is_empty() {
+            status
+        } else {
+            crate::status::StatusUpdate::default()
+        };
+        out.push(ListenerEvent::Messages {
+            group: true,
+            items: group_msgs,
+            history: true,
+            status: group_status,
+        });
+    }
+    out
 }
 
 fn array_of(value: &Value, key: &str) -> Vec<Value> {
@@ -994,15 +1069,17 @@ pub fn is_transient_disconnect(reason: &str) -> bool {
         "close_notify",
         "unexpected-eof",
         "unexpected eof",
+        "early eof",
         "connection reset",
         "broken pipe",
         "timed out",
+        "handshake timeout",
+        "connect timeout",
         "socket ended",
         "dns",
         "failed to lookup",
         "network is unreachable",
         "temporary failure",
-        "eof",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -1038,8 +1115,8 @@ where
 }
 
 /// [`run_listener`] that also writes the frames sent on `outgoing` to the
-/// socket (requests such as sync `cmd 590`). Frames sent while the socket is
-/// reconnecting wait in the channel.
+/// socket. Frames sent while the socket is reconnecting wait in the channel.
+/// The desktop client currently passes `None`.
 ///
 /// # Errors
 ///
@@ -1087,8 +1164,11 @@ where
                 on_event(ListenerEvent::Replaced);
                 return Ok(());
             }
-            Ok(Outcome::Dropped { was_ready, reason }) => {
-                if was_ready {
+            Ok(Outcome::Dropped {
+                was_healthy,
+                reason,
+            }) => {
+                if was_healthy {
                     backoff = Duration::from_secs(2);
                     consecutive_unready = 0;
                 } else {
@@ -1123,10 +1203,17 @@ where
     }
 }
 
+/// Minimum healthy uptime after `Ready` before a subsequent disconnect resets
+/// backoff and `consecutive_unready`. Prevents infinite reconnect loops when a
+/// stale session gets `cmd 1` and is immediately closed by the server.
+const MIN_HEALTHY_READY: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+
 enum Outcome {
     Stop,
     Replaced,
-    Dropped { was_ready: bool, reason: String },
+    Dropped { was_healthy: bool, reason: String },
 }
 
 async fn run_once<F>(
@@ -1153,7 +1240,12 @@ where
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     headers.insert("Pragma", HeaderValue::from_static("no-cache"));
 
-    let (socket, _) = tokio_tungstenite::connect_async(request).await?;
+    let (socket, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| ListenerError::Closed("connect timeout".to_owned()))??;
     let (mut sink, mut stream) = socket.split();
     if !on_event(ListenerEvent::Connected) {
         let _ = sink.close().await;
@@ -1162,11 +1254,19 @@ where
     let mut decoder = EventDecoder::with_cursors(cursors.clone());
     let mut ping = tokio::time::interval(config.ping_interval);
     ping.tick().await;
-    let mut last_rx = tokio::time::Instant::now();
+    let mut handshake_deadline =
+        tokio::time::interval(Duration::from_secs(5));
+    handshake_deadline.tick().await;
+    let connected_at = tokio::time::Instant::now();
+    let mut ready_at: Option<tokio::time::Instant> = None;
+    let mut last_rx = connected_at;
     let stale_after = config
         .ping_interval
         .saturating_mul(2)
         .max(Duration::from_secs(45));
+    let is_healthy = |ready_at: Option<tokio::time::Instant>| {
+        ready_at.is_some_and(|at| at.elapsed() >= MIN_HEALTHY_READY)
+    };
     loop {
         tokio::select! {
             incoming = stream.next() => {
@@ -1176,11 +1276,11 @@ where
                         message
                     }
                     Some(Err(err)) => return Ok(Outcome::Dropped {
-                        was_ready: decoder.is_ready(),
+                        was_healthy: is_healthy(ready_at),
                         reason: err.to_string(),
                     }),
                     None => return Ok(Outcome::Dropped {
-                        was_ready: decoder.is_ready(),
+                        was_healthy: is_healthy(ready_at),
                         reason: "socket ended".to_owned(),
                     }),
                 };
@@ -1193,7 +1293,7 @@ where
                             return Ok(Outcome::Replaced);
                         }
                         return Ok(Outcome::Dropped {
-                            was_ready: decoder.is_ready(),
+                            was_healthy: is_healthy(ready_at),
                             reason: format!("close {}", code.map_or("-".to_owned(), |c| c.to_string())),
                         });
                     }
@@ -1201,7 +1301,7 @@ where
                 };
                 let Ok(frame) = Frame::decode(&bytes) else { continue };
                 // A single bad event must not tear the connection down.
-                let parsed = decoder.handle(&frame);
+                let parsed = decoder.handle_all(&frame);
                 let mut extra = decoder.take_outbound();
                 if decoder.cursors_dirty() {
                     *cursors = decoder.cursors().clone();
@@ -1210,42 +1310,62 @@ where
                         save_queue_cursors(path, cursors);
                     }
                 }
-                let Ok(event) = parsed else { continue };
-                let Some(event) = event else {
+                let Ok(events) = parsed else { continue };
+                if events.is_empty() {
                     if let Err(err) = send_frames(&mut sink, extra).await {
                         return Ok(Outcome::Dropped {
-                            was_ready: decoder.is_ready(),
+                            was_healthy: is_healthy(ready_at),
                             reason: err,
                         });
                     }
                     continue;
-                };
-                if event == ListenerEvent::Replaced {
+                }
+                if events.contains(&ListenerEvent::Replaced) {
                     let _ = sink.close().await;
                     return Ok(Outcome::Replaced);
                 }
-                if event == ListenerEvent::Ready && extra.is_empty() {
-                    // Auth had no `qCmds`. Fall back to the direct 510/511 resume.
-                    let pending = [(false, last_ids.user.clone()), (true, last_ids.group.clone())];
-                    for (group, last) in pending {
-                        let Some(last) = last else { continue };
-                        extra.push(catch_up_frame(group, &last));
+                if events.contains(&ListenerEvent::Ready) {
+                    ready_at.get_or_insert_with(tokio::time::Instant::now);
+                    if extra.is_empty() {
+                        // Auth had no `qCmds`. Fall back to the direct 510/511 resume.
+                        let pending = [(false, last_ids.user.clone()), (true, last_ids.group.clone())];
+                        for (group, last) in pending {
+                            let Some(last) = last else { continue };
+                            extra.push(catch_up_frame(group, &last));
+                        }
                     }
                 }
                 if let Err(err) = send_frames(&mut sink, extra).await {
-                    return Ok(Outcome::Dropped { was_ready: true, reason: err });
+                    return Ok(Outcome::Dropped {
+                        was_healthy: is_healthy(ready_at),
+                        reason: err,
+                    });
                 }
-                if let ListenerEvent::Messages { group, items, .. } = &event {
-                    last_ids.record(*group, items);
-                }
-                if !on_event(event) {
-                    let _ = sink.close().await;
-                    return Ok(Outcome::Stop);
+                for event in events {
+                    if let ListenerEvent::Messages { group, items, .. } = &event {
+                        last_ids.record(*group, items);
+                    }
+                    if !on_event(event) {
+                        let _ = sink.close().await;
+                        return Ok(Outcome::Stop);
+                    }
                 }
             }
             Some(frame) = next_outgoing(outgoing, decoder.is_ready()) => {
                 if let Err(err) = sink.send(Message::binary(frame.encode())).await {
-                    return Ok(Outcome::Dropped { was_ready: true, reason: err.to_string() });
+                    return Ok(Outcome::Dropped {
+                        was_healthy: is_healthy(ready_at),
+                        reason: err.to_string(),
+                    });
+                }
+            }
+            _ = handshake_deadline.tick(), if !decoder.is_ready() => {
+                if connected_at.elapsed() >= HANDSHAKE_TIMEOUT {
+                    let _ = sink.close().await;
+                    return Ok(Outcome::Dropped {
+                        was_healthy: false,
+                        reason: "handshake timeout".to_owned(),
+                    });
                 }
             }
             _ = ping.tick() => {
@@ -1253,14 +1373,14 @@ where
                     if last_rx.elapsed() >= stale_after {
                         let _ = sink.close().await;
                         return Ok(Outcome::Dropped {
-                            was_ready: true,
+                            was_healthy: is_healthy(ready_at),
                             reason: "connection timed out".to_owned(),
                         });
                     }
                     let frame = Frame::ping(unix_ms());
                     if let Err(err) = sink.send(Message::binary(frame.encode())).await {
                         return Ok(Outcome::Dropped {
-                            was_ready: true,
+                            was_healthy: is_healthy(ready_at),
                             reason: err.to_string(),
                         });
                     }
@@ -1460,6 +1580,23 @@ mod tests {
         let dup = Frame::json(CMD_DUPLICATE, 0, &Value::Null);
         assert_eq!(
             decoder.handle(&dup).expect("dup"),
+            Some(ListenerEvent::Replaced)
+        );
+        let mut kicked = EventDecoder::new();
+        let auth = Frame::json(1, 1, &json!({"key": "abc", "error_code": 600}));
+        assert_eq!(
+            kicked.handle(&auth).expect("kick auth"),
+            Some(ListenerEvent::Replaced)
+        );
+        assert!(!kicked.is_ready());
+        let poll = Frame::json(601, 0, &json!({"error_code": -69}));
+        assert_eq!(
+            kicked.handle(&poll).expect("kick poll"),
+            Some(ListenerEvent::Replaced)
+        );
+        let inner = Frame::json(612, 0, &json!({"encrypt": 0, "data": {"error_code": 600}}));
+        assert_eq!(
+            kicked.handle(&inner).expect("kick inner"),
             Some(ListenerEvent::Replaced)
         );
         let react = Frame::json(612, 0, &json!({"encrypt": 0, "data": {"reacts": []}}));
@@ -1769,5 +1906,61 @@ mod tests {
             Some("99")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mixed_offline_frame_splits_user_and_group_without_corrupting_last_ids() {
+        let mut decoder = EventDecoder::new();
+        let frame = Frame::json(
+            CMD_PRELOAD,
+            0,
+            &json!({
+                "encrypt": 0,
+                "data": {
+                    "msgs": [{"msgId": "100", "content": "hi"}],
+                    "groupMsgs": [{"msgId": "900", "idTo": "777", "isGroup": 0, "content": "team"}]
+                }
+            }),
+        );
+        let events = decoder.handle_all(&frame).expect("mixed preload");
+        assert_eq!(events.len(), 2);
+
+        let mut last_ids = LastIds::default();
+        for ev in &events {
+            if let ListenerEvent::Messages { group, items, .. } = ev {
+                last_ids.record(*group, items);
+            }
+        }
+        assert_eq!(last_ids.user.as_deref(), Some("100"));
+        assert_eq!(last_ids.group.as_deref(), Some("900"));
+
+        match &events[0] {
+            ListenerEvent::Messages { group, items, .. } => {
+                assert!(!group);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0]["msgId"], "100");
+            }
+            other => panic!("expected user batch, got {other:?}"),
+        }
+        match &events[1] {
+            ListenerEvent::Messages { group, items, .. } => {
+                assert!(*group);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0]["msgId"], "900");
+                assert_eq!(items[0]["isGroup"], 1);
+            }
+            other => panic!("expected group batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transient_disconnect_avoids_false_positives_on_generic_eof() {
+        assert!(is_transient_disconnect(
+            "peer closed connection without sending TLS close_notify"
+        ));
+        assert!(is_transient_disconnect("unexpected EOF"));
+        assert!(is_transient_disconnect("handshake timeout"));
+        assert!(is_transient_disconnect("connect timeout"));
+        assert!(!is_transient_disconnect("EOF while parsing a value at line 1"));
     }
 }

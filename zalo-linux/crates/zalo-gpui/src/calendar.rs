@@ -1,7 +1,6 @@
 //! Calendar date arithmetic (`DD/MM/YYYY`) and 6×7 Sunday-first month grid
 //! used by the in-chat message date-range search picker.
 
-use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -176,18 +175,31 @@ pub fn month_grid(year: u32, month: u8) -> [CalCell; 42] {
     cells
 }
 
+/// Formats the current local timestamp as `DDMMYYYY_HHMMSS` (no `date` subprocess).
+#[must_use]
+pub(crate) fn local_stamp_dmy_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let shifted = secs.saturating_add(local_tz_offset_secs()).max(0) as u64;
+    let (year, month, day, hh, mm, ss) = utc_from_unix_secs(shifted);
+    format!("{day:02}{month:02}{year:04}_{hh:02}{mm:02}{ss:02}")
+}
+
 fn local_tz_offset_secs() -> i64 {
     static OFFSET: OnceLock<i64> = OnceLock::new();
     *OFFSET.get_or_init(|| {
-        let out = Command::new("date").arg("+%z").output().ok();
-        let text = out
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default();
-        if text.len() == 5 {
-            let sign = if text.starts_with('-') { -1_i64 } else { 1_i64 };
-            if let (Ok(hh), Ok(mm)) = (text[1..3].parse::<i64>(), text[3..5].parse::<i64>()) {
-                return sign * (hh * 3600 + mm * 60);
+        #[cfg(unix)]
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as libc::time_t)
+                .unwrap_or(0);
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            let ptr = unsafe { libc::localtime_r(&now, &mut tm) };
+            if !ptr.is_null() {
+                return tm.tm_gmtoff as i64;
             }
         }
         0

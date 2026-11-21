@@ -1,8 +1,6 @@
-//! Microphone voice recording (`zcall-audio` + `ffmpeg` -> MP3) and `send_voice`.
+//! Microphone voice recording (`zcall-audio` `CardMic` + pure-Rust `rusty_mp3`) and `send_voice`.
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -52,64 +50,33 @@ pub(crate) fn validate_pcm_len(pcm_bytes: usize) -> Result<u64, String> {
     Ok(ms)
 }
 
-fn pulse_running() -> bool {
-    Command::new("pactl")
-        .arg("info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Encodes 16 kHz mono `s16le` PCM into MP3 (`32 kbps`) via `ffmpeg`.
+/// Encodes 16 kHz mono `s16le` PCM into MP3 (`32 kbps`) in-process via pure-Rust `rusty_mp3`
+/// (zero `ffmpeg` dependency).
 pub(crate) fn pcm_s16le_16k_to_mp3(pcm: &[u8]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "s16le",
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-i",
-            "pipe:0",
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "32k",
-            "-f",
-            "mp3",
-            "pipe:1",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("không chạy được ffmpeg: {e}"))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "ffmpeg stdin unavailable".to_owned())?;
-        stdin.write_all(pcm).map_err(|e| e.to_string())?;
+    if pcm.len() < 2 {
+        return Err("dữ liệu PCM rỗng".to_owned());
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-        return Err(if err.is_empty() {
-            "ffmpeg lỗi mã hóa MP3".to_owned()
-        } else {
-            err
-        });
+    let mut encoder = rusty_mp3::Mp3Encoder::new(rusty_mp3::Mp3EncoderConfig {
+        bitrate_kbps: 32,
+        vbr_quality: None,
+    });
+    let aligned = &pcm[..pcm.len() & !1];
+    encoder
+        .push_pcm_s16le(aligned, 1, 16_000)
+        .map_err(|e| format!("lỗi mã hóa MP3: {e:?}"))?;
+    encoder.finish();
+    let mut mp3 = Vec::new();
+    loop {
+        match encoder.next_packet() {
+            Ok(pkt) => mp3.extend_from_slice(&pkt),
+            Err(rusty_mp3::Error::Again | rusty_mp3::Error::Eof) => break,
+            Err(e) => return Err(format!("lỗi xuất khung MP3: {e:?}")),
+        }
     }
-    if out.stdout.is_empty() {
-        return Err("ffmpeg không tạo được dữ liệu MP3".to_owned());
+    if mp3.is_empty() {
+        return Err("không tạo được dữ liệu MP3".to_owned());
     }
-    Ok(out.stdout)
+    Ok(mp3)
 }
 
 /// Stores recorded MP3 locally so the outgoing bubble plays immediately.
@@ -125,23 +92,37 @@ pub(crate) fn save_local_voice(client_id: u64, mp3: &[u8]) -> Option<PathBuf> {
 }
 
 /// Captures mic frames until stopped/canceled or [`MAX_VOICE_SECS`], then encodes MP3.
+/// Uses in-process `CardMic` (`libpulse-simple`) first so `pactl`/`parec` are not needed.
 pub(crate) fn record_blocking(
     stop: &AtomicBool,
     cancel: &AtomicBool,
 ) -> Result<Option<(Vec<u8>, u64)>, String> {
-    let mut cap = zcall_audio::capture::MicCapture::from_mic(None, None, pulse_running())
-        .or_else(|_| zcall_audio::capture::MicCapture::from_mic(None, None, false))
-        .map_err(|e| format!("Không mở được mic ({e})"))?;
     let mut pcm = Vec::new();
     let started = Instant::now();
     let max = Duration::from_secs(MAX_VOICE_SECS);
-    while !stop.load(Ordering::Relaxed) && started.elapsed() < max {
-        match cap.next_frame() {
-            Some(frame) => pcm.extend_from_slice(&frame),
-            None => break,
+    if let Ok(card) = zcall_audio::capture::CardMic::open(None) {
+        while !stop.load(Ordering::Relaxed) && started.elapsed() < max {
+            match card.read_frame() {
+                Ok(samples) => {
+                    for s in samples {
+                        pcm.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+                Err(_) => break,
+            }
         }
+    } else {
+        let mut cap = zcall_audio::capture::MicCapture::from_mic(None, None, true)
+            .or_else(|_| zcall_audio::capture::MicCapture::from_mic(None, None, false))
+            .map_err(|e| format!("Không mở được mic ({e})"))?;
+        while !stop.load(Ordering::Relaxed) && started.elapsed() < max {
+            match cap.next_frame() {
+                Some(frame) => pcm.extend_from_slice(&frame),
+                None => break,
+            }
+        }
+        cap.close();
     }
-    cap.close();
     if cancel.load(Ordering::Relaxed) {
         return Ok(None);
     }
@@ -161,8 +142,8 @@ impl ShellView {
             self.set_note("Chọn một hội thoại để ghi âm");
             return;
         };
-        if let Some((_, mut child)) = self.voice_playing.take() {
-            let _ = child.kill();
+        if let Some((_, handle)) = self.voice_playing.take() {
+            handle.stop();
         }
         self.sticker_open = false;
         self.menu = None;
@@ -373,5 +354,29 @@ mod tests {
         assert!(validate_pcm_len(12_000).is_err());
         assert_eq!(validate_pcm_len(12_800), Ok(400));
         assert_eq!(validate_pcm_len(64_000), Ok(2000));
+    }
+
+    #[test]
+    fn encodes_16k_mono_pcm_to_valid_mp3_in_process_without_ffmpeg() {
+        // 0.6 s of 440 Hz tone at 16 kHz mono s16le.
+        let mut pcm = Vec::with_capacity(16_000 * 2);
+        for i in 0..9_600 {
+            let s = (0.4 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 16_000.0).sin()
+                * i16::MAX as f32) as i16;
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        let mp3 = pcm_s16le_16k_to_mp3(&pcm).expect("in-process mp3 encode");
+        assert!(mp3.len() > 500, "encoded mp3 too short: {}", mp3.len());
+        // Verify round-trip decode succeeds.
+        let mut dec = rusty_mp3::Mp3Decoder::new();
+        dec.push(&mp3);
+        dec.flush();
+        let mut decoded_samples = 0usize;
+        while let Ok(frame) = dec.next_frame() {
+            assert_eq!(frame.sample_rate, 16_000);
+            assert_eq!(frame.channels, 1);
+            decoded_samples += frame.samples.len();
+        }
+        assert!(decoded_samples >= 8_000);
     }
 }

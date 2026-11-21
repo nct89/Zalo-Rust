@@ -280,17 +280,31 @@ impl ZrtcMediaBackend {
         }
     }
 
-    /// Starts the screen-share SSRC.
+    /// Starts the screen-share SSRC (and dedicated UDP socket for group `ShareScreenPeer`).
     pub fn start_share(&mut self, share_id: u32) {
         if let Some(driver) = self.driver.as_mut() {
-            driver.media.start_share(share_id);
+            driver.start_share(share_id);
         }
     }
 
-    /// Stops the screen-share SSRC.
+    /// Stops the screen-share SSRC and closes any dedicated group share socket.
     pub fn stop_share(&mut self) {
         if let Some(driver) = self.driver.as_mut() {
-            driver.media.stop_share();
+            driver.stop_share();
+        }
+    }
+
+    /// Consumes a pending keyframe request for the group screen-share encoder.
+    pub fn take_share_key_frame_request(&mut self) -> bool {
+        self.driver
+            .as_mut()
+            .is_some_and(|driver| driver.media.take_share_key_frame_request())
+    }
+
+    /// Reports the encoded screen-share dimensions to the group share peer.
+    pub fn set_share_dimensions(&mut self, width: u16, height: u16) {
+        if let Some(driver) = self.driver.as_mut() {
+            driver.media.set_share_dimensions(width, height);
         }
     }
 
@@ -657,11 +671,25 @@ pub fn poll_and_tick(
     }
 
     if !backend.is_started() {
+        // Keep 1-1 relay NAT bindings and InitZRTP sessions alive while ringing
+        // before `start()` activates media.
+        let ringing_1to1 = backend
+            .driver
+            .as_ref()
+            .is_some_and(|d| !d.media.group && !d.media.replies.is_empty());
+        if ringing_1to1 {
+            let now = Instant::now();
+            if now.duration_since(*last_ping) >= Duration::from_millis(PING_INTERVAL_MS) {
+                backend.send_ping();
+                *last_ping = now;
+            }
+        }
         return;
     }
     if let Some(driver) = backend.driver.as_mut() {
         driver.media.send_fwd8_if_due();
         let _ = driver.media.drain_video_queue(16);
+        driver.media.tick_share();
     }
     let now = Instant::now();
     let now_ms = now.duration_since(backend.started_at).as_millis() as u64;
@@ -813,6 +841,7 @@ fn usable_ipv4(ip: &str) -> bool {
 }
 
 /// Host addresses marked `LOCAL` in `/proc/net/fib_trie`.
+#[cfg(any(target_os = "linux", test))]
 fn host_ipv4_from_fib(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
@@ -835,9 +864,26 @@ fn host_ipv4_from_fib(text: &str) -> Vec<String> {
 }
 
 /// This machine's IPv4 addresses, for the 416 / 402 candidate list.
+///
+/// Uses cross-platform `if_addrs` (Linux, Windows, macOS), falling back to
+/// `/proc/net/fib_trie` on Linux and finally the default-route UDP socket.
 fn host_ipv4_addrs() -> Vec<String> {
-    let text = std::fs::read_to_string("/proc/net/fib_trie").unwrap_or_default();
-    let mut out = host_ipv4_from_fib(&text);
+    let mut out = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if let std::net::IpAddr::V4(ip) = iface.ip() {
+                let text = ip.to_string();
+                if usable_ipv4(&text) && !out.contains(&text) {
+                    out.push(text);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if out.is_empty() {
+        let text = std::fs::read_to_string("/proc/net/fib_trie").unwrap_or_default();
+        out = host_ipv4_from_fib(&text);
+    }
     if out.is_empty() {
         if let Some(ip) = default_route_ipv4() {
             out.push(ip);
@@ -904,5 +950,72 @@ mod tests {
         let s = backend.stats();
         assert_eq!(s["rx"], json!(0));
         assert_eq!(s["active"], json!(false));
+    }
+
+    #[test]
+    fn poll_and_tick_pings_all_replied_relays_while_ringing() {
+        let sent = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let rec = Arc::clone(&sent);
+
+        let mut driver = MediaDriver::bind().expect("bind driver");
+        driver.media.send_udp = true;
+        driver.media.set_send(move |_pkt, srv, what| {
+            rec.lock()
+                .unwrap()
+                .push((srv.host.clone(), what.to_owned()));
+        });
+        driver.media.on_negotiated(&json!({
+            "callId": 42,
+            "role": "caller",
+            "localUid": 100,
+            "peerUid": 200,
+            "sessId": "ring-tick-session-123456789012345",
+            "servers": [
+                {"rtpaddr": "192.0.2.10:5000"},
+                {"rtpaddr": "192.0.2.11:5001"}
+            ]
+        }));
+        driver.media.replies.push(crate::media::Reply {
+            server: Server {
+                host: "192.0.2.10".into(),
+                port: 5000,
+            },
+            token: 101,
+            rtt_ms: 10,
+            public_addr: None,
+        });
+        driver.media.replies.push(crate::media::Reply {
+            server: Server {
+                host: "192.0.2.11".into(),
+                port: 5001,
+            },
+            token: 202,
+            rtt_ms: 20,
+            public_addr: None,
+        });
+        driver.media.active_server = Some(Server {
+            host: "192.0.2.10".into(),
+            port: 5000,
+        });
+
+        let mut backend = ZrtcMediaBackend::new(true);
+        backend.driver = Some(driver);
+        assert!(!backend.is_started());
+
+        let mut last_ping = Instant::now() - Duration::from_millis(PING_INTERVAL_MS + 100);
+        let mut last_status = Instant::now();
+        let mut last_twcc = Instant::now();
+        let mut last_report = Instant::now();
+        poll_and_tick(
+            &mut backend,
+            &mut last_ping,
+            &mut last_status,
+            &mut last_twcc,
+            &mut last_report,
+        );
+        let pkts = sent.lock().unwrap();
+        assert_eq!(pkts.len(), 2);
+        assert_eq!(pkts[0], ("192.0.2.10".to_owned(), "Ping".to_owned()));
+        assert_eq!(pkts[1], ("192.0.2.11".to_owned(), "Ping".to_owned()));
     }
 }

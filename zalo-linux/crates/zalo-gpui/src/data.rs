@@ -107,6 +107,9 @@ pub struct ChatMsg {
     pub poll_closed: bool,
     /// Choices. Empty until `/api/poll/detail` fills them.
     pub poll_options: Vec<PollChoice>,
+    /// Electron `params.group_layout_id` for one cell of a multi-photo send.
+    /// `0` means the row has no album id.
+    pub group_layout_id: i64,
 }
 
 impl ChatMsg {
@@ -155,8 +158,59 @@ impl ChatMsg {
             poll_action: String::new(),
             poll_closed: false,
             poll_options: Vec::new(),
+            group_layout_id: 0,
         }
     }
+}
+
+/// Exclusive end of a horizontal photo album that starts at `start`.
+/// A single photo returns `start + 1`.
+///
+/// Electron groups cells that share `group_layout_id` (`is_group_layout` and
+/// `total_item_in_group > 1`). Rows saved before that id was kept still belong
+/// to one send when they are consecutive photos from the same person and each
+/// neighbor is at most 2 seconds later — the gap of one composer send.
+#[must_use]
+pub fn photo_album_end(msgs: &[ChatMsg], start: usize) -> usize {
+    const GAP_MS: i64 = 2_000;
+    let Some(first) = msgs.get(start) else {
+        return start;
+    };
+    if !is_album_photo(first) {
+        return start + 1;
+    }
+    let layout = first.group_layout_id;
+    let mut end = start + 1;
+    while let Some(next) = msgs.get(end) {
+        if !is_album_photo(next) || !same_album_sender(first, next) {
+            break;
+        }
+        if layout != 0 {
+            if next.group_layout_id != layout {
+                break;
+            }
+        } else if next.group_layout_id != 0
+            || next.at_ms == 0
+            || msgs[end - 1].at_ms == 0
+            || (next.at_ms - msgs[end - 1].at_ms).abs() > GAP_MS
+        {
+            break;
+        }
+        end += 1;
+    }
+    if end - start < 2 {
+        start + 1
+    } else {
+        end
+    }
+}
+
+fn is_album_photo(msg: &ChatMsg) -> bool {
+    msg.kind == MsgKind::Photo && !msg.recalled
+}
+
+fn same_album_sender(a: &ChatMsg, b: &ChatMsg) -> bool {
+    a.from_me == b.from_me && a.sender_uid == b.sender_uid
 }
 
 /// One Contacts person or group.
@@ -231,13 +285,106 @@ pub fn config_dir() -> Option<PathBuf> {
         .map(|xdg| xdg.config_home().join("zalo-rust"))
 }
 
+/// Directory of one account: `accounts/<userId>` under the machine config dir.
+///
+/// The id is the `userId` from `profile/me`. Characters that are not safe in a
+/// path are replaced so the folder cannot escape the accounts directory.
+#[must_use]
+pub fn account_dir(machine: &std::path::Path, user_id: &str) -> PathBuf {
+    let safe: String = user_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    machine.join("accounts").join(safe)
+}
+
+/// `current-user` names the account directory the UI is allowed to open.
+#[must_use]
+pub fn read_current_user(machine: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(machine.join("current-user"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Points the UI at `user_id`. Does not delete any other account directory.
+pub fn write_current_user(machine: &std::path::Path, user_id: &str) {
+    let user_id = user_id.trim();
+    if user_id.is_empty() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(machine);
+    let _ = std::fs::write(machine.join("current-user"), user_id);
+}
+
+/// Drops the pointer. A later login of a different account cannot see this one.
+pub fn clear_current_user(machine: &std::path::Path) {
+    let _ = std::fs::remove_file(machine.join("current-user"));
+}
+
+/// Session directory to open.
+///
+/// A `current-user` pointer wins. If it names an account whose `session.json`
+/// is gone, this returns `None` instead of falling back to a leftover session
+/// at the machine root. The root session is only for installs that have never
+/// written `current-user`.
+#[must_use]
+pub fn active_data_dir() -> Option<PathBuf> {
+    let machine = config_dir()?;
+    if let Some(uid) = read_current_user(&machine) {
+        let dir = account_dir(&machine, &uid);
+        return dir.join("session.json").is_file().then_some(dir);
+    }
+    machine.join("session.json").is_file().then_some(machine)
+}
+
+/// Copies `device.json` into an account directory.
+///
+/// API calls look for the device file beside `session.json`. Generating a
+/// second file would mint a new IMEI and the server would treat it as another
+/// computer.
+pub fn share_device(machine: &std::path::Path, account: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(account)?;
+    let src = machine.join("device.json");
+    let dest = account.join("device.json");
+    if dest.is_file() || !src.is_file() {
+        return Ok(());
+    }
+    std::fs::copy(src, dest).map(|_| ())
+}
+
+/// Moves this machine's legacy store into `account` when `account.uid` is this user.
+///
+/// A mismatched id is left where it is. Copying it would put the previous
+/// account's chats into the new account.
+pub fn migrate_legacy_store(machine: &std::path::Path, account: &std::path::Path, user_id: &str) {
+    if account.join("store.db").is_file() {
+        return;
+    }
+    if read_last_account_uid(machine).as_deref() != Some(user_id) {
+        return;
+    }
+    for name in ["store.db", "store.db-wal", "store.db-shm", "queue-cursors.json"] {
+        let src = machine.join(name);
+        if src.is_file() {
+            let _ = std::fs::rename(&src, account.join(name));
+        }
+    }
+}
+
 /// True when `session.json` holds a `zpw_sek`. Tests always return false.
 #[must_use]
 pub fn session_present() -> bool {
     if cfg!(test) {
         return false;
     }
-    config_dir()
+    active_data_dir()
         .and_then(|dir| StoredSession::load(&dir).ok())
         .and_then(|session| session.zpw_sek())
         .is_some()
@@ -246,6 +393,77 @@ pub fn session_present() -> bool {
 /// Deletes `session.json` in `dir`. `device.json` stays so the next QR keeps the IMEI.
 pub fn wipe_session_file(dir: &std::path::Path) {
     let _ = std::fs::remove_file(dir.join("session.json"));
+}
+
+/// Logout: drop the active pointer and this account's bearer session.
+///
+/// The account directory's `store.db` stays, so the same user can log in again.
+/// Other accounts are not touched. The legacy root `session.json` is removed
+/// too, otherwise a cleared pointer would reopen the previous account.
+pub fn detach_account(session_dir: &std::path::Path) {
+    wipe_session_file(session_dir);
+    // `accounts/<userId>` → the machine config dir is two levels up.
+    // A legacy session lives in the machine dir itself.
+    let machine = if session_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .is_some_and(|name| name == "accounts")
+    {
+        session_dir.parent().and_then(|p| p.parent())
+    } else {
+        Some(session_dir)
+    };
+    if let Some(machine) = machine {
+        clear_current_user(machine);
+        if machine != session_dir {
+            wipe_session_file(machine);
+        }
+    }
+}
+
+/// Deletes ALL account-scoped local state in `dir` (and matching profile/link caches)
+/// while keeping `device.json` and app-level UI preferences (theme, language, window size).
+///
+/// Called on explicit user logout and whenever QR login authenticates a different account
+/// than the previous one, so chats/groups/cursors/profiles from the old account never leak.
+pub fn wipe_account_data(dir: &std::path::Path) {
+    wipe_session_file(dir);
+    for name in [
+        "store.db",
+        "store.db-wal",
+        "store.db-shm",
+        "queue-cursors.json",
+        "account.uid",
+    ] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let mut prefs = crate::prefs::Prefs::load(Some(dir.to_path_buf()));
+    prefs.reset_account_keys();
+    if config_dir().as_deref() == Some(dir) {
+        if let Some(p) = crate::profiles::cache_path() {
+            let _ = std::fs::remove_file(p);
+        }
+        if let Some(l) = crate::links::cache_path() {
+            let _ = std::fs::remove_file(l);
+        }
+    }
+}
+
+/// Reads the last logged-in account identifier stored in `dir/account.uid`.
+#[must_use]
+pub fn read_last_account_uid(dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(dir.join("account.uid"))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Persists the active account identifier to `dir/account.uid`.
+pub fn write_last_account_uid(dir: &std::path::Path, uid: &str) {
+    let uid = uid.trim();
+    if !uid.is_empty() {
+        let _ = std::fs::write(dir.join("account.uid"), uid);
+    }
 }
 
 /// Unix milliseconds.
@@ -360,6 +578,24 @@ pub(crate) fn vn_ymd(ms: i64) -> (i64, i64, i64) {
     (year, month as i64, day as i64)
 }
 
+/// Conversations and messages currently in `dir/store.db`.
+#[must_use]
+pub(crate) fn snapshot_from_store(dir: &std::path::Path) -> Option<Snapshot> {
+    #[cfg(test)]
+    {
+        let _ = dir;
+        None
+    }
+    #[cfg(not(test))]
+    {
+        let store = LocalStore::open(&dir.join("store.db")).ok()?;
+        let mut snap = map_store(&store);
+        snap.session_dir = Some(dir.to_path_buf());
+        snap.has_session = true;
+        Some(snap)
+    }
+}
+
 /// Load local content. Tests always get the four preview threads.
 #[must_use]
 pub fn load_snapshot() -> Snapshot {
@@ -377,7 +613,7 @@ pub fn load_snapshot() -> Snapshot {
 /// Logged-in shell with no local threads yet. Realtime `startup_sync` fills it.
 #[cfg(not(test))]
 fn session_shell_snapshot() -> Option<Snapshot> {
-    let dir = config_dir()?;
+    let dir = active_data_dir()?;
     let session = StoredSession::load(&dir).ok()?;
     session
         .zpw_sek()
@@ -481,8 +717,11 @@ fn person_from_preview(row: &preview::PreviewPerson) -> ChatPerson {
 
 #[cfg(not(test))]
 fn load_from_disk() -> Option<Snapshot> {
-    let dir = config_dir()?;
-    let session = StoredSession::load(&dir).ok();
+    let dir = active_data_dir()?;
+    let session = StoredSession::load(&dir).ok()?;
+    if session.zpw_sek().is_none() {
+        return None;
+    }
     let store_path = dir.join("store.db");
     if !store_path.is_file() {
         return None;
@@ -492,17 +731,13 @@ fn load_from_disk() -> Option<Snapshot> {
     if snap.convs.is_empty() {
         return None;
     }
-    if let Some(session) = session {
-        snap.display_name = session.display_name.clone();
-        snap.uin = session.uin.clone();
-        snap.send2me_id = session.send2me_id.clone();
-        snap.has_session = session.zpw_sek().is_some();
-        snap.session_dir = Some(dir.clone());
-        if let Some(uin) = session.uin.as_deref() {
-            merge_index_friends(&mut snap, uin);
-        }
-    } else {
-        snap.session_dir = Some(dir);
+    snap.display_name = session.display_name.clone();
+    snap.uin = session.uin.clone();
+    snap.send2me_id = session.send2me_id.clone();
+    snap.has_session = true;
+    snap.session_dir = Some(dir.clone());
+    if let Some(uin) = session.uin.as_deref() {
+        merge_index_friends(&mut snap, uin);
     }
     Some(snap)
 }
@@ -595,6 +830,7 @@ fn record_to_chat_msg(
         poll_action: meta.poll_action,
         poll_closed: meta.poll_closed,
         poll_options: meta.poll_options,
+        group_layout_id: meta.group_layout_id,
     }
 }
 
@@ -619,7 +855,7 @@ pub fn search_thread_messages_filtered(
         if q.is_empty() && from_ms.is_none() && to_ms.is_none() {
             return Vec::new();
         }
-        let Some(dir) = config_dir() else {
+        let Some(dir) = active_data_dir() else {
             return Vec::new();
         };
         let store_path = dir.join("store.db");
@@ -785,7 +1021,7 @@ pub fn persist_local_message_quote(
     if cfg!(test) || !live_allowed(thread_id) || body.is_empty() {
         return;
     }
-    let Some(dir) = config_dir() else {
+    let Some(dir) = active_data_dir() else {
         return;
     };
     let path = dir.join("store.db");
@@ -829,7 +1065,7 @@ pub fn persist_thread_title(thread_id: &str, title: &str) {
     if title.is_empty() || crate::profiles::is_id_label(thread_id, title) {
         return;
     }
-    let Some(dir) = config_dir() else {
+    let Some(dir) = active_data_dir() else {
         return;
     };
     let path = dir.join("store.db");
@@ -847,7 +1083,7 @@ pub fn persist_delete_message(message_id: i64) {
     if cfg!(test) || message_id <= 0 {
         return;
     }
-    let Some(dir) = config_dir() else {
+    let Some(dir) = active_data_dir() else {
         return;
     };
     let path = dir.join("store.db");
@@ -892,6 +1128,52 @@ mod tests {
     }
 
     #[test]
+    fn photo_album_groups_one_send_and_keeps_a_later_photo() {
+        let photo = |at: i64, layout: i64| {
+            let mut msg = ChatMsg::text_msg(
+                at as u64,
+                1,
+                "t".into(),
+                true,
+                "Bạn".into(),
+                String::new(),
+                "[Hình ảnh]".into(),
+                "00:00".into(),
+                at,
+                None,
+                None,
+            );
+            msg.kind = MsgKind::Photo;
+            msg.group_layout_id = layout;
+            msg
+        };
+        let burst = vec![photo(1_000, 0), photo(1_042, 0), photo(1_083, 0)];
+        assert_eq!(photo_album_end(&burst, 0), 3);
+        assert_eq!(photo_album_end(&burst, 1), 3);
+        let mut later = burst.clone();
+        later.push(photo(8_000, 0));
+        assert_eq!(photo_album_end(&later, 0), 3);
+        assert_eq!(photo_album_end(&later, 3), 4);
+        let shared = vec![photo(1_000, 77), photo(9_000, 77)];
+        assert_eq!(photo_album_end(&shared, 0), 2);
+        let text = ChatMsg::text_msg(
+            5,
+            1,
+            "t".into(),
+            true,
+            "Bạn".into(),
+            String::new(),
+            "xin chào".into(),
+            "00:00".into(),
+            1_050,
+            None,
+            None,
+        );
+        let split = vec![photo(1_000, 0), text, photo(1_080, 0)];
+        assert_eq!(photo_album_end(&split, 0), 1);
+        assert_eq!(photo_album_end(&split, 2), 3);
+    }
+
     fn hash_id_skips_preview_range() {
         let id = hash_id("g_200000000000000002");
         assert_ne!(id, 0);
@@ -950,5 +1232,63 @@ mod tests {
         assert!(!session.is_file());
         assert!(device.is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wipe_account_data_clears_account_state_but_keeps_device_and_app_prefs() {
+        let dir = std::env::temp_dir().join(format!("zalo-gpui-wipe-acct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("session.json"), "{}").unwrap();
+        std::fs::write(dir.join("device.json"), "{\"imei\":\"keep\"}").unwrap();
+        std::fs::write(dir.join("store.db"), "sqlite").unwrap();
+        std::fs::write(dir.join("store.db-wal"), "wal").unwrap();
+        std::fs::write(dir.join("queue-cursors.json"), "{}").unwrap();
+        write_last_account_uid(&dir, "12345");
+        let mut prefs = crate::prefs::Prefs::load(Some(dir.clone()));
+        prefs.set("dark", serde_json::Value::Bool(true));
+        prefs.set("hidden", serde_json::Value::Bool(true));
+        prefs.set("pinned", serde_json::json!(["111"]));
+
+        wipe_account_data(&dir);
+
+        assert!(dir.join("device.json").is_file());
+        assert!(!dir.join("session.json").is_file());
+        assert!(!dir.join("store.db").is_file());
+        assert!(!dir.join("store.db-wal").is_file());
+        assert!(!dir.join("queue-cursors.json").is_file());
+        assert!(read_last_account_uid(&dir).is_none());
+
+        let reloaded = crate::prefs::Prefs::load(Some(dir.clone()));
+        assert!(reloaded.bool("dark", false));
+        assert!(!reloaded.bool("hidden", false));
+        assert!(reloaded.json("pinned").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn account_dirs_do_not_share_a_session() {
+        let machine = std::env::temp_dir().join(format!(
+            "zalo-gpui-acct-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&machine);
+        std::fs::create_dir_all(&machine).unwrap();
+        let a = account_dir(&machine, "111");
+        let b = account_dir(&machine, "222");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("session.json"), "{\"user\":\"a\"}").unwrap();
+        std::fs::write(b.join("store.db"), "b-only").unwrap();
+        write_current_user(&machine, "111");
+        assert_eq!(read_current_user(&machine).as_deref(), Some("111"));
+        assert!(a.join("session.json").is_file());
+        assert!(!b.join("session.json").is_file());
+        detach_account(&a);
+        assert!(read_current_user(&machine).is_none());
+        assert!(!a.join("session.json").is_file());
+        assert_eq!(std::fs::read(b.join("store.db")).unwrap(), b"b-only");
+        let _ = std::fs::remove_dir_all(&machine);
     }
 }

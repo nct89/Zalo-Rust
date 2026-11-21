@@ -92,10 +92,7 @@ impl ShellView {
             .child(div().w(px(1.)).h_full().absolute().right_0().bg(line))
             .child(self.search_bar(cx))
             .when(lists_chats(self.rail), |el| {
-                let banner = self.sync_banner(cx);
-                el.child(self.list_tabs(cx))
-                    .when_some(banner, |el, banner| el.child(banner))
-                    .child(self.conv_rows(cx))
+                el.child(self.list_tabs(cx)).child(self.conv_rows(cx))
             })
             .when(self.rail == Rail::Contacts, |el| {
                 el.child(self.contacts_nav(cx))
@@ -281,189 +278,10 @@ impl ShellView {
             )
     }
 
-    /// Electron `sync-db-banner-v3`, pinned above the scrolling conversation list.
-    ///
-    /// A click starts the existing sync-2 path. Nothing here starts a sync by
-    /// itself, and closing the row while a sync is running only cancels it.
-    fn sync_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        use crate::phone_sync::{sync_banner_kind, SyncBannerKind};
-        let kind = sync_banner_kind(
-            self.has_session,
-            self.prefs.bool("syncBannerDismissed", false),
-            self.phone_sync.active(),
-            self.phone_sync.finished_ok,
-        );
-        let (title, desc, cta, click_sync) = match kind {
-            SyncBannerKind::Hidden => return None,
-            SyncBannerKind::Suggest => (
-                str_vi(
-                    "STR_SYNC_BANNER_COMPACT_SUGGEST_TITLE",
-                    "Đồng bộ tin nhắn gần đây?",
-                )
-                .to_owned(),
-                str_vi(
-                    "STR_SYNC_BANNER_SUGGEST_NEW_SYNC_DESC",
-                    "Zalo Web của bạn hiện chưa có đầy đủ tin nhắn gần đây",
-                )
-                .to_owned(),
-                Some(str_vi("STR_SYNC_BANNER_COMPACT_SUGGEST_CTA", "Đồng bộ")),
-                true,
-            ),
-            SyncBannerKind::Progress => (
-                self.phone_sync
-                    .status_line()
-                    .unwrap_or_else(|| "Đang đồng bộ…".to_owned()),
-                String::new(),
-                None,
-                false,
-            ),
-            SyncBannerKind::Success => (
-                str_vi(
-                    "STR_SYNC_BANNER_COMPACT_SUCCESS_TITLE",
-                    "Đồng bộ tin nhắn thành công",
-                )
-                .to_owned(),
-                String::new(),
-                None,
-                false,
-            ),
-        };
-        let ink = token_rgb("--text-primary", "#081b3a");
-        let muted = token_rgb("--text-secondary", "#5a6981");
-        let bg = token_rgb("--B10", "#e5f1ff");
-        let blue = token_rgb("--B55", "#0068ff");
-        let desc_line = desc;
-        Some(
-            div()
-                .id("sync-db-banner-v3")
-                .flex_none()
-                .mx(px(8.))
-                .mt(px(8.))
-                .h(px(54.))
-                .px(px(10.))
-                .rounded(px(6.))
-                .bg(rgb(bg))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(8.))
-                .overflow_hidden()
-                .when(click_sync, |el| {
-                    el.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
-                        if this.phone_sync.active() {
-                            return;
-                        }
-                        this.start_phone_sync(cx);
-                        cx.notify();
-                    }))
-                })
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(28.))
-                        .rounded(px(8.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .bg(rgb(blue))
-                        .text_color(rgb(0xffffff))
-                        .child(fonts::icon_el(ic::PHONE, "☎", 16.)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .justify_center()
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .line_height(px(16.))
-                                .font_family(FAMILY_SEMIBOLD)
-                                .text_color(rgb(ink))
-                                .truncate()
-                                .child(title),
-                        )
-                        .when(!desc_line.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .text_size(px(12.))
-                                    .line_height(px(15.))
-                                    .text_color(rgb(muted))
-                                    .truncate()
-                                    .child(desc_line),
-                            )
-                        }),
-                )
-                .when_some(cta, |el, label| {
-                    el.child(
-                        div()
-                            .id("sync-banner-go")
-                            .flex_none()
-                            .h(px(26.))
-                            .px(px(10.))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .bg(rgb(blue))
-                            .text_size(px(12.))
-                            .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(0xffffff))
-                            .cursor_pointer()
-                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                if this.phone_sync.active() {
-                                    return;
-                                }
-                                this.start_phone_sync(cx);
-                                cx.notify();
-                            }))
-                            .child(label),
-                    )
-                })
-                .child(
-                    div()
-                        .id("sync-banner-close")
-                        .flex_none()
-                        .size(px(22.))
-                        .rounded(px(11.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .text_color(rgb(ink))
-                        .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
-                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            if this.phone_sync.active() {
-                                this.cancel_phone_sync();
-                            } else {
-                                this.phone_sync.finished_ok = false;
-                                this.prefs
-                                    .set("syncBannerDismissed", serde_json::Value::Bool(true));
-                            }
-                            cx.notify();
-                        }))
-                        .child(fonts::icon_el('\u{EAA1}', "×", 12.)),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn conv_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected;
         let rows = self.listed_convs();
         let show_back = self.list_filter == crate::shell::ListFilter::Strangers;
-        let folder = (!self.other_tab
-            && self.list_filter == crate::shell::ListFilter::All
-            && self.search_query.trim().is_empty())
-        .then(|| self.stranger_summary())
-        .flatten();
         div()
             .id("conv-scroll")
             .flex()
@@ -473,9 +291,6 @@ impl ShellView {
             .overflow_y_scroll()
             .when(show_back, |el| {
                 el.child(self.stranger_back_bar(rows.len(), cx))
-            })
-            .when_some(folder, |el, (count, unread, time)| {
-                el.child(self.stranger_box_row(count, unread, time, cx))
             })
             .children(rows.into_iter().map(|row| {
                 let on = selected == Some(row.id);
@@ -526,6 +341,7 @@ impl ShellView {
             )
     }
 
+    #[allow(dead_code)]
     fn stranger_box_row(
         &self,
         count: usize,
@@ -622,6 +438,32 @@ impl ShellView {
             )
     }
 
+    /// Group preview prefix. A stored "Người dùng Zalo" or raw id uses the
+    /// profile name when that person is already in the cache.
+    fn preview_sender(&self, last: &crate::data::ChatMsg) -> String {
+        let fallback = str_vi("STR_ZALO_USER", "Người dùng Zalo");
+        let raw = last.sender.trim();
+        let unknown = raw.is_empty()
+            || raw == fallback
+            || (!last.sender_uid.is_empty() && crate::profiles::is_id_label(&last.sender_uid, raw));
+        if unknown && !last.sender_uid.is_empty() {
+            if let Some(name) = self
+                .profiles
+                .map
+                .get(&last.sender_uid)
+                .map(|p| p.name.trim().to_owned())
+                .filter(|n| !n.is_empty() && !crate::profiles::is_id_label(&last.sender_uid, n))
+            {
+                return name;
+            }
+        }
+        if raw.is_empty() {
+            fallback.to_owned()
+        } else {
+            raw.to_owned()
+        }
+    }
+
     /// Prefix, icon and text of the last-message line (`.z-conv-message`).
     fn preview_parts(&self, row: &ChatConv) -> (Option<String>, Option<(char, bool)>, String) {
         use crate::media::MsgKind;
@@ -631,7 +473,7 @@ impl ShellView {
         let prefix = if last.from_me {
             Some(format!("{}:", str_vi("STR_YOU", "Bạn")))
         } else if row.is_group && !last.sender.is_empty() {
-            Some(format!("{}:", last.sender))
+            Some(format!("{}:", self.preview_sender(last)))
         } else {
             None
         };
@@ -697,7 +539,23 @@ impl ShellView {
         let unread = self.unread_of(&row);
         let pinned = self.pinned.contains(&id);
         let muted_row = self.muted.contains(&id);
-        let initial = row.name.chars().next().unwrap_or('?').to_string();
+        let own_photo = self.shown_photo(&row.thread_id);
+        let cloud_row = crate::shell::is_my_documents(
+            &row.name,
+            &row.thread_id,
+            self.send2me_id.as_deref(),
+        );
+        let member_faces = if row.is_group && own_photo.is_none() && !cloud_row {
+            self.group_collage_faces(&row.thread_id)
+        } else {
+            Vec::new()
+        };
+        let initial = avatar_initials(&row.name);
+        let fill = if row.is_group {
+            0x0068ff
+        } else {
+            avatar_color(&row.thread_id)
+        };
         let at = self.messages_of(id).last().map(|m| m.at_ms).unwrap_or(0);
         let time = if at > 0 {
             crate::data::conv_time_rel(at, crate::data::now_ms())
@@ -782,14 +640,12 @@ impl ShellView {
                             .h_full()
                             .child(avatar(
                                 &initial,
+                                fill,
                                 self.conv_online(&row),
                                 row.is_group,
-                                self.avatar_of(&row.thread_id),
-                                crate::shell::is_my_documents(
-                                    &row.name,
-                                    &row.thread_id,
-                                    self.send2me_id.as_deref(),
-                                ),
+                                own_photo,
+                                cloud_row,
+                                &member_faces,
                             )),
                     )
                     .child(
@@ -1150,51 +1006,395 @@ fn cloud_avatar(size: f32) -> impl IntoElement {
         .child(fonts::icon_el(ic::DOCS_ON, "☁", size * 0.68))
 }
 
+/// What to paint when a thread has no single photo of its own.
+///
+/// Electron's avatar widget (`zavatar-multi`) collages `topMember` only when
+/// the group has no `avatar`. A group with neither photo nor member faces
+/// uses the group glyph. A person still gets an initial.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AvatarPaint {
+    Photo,
+    Cloud,
+    Collage,
+    GroupMark,
+    Letter,
+}
+
+#[must_use]
+pub(crate) fn avatar_paint(is_group: bool, has_photo: bool, cloud: bool, faces: usize) -> AvatarPaint {
+    if has_photo {
+        AvatarPaint::Photo
+    } else if cloud {
+        AvatarPaint::Cloud
+    } else if is_group && faces > 0 {
+        AvatarPaint::Collage
+    } else if is_group {
+        AvatarPaint::GroupMark
+    } else {
+        AvatarPaint::Letter
+    }
+}
+
+/// One cell inside a group collage. Electron draws these as overlapping
+/// circles (`zavatar-multi`), not as slices of one circle.
+pub(crate) enum CollageFace {
+    Photo(std::sync::Arc<gpui::RenderImage>),
+    /// Coloured disc. `text` is empty when the member has no display name.
+    Letter { text: String, fill: u32 },
+    /// The `99+` cell when `totalMember` is above 4, or the extra cell that
+    /// keeps a one-member group on the two-circle layout.
+    Count(u32),
+    /// Padded member Electron paints with the default user glyph.
+    Placeholder,
+}
+
+/// Which member indexes a collage shows. Mirrors `YfZ7` `m()` after
+/// `_sortMemberIds`: creator, then admins, then the rest. At most four cells.
+/// A counter replaces the fourth face when the group is larger than 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollagePick {
+    /// Index into the original id slice, not into the sorted order.
+    Face(usize),
+    Count(u32),
+    Placeholder,
+}
+
+/// `_sortMemberIds`: creator, then `adminIds` in server order, then everyone
+/// else. A person already placed is not repeated.
+fn sorted_member_indexes(
+    ids: &[impl AsRef<str>],
+    creator: &str,
+    admins: &[impl AsRef<str>],
+) -> Vec<usize> {
+    let mut taken = vec![false; ids.len()];
+    let mut out = Vec::with_capacity(ids.len());
+    let mut push_id = |id: &str| {
+        if id.is_empty() {
+            return;
+        }
+        if let Some(index) = ids.iter().position(|item| item.as_ref() == id) {
+            if !taken[index] {
+                taken[index] = true;
+                out.push(index);
+            }
+        }
+    };
+    push_id(creator);
+    for admin in admins {
+        push_id(admin.as_ref());
+    }
+    for index in 0..ids.len() {
+        if !taken[index] {
+            out.push(index);
+        }
+    }
+    out
+}
+
+#[must_use]
+pub(crate) fn collage_picks(
+    ids: &[impl AsRef<str>],
+    total: u32,
+    me: Option<&str>,
+    creator: &str,
+    admins: &[impl AsRef<str>],
+) -> Vec<CollagePick> {
+    if ids.is_empty() || total == 0 {
+        return Vec::new();
+    }
+    // `topMember` is this sorted list before `m()` runs. `h()` then moves the
+    // creator to the front; that is a no-op once the list is already sorted.
+    let sorted = sorted_member_indexes(ids, creator, admins);
+    let cap = if total > 4 { 3 } else { 4 };
+    let mut faces = Vec::new();
+    if total > 4 {
+        // A short `topMember` keeps that order, skips nobody, and pads the
+        // default glyph up to 3. A longer list skips the signed-in user unless
+        // they are the creator. The widget then appends the numeric counter.
+        let creator_is_me = !creator.is_empty() && me == Some(creator);
+        if sorted.len() <= cap {
+            for index in &sorted {
+                faces.push(CollagePick::Face(*index));
+            }
+            while faces.len() < cap {
+                faces.push(CollagePick::Placeholder);
+            }
+        } else {
+            let mut window = cap.min(total as usize).min(sorted.len());
+            let mut index = 0;
+            while index < window && index < sorted.len() {
+                let member = sorted[index];
+                let skip = !creator_is_me && me == Some(ids[member].as_ref());
+                if skip {
+                    if window < sorted.len() {
+                        window += 1;
+                    }
+                } else {
+                    faces.push(CollagePick::Face(member));
+                }
+                index += 1;
+            }
+        }
+        if faces.len() == 1 {
+            faces.push(CollagePick::Count(1));
+        }
+        faces.push(CollagePick::Count(total));
+    } else if (total as usize) > sorted.len() {
+        for index in &sorted {
+            faces.push(CollagePick::Face(*index));
+        }
+        while (faces.len() as u32) < total {
+            faces.push(CollagePick::Placeholder);
+        }
+        if faces.len() == 1 {
+            faces.push(CollagePick::Count(1));
+        }
+    } else {
+        for index in sorted.iter().take(cap) {
+            faces.push(CollagePick::Face(*index));
+        }
+        if faces.len() == 1 {
+            faces.push(CollagePick::Count(1));
+        }
+    }
+    faces
+}
+
+/// `true` when the URL is a photo Electron would paint, not a `/default` avatar.
+#[must_use]
+pub(crate) fn is_real_avatar(url: &str) -> bool {
+    let url = url.trim();
+    (url.starts_with("https://") || url.starts_with("http://")) && !url.contains("/default")
+}
+
+/// Electron `le.b`: one word keeps its first character; two or more words
+/// become the first character of the first word and of the last word.
+#[must_use]
+pub(crate) fn avatar_initials(name: &str) -> String {
+    let parts: Vec<&str> = name.split_whitespace().filter(|part| !part.is_empty()).collect();
+    match parts.as_slice() {
+        [] => String::new(),
+        [one] => one.chars().next().unwrap_or('?').to_string(),
+        [first, .., last] => {
+            let a = first.chars().next().unwrap_or('?');
+            let b = last.chars().next().unwrap_or('?');
+            format!("{}{}", upper_char(a), upper_char(b))
+        }
+    }
+}
+
+fn upper_char(c: char) -> String {
+    c.to_uppercase().collect()
+}
+
+/// First colour of Electron's nine avatar gradients. Index is the last four
+/// digits of `userId` modulo 9 (`YfZ7` / `fLyd`).
+#[must_use]
+pub(crate) fn avatar_color(user_id: &str) -> u32 {
+    const FILLS: [u32; 9] = [
+        0x0066ff, 0x0fc3ff, 0x37b361, 0xeb5e00, 0x5a2db4, 0x6f3fcf, 0xf31bc8, 0x0066ff, 0x0066ff,
+    ];
+    let tail: String = user_id.chars().rev().take(4).collect::<String>().chars().rev().collect();
+    let n = tail.parse::<u32>().unwrap_or(0);
+    FILLS[(n as usize) % FILLS.len()]
+}
+
+/// Coloured disc used for a person, and for a collage cell without a photo.
+pub(crate) fn letter_disc(text: &str, fill: u32, size: f32) -> impl IntoElement {
+    div()
+        .size(px(size))
+        .rounded(px(size / 2.0))
+        .bg(rgb(fill))
+        .border_1()
+        .border_color(hsla(0., 0., 0., 0.1))
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .text_color(rgb(0xffffff))
+        .text_size(px((size * 0.36).max(10.)))
+        .font_family(FAMILY_SEMIBOLD)
+        .child(text.to_owned())
+}
+
+/// Overlapping member circles. Diameters are Electron's `.zavatar-multi`
+/// table: list and header are `.zavatar-l` (48), the info panel is
+/// `.zavatar-xl` (56, 2 px border). The conversation list itself is size `l`,
+/// not `m`.
+pub(crate) fn group_collage(faces: &[CollageFace], size: f32) -> impl IntoElement {
+    let n = faces.len().min(4);
+    let (diameter, border, pos) = collage_layout(n, size);
+    let order: Vec<usize> = (0..n).rev().collect();
+    div()
+        .relative()
+        .size(px(size))
+        .rounded(px(size / 2.0))
+        .overflow_hidden()
+        .children(order.into_iter().map(|i| {
+            let (x, y) = pos[i];
+            collage_cell(&faces[i], diameter, border, x, y)
+        }))
+}
+
+/// `(diameter, border, positions)` for 2, 3, or 4 cells.
+fn collage_layout(n: usize, size: f32) -> (f32, f32, Vec<(f32, f32)>) {
+    // CSS widths are border-box. `m` is 40 and is used by search and label
+    // rows, not by `.conversationList__avatar`.
+    let (two, three, four, border) = match size.round() as i32 {
+        40 => (26.0, 22.0, 22.0, 1.0),
+        56 => (36.0, 32.0, 30.0, 2.0),
+        _ => {
+            let scale = if (size - 48.0).abs() < 0.5 {
+                1.0
+            } else {
+                size / 48.0
+            };
+            (32.0 * scale, 28.0 * scale, 26.0 * scale, 1.0)
+        }
+    };
+    let diameter = match n {
+        0 | 1 => size,
+        2 => two,
+        3 => three,
+        _ => four,
+    };
+    let pos = match n {
+        2 => vec![(0.0, size - diameter), (size - diameter, 0.0)],
+        3 => vec![
+            ((size - diameter) / 2.0, 0.0),
+            (0.0, size - diameter),
+            (size - diameter, size - diameter),
+        ],
+        _ => vec![
+            (0.0, 0.0),
+            (size - diameter, 0.0),
+            (0.0, size - diameter),
+            (size - diameter, size - diameter),
+        ],
+    };
+    (diameter, border, pos)
+}
+
+fn collage_cell(face: &CollageFace, diameter: f32, border: f32, x: f32, y: f32) -> impl IntoElement {
+    let text_px = (diameter * 0.42).max(9.0);
+    // GPUI clips `overflow_hidden` to a rectangle. A radius on the parent does
+    // not round a child photo. The radius has to be on the image, as it is for
+    // a single avatar (`img.rounded`).
+    let radius = px(diameter / 2.0);
+    let inner = match face {
+        CollageFace::Photo(image) => gpui::img(image.clone())
+            .size_full()
+            .rounded(radius)
+            .object_fit(gpui::ObjectFit::Cover)
+            .into_any_element(),
+        CollageFace::Letter { text, fill } => div()
+            .size_full()
+            .rounded(radius)
+            .bg(rgb(*fill))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0xffffff))
+            .text_size(px(text_px))
+            .font_family(FAMILY_SEMIBOLD)
+            .child(text.clone())
+            .into_any_element(),
+        CollageFace::Count(n) => {
+            let label = if *n > 99 {
+                "99+".to_owned()
+            } else {
+                n.to_string()
+            };
+            div()
+                .size_full()
+                .rounded(radius)
+                .bg(rgb(0xeef0f3))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(0x081b3a))
+                .text_size(px(text_px))
+                .font_family(FAMILY_SEMIBOLD)
+                .child(label)
+                .into_any_element()
+        }
+        CollageFace::Placeholder => div()
+            .size_full()
+            .rounded(radius)
+            .bg(rgb(0xeef0f3))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(0x8a94a6))
+            .child(fonts::icon_el(ic::USER, "☺", diameter * 0.55))
+            .into_any_element(),
+    };
+    let cell = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .size(px(diameter))
+        .rounded(px(diameter / 2.0))
+        .overflow_hidden();
+    // `.zavatar-xl` cells use a 2 px border. `m` and `l` use 1 px.
+    if border >= 1.5 {
+        cell.border_2()
+    } else {
+        cell.border_1()
+    }
+    .border_color(hsla(0., 0., 0., 0.12))
+    .child(inner)
+}
+
+/// Blue disc with the group-list glyph. Used when a group has no photo and
+/// no member photo, so the first letter of "Nhóm" is not painted as N.
+pub(crate) fn group_mark(size: f32) -> impl IntoElement {
+    div()
+        .size(px(size))
+        .rounded(px(size / 2.0))
+        .bg(rgb(0x0068ff))
+        .border_1()
+        .border_color(hsla(0., 0., 0., 0.1))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(0xffffff))
+        .child(fonts::icon_el(ic::GROUP_LIST, "◎", size * 22.0 / 48.0))
+}
+
 /// Default avatar for an account without a cached photo. Zalo PC paints a
 /// coloured gradient with the initial; colour is stable per name.
 fn avatar(
     initial: &str,
+    fill: u32,
     online: bool,
     group: bool,
     image: Option<std::sync::Arc<gpui::RenderImage>>,
     cloud: bool,
+    member_faces: &[CollageFace],
 ) -> impl IntoElement {
-    const PALETTE: [u32; 6] = [0x0068ff, 0x12_ae_e0, 0x2fcc70, 0xf5a623, 0xdb3642, 0x785ac8];
-    let idx = initial
-        .chars()
-        .next()
-        .map(|c| c as usize % PALETTE.len())
-        .unwrap_or(0);
-    let fill = if group { 0x0068ff } else { PALETTE[idx] };
+    let paint = avatar_paint(group, image.is_some(), cloud, member_faces.len());
     div()
         .relative()
         .flex_none()
         .size(px(48.))
-        .when_some(image.clone(), |el, img| {
-            el.child(
-                gpui::img(img)
-                    .size(px(48.))
-                    .rounded(px(24.))
-                    .object_fit(gpui::ObjectFit::Cover),
-            )
+        .when(paint == AvatarPaint::Photo, |el| {
+            el.when_some(image.clone(), |el, img| {
+                el.child(
+                    gpui::img(img)
+                        .size(px(48.))
+                        .rounded(px(24.))
+                        .object_fit(gpui::ObjectFit::Cover),
+                )
+            })
         })
-        .when(image.is_none() && cloud, |el| el.child(cloud_avatar(48.)))
-        .when(image.is_none() && !cloud, |el| {
-            el.child(
-                div()
-                    .size(px(48.))
-                    .rounded(px(24.))
-                    .bg(rgb(fill))
-                    .border_1()
-                    .border_color(hsla(0., 0., 0., 0.1))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(0xffffff))
-                    .text_size(px(18.))
-                    .font_family(FAMILY_SEMIBOLD)
-                    .child(initial.to_owned()),
-            )
+        .when(paint == AvatarPaint::Cloud, |el| el.child(cloud_avatar(48.)))
+        .when(paint == AvatarPaint::Collage, |el| {
+            el.child(group_collage(member_faces, 48.))
+        })
+        .when(paint == AvatarPaint::GroupMark, |el| el.child(group_mark(48.)))
+        .when(paint == AvatarPaint::Letter, |el| {
+            el.child(letter_disc(initial, fill, 48.))
         })
         .when(online, |el| {
             el.child(
@@ -1225,5 +1425,98 @@ mod tests {
         assert_eq!(zalo_design::CONTACT_ITEM_H, 72.0);
         assert_eq!(ContactTab::Friends.label(), "Danh sách bạn bè");
         assert_eq!(ContactTab::Friends.glyph().0, ic::FRIEND_LIST);
+    }
+
+    #[test]
+    fn group_without_a_photo_collages_members_and_never_paints_a_letter() {
+        assert_eq!(avatar_paint(true, true, false, 4), AvatarPaint::Photo);
+        assert_eq!(avatar_paint(true, false, false, 3), AvatarPaint::Collage);
+        assert_eq!(avatar_paint(true, false, false, 0), AvatarPaint::GroupMark);
+        assert_eq!(avatar_paint(true, false, true, 4), AvatarPaint::Cloud);
+        assert_eq!(avatar_paint(false, false, false, 0), AvatarPaint::Letter);
+        assert_eq!(avatar_paint(false, true, false, 0), AvatarPaint::Photo);
+    }
+
+    #[test]
+    fn initials_color_and_collage_follow_electron() {
+        assert_eq!(avatar_initials("Lan"), "L");
+        assert_eq!(avatar_initials("Nguyễn Tuấn"), "NT");
+        assert_eq!(avatar_initials("Dũng Mobile Đồng Tâm"), "DT");
+        assert_eq!(avatar_initials("  "), "");
+        assert!(!is_real_avatar(""));
+        assert!(!is_real_avatar("https://ava.zalo.me/default/x.jpg"));
+        assert!(is_real_avatar("https://s120-ava-talk.zadn.vn/a.jpg"));
+        assert_eq!(avatar_color("1488852095078916019"), avatar_color("6019"));
+        let ids = ["1", "2", "3", "4", "5", "6"];
+        let big = collage_picks(&ids, 8, Some("1"), "", &[] as &[&str]);
+        assert_eq!(
+            big,
+            vec![
+                CollagePick::Face(1),
+                CollagePick::Face(2),
+                CollagePick::Face(3),
+                CollagePick::Count(8),
+            ]
+        );
+        // Creator 4, then admin 3, then skip self (index 0), then index 1.
+        let ordered = collage_picks(&ids, 8, Some("1"), "4", &["3"]);
+        assert_eq!(
+            ordered,
+            vec![
+                CollagePick::Face(3),
+                CollagePick::Face(2),
+                CollagePick::Face(1),
+                CollagePick::Count(8),
+            ]
+        );
+        // The creator is the signed-in user, so self stays in front.
+        let mine = collage_picks(&ids, 8, Some("1"), "1", &[] as &[&str]);
+        assert_eq!(
+            mine,
+            vec![
+                CollagePick::Face(0),
+                CollagePick::Face(1),
+                CollagePick::Face(2),
+                CollagePick::Count(8),
+            ]
+        );
+        // Short topMember: original sorted order, no skip, pad to 3, then count.
+        let short = collage_picks(&["1", "2"], 8, Some("1"), "2", &[] as &[&str]);
+        assert_eq!(
+            short,
+            vec![
+                CollagePick::Face(1),
+                CollagePick::Face(0),
+                CollagePick::Placeholder,
+                CollagePick::Count(8),
+            ]
+        );
+        assert_eq!(
+            collage_picks(&["a", "b"], 2, None, "", &[] as &[&str]),
+            vec![CollagePick::Face(0), CollagePick::Face(1)]
+        );
+        assert_eq!(
+            collage_picks(&["only"], 1, None, "", &[] as &[&str]),
+            vec![CollagePick::Face(0), CollagePick::Count(1)]
+        );
+        assert_eq!(
+            collage_picks(&["a"], 3, None, "", &[] as &[&str]),
+            vec![
+                CollagePick::Face(0),
+                CollagePick::Placeholder,
+                CollagePick::Placeholder,
+            ]
+        );
+        let (d2, b2, _) = collage_layout(2, 48.0);
+        let (d3, _, _) = collage_layout(3, 48.0);
+        let (d4, _, _) = collage_layout(4, 48.0);
+        assert_eq!((d2, b2, d3, d4), (32.0, 1.0, 28.0, 26.0));
+        let (x2, xb, _) = collage_layout(2, 56.0);
+        let (x3, _, _) = collage_layout(3, 56.0);
+        let (x4, _, _) = collage_layout(4, 56.0);
+        assert_eq!((x2, xb, x3, x4), (36.0, 2.0, 32.0, 30.0));
+        let (m2, _, _) = collage_layout(2, 40.0);
+        let (m4, _, _) = collage_layout(4, 40.0);
+        assert_eq!((m2, m4), (26.0, 22.0));
     }
 }

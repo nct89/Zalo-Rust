@@ -82,6 +82,14 @@ fn unix_now() -> u64 {
 }
 
 fn hostname() -> String {
+    if let Ok(os_name) = hostname::get() {
+        let name = os_name.to_string_lossy();
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    #[cfg(unix)]
     if let Ok(name) = fs::read_to_string("/proc/sys/kernel/hostname") {
         let name = name.trim();
         if !name.is_empty() {
@@ -90,8 +98,9 @@ fn hostname() -> String {
     }
     std::env::var("HOSTNAME")
         .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "linux".to_owned())
+        .unwrap_or_else(|| std::env::consts::OS.to_owned())
 }
 
 impl fmt::Display for Device {

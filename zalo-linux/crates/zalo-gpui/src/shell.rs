@@ -94,6 +94,8 @@ pub struct ShellView {
     note_at: Option<std::time::Instant>,
     /// Message popup waiting for the next frame. It opens a screen window.
     pending_notice: Option<crate::notice::NoticeContent>,
+    /// Thread of the popup on screen, so a late avatar decode can fill it.
+    notice_thread: Option<String>,
     /// Decoded chat wallpaper `(path, image)`.
     pub(crate) wall_image: RefCell<Option<(String, Arc<RenderImage>)>>,
     /// Composer had a selection when its context menu opened.
@@ -117,7 +119,7 @@ pub struct ShellView {
     /// Poll ids whose detail fetch failed this session.
     poll_failed: HashSet<i64>,
     /// Voice message being played (`ffplay` child).
-    pub(crate) voice_playing: Option<(u64, std::process::Child)>,
+    pub(crate) voice_playing: Option<(u64, crate::audio_play::AudioHandle)>,
     /// Contacts search field and its text.
     pub(crate) contacts_query: Entity<LineInput>,
     pub(crate) contacts_q: String,
@@ -196,6 +198,11 @@ pub struct ShellView {
     pub(crate) info_wide: Option<bool>,
     /// Narrow window: the column floats and a click outside closes it.
     pub(crate) info_overlay: bool,
+    /// Group invite link already fetched, keyed by conversation id.
+    pub(crate) info_join: HashMap<u64, String>,
+    pub(crate) info_join_busy: HashSet<u64>,
+    /// Expanded Ảnh/Video (`0`), File (`1`) or Link (`2`) inside the info column.
+    pub(crate) info_shelf: Option<(u64, u8)>,
     /// Composer capture includes the Zalo window.
     pub(crate) shot_with_zalo: bool,
     /// Photo-viewer drag origin `(mouse_x, mouse_y, pan_x, pan_y)`.
@@ -208,6 +215,10 @@ pub struct ShellView {
     pub(crate) send2me_id: Option<String>,
     pub(crate) session_dir: Option<PathBuf>,
     pub(crate) has_session: bool,
+    /// Server ended this PC session (`error_code` 600 / -69). Render opens QR.
+    kick_to_login: bool,
+    /// [`Self::leave_to_login`] already ran on this window.
+    left_for_login: bool,
     pub(crate) next_msg_id: u64,
     /// Saved settings (`ui-state.json` + `gpui-prefs.json`).
     pub(crate) prefs: crate::prefs::Prefs,
@@ -215,9 +226,14 @@ pub struct ShellView {
     window_saved: (i64, i64, bool),
     /// Disk sizes / audio devices for the open settings page.
     pub(crate) settings_cache: Option<crate::settings::SettingsCache>,
-    /// Screenshot / picked photo waiting above the composer.
-    pub(crate) pending_photo: Option<PathBuf>,
-    pub(crate) pending_thumb: Option<Arc<RenderImage>>,
+    /// Photos waiting in the composer tray under the text input.
+    pub(crate) pending_photos: Vec<PathBuf>,
+    pub(crate) pending_thumbs: Vec<Option<Arc<RenderImage>>>,
+    /// Per-photo caption edited from the pencil on that thumb. Parallel to `pending_photos`.
+    pub(crate) pending_captions: Vec<String>,
+    /// Index of the thumb whose caption field is open.
+    pub(crate) caption_edit: Option<usize>,
+    pub(crate) caption_input: Entity<LineInput>,
     /// Region picker running.
     pub(crate) capture_busy: bool,
     /// zCloud / Tools / Starred Messages popover next to the rail.
@@ -247,6 +263,9 @@ pub struct ShellView {
     pub(crate) profiles: crate::profiles::Profiles,
     /// Decoded avatars keyed like [`crate::profiles::Profiles::map`].
     pub(crate) avatars: HashMap<String, Arc<RenderImage>>,
+    /// Profile keys whose avatar URL did not decode. Left out of the next
+    /// chunk so one bad photo does not keep the visible rows as letters.
+    avatar_miss: HashSet<String>,
     pub(crate) profiles_refresh: bool,
     pub(crate) avatars_queued: bool,
     /// One `getprofiles/v2` pass for senders that still have no photo.
@@ -297,8 +316,8 @@ pub struct ShellView {
     pub(crate) privacy: crate::settings::PrivacyState,
     /// XDG GlobalShortcuts portal handle + bound status.
     pub(crate) shortcuts: crate::shortcuts::ShortcutState,
-    /// Phone message sync v2 state (`Settings › Sync`).
-    pub(crate) phone_sync: crate::phone_sync::PhoneSyncState,
+    /// Local Xuất / Nhập zip. The PC-to-phone backup engine is not in this client.
+    pub(crate) export_ui: crate::pc_export::TransferUi,
     /// Quick-reply popup open above the composer (`cmp-qr`).
     pub(crate) quick_menu: bool,
     /// Composer formatting + urgency strip open (`cmp-fmt`).
@@ -414,6 +433,12 @@ impl ShellView {
         let search =
             cx.new(|cx| LineInput::new(cx, str_vi("STR_PLACE_HOLDER_SEARCH_PRODUCT", "Tìm kiếm")));
         let composer = cx.new(|cx| LineInput::new(cx, str_vi("STR_SEND_MESSAGE", "Nhập tin nhắn")));
+        let caption_input = cx.new(|cx| {
+            LineInput::new(
+                cx,
+                str_vi("STR_INPUT_PREVIEW_EDIT_PHOTO_CAPTION", "Chỉnh sửa mô tả ảnh"),
+            )
+        });
         let contacts_query = cx.new(|cx| LineInput::new(cx, "Tìm bạn"));
         let msg_search = cx.new(|cx| LineInput::new(cx, "Nhập từ khóa để tìm kiếm"));
         cx.subscribe(&msg_search, |this, _, event: &LineEvent, cx| match event {
@@ -510,6 +535,7 @@ impl ShellView {
             note: None,
             note_at: None,
             pending_notice: None,
+            notice_thread: None,
             wall_image: RefCell::new(None),
             input_has_sel: false,
             members_view: None,
@@ -580,6 +606,9 @@ impl ShellView {
             info_pref: true,
             info_wide: None,
             info_overlay: false,
+            info_join: HashMap::new(),
+            info_join_busy: HashSet::new(),
+            info_shelf: None,
             shot_with_zalo: true,
             viewer_drag: None,
             viewer_dragged: false,
@@ -589,12 +618,17 @@ impl ShellView {
             send2me_id: snap.send2me_id,
             session_dir: snap.session_dir,
             has_session: snap.has_session,
+            kick_to_login: false,
+            left_for_login: false,
             next_msg_id: snap.next_msg_id,
             prefs: crate::prefs::Prefs::load(prefs_dir()),
             window_saved: (0, 0, false),
             settings_cache: None,
-            pending_photo: None,
-            pending_thumb: None,
+            pending_photos: Vec::new(),
+            pending_thumbs: Vec::new(),
+            pending_captions: Vec::new(),
+            caption_edit: None,
+            caption_input,
             capture_busy: false,
             rail_popup: None,
             e2ee_groups: None,
@@ -612,6 +646,7 @@ impl ShellView {
             msg_window: MSG_WINDOW,
             profiles: crate::profiles::Profiles::load(crate::profiles::cache_path().as_deref()),
             avatars: HashMap::new(),
+            avatar_miss: HashSet::new(),
             profiles_refresh: false,
             avatars_queued: true,
             profile_gaps_started: false,
@@ -641,7 +676,7 @@ impl ShellView {
             voice_rec: None,
             privacy: Default::default(),
             shortcuts: Default::default(),
-            phone_sync: Default::default(),
+            export_ui: Default::default(),
             quick_menu: false,
             format_open: false,
             urgency: 0,
@@ -658,9 +693,16 @@ impl ShellView {
             this.msg_scroll.scroll_to_bottom();
         }
         // Older caches have no `friend` flag: refresh once so Contacts is real.
+        // A group list with members but no `creatorId` cannot put the owner
+        // first in the collage, so refresh once through the same fetch.
         let flagged = this.profiles.map.values().any(|p| p.friend);
+        let needs_creator = this
+            .profiles
+            .map
+            .values()
+            .any(|p| !p.member_ids.is_empty() && p.creator_id.is_empty());
         this.profiles_refresh =
-            this.has_session && (this.profiles.stale(data::now_ms()) || !flagged);
+            this.has_session && (this.profiles.stale(data::now_ms()) || !flagged || needs_creator);
         this.wire_lock_input(cx);
         // A set screen-lock code also locks at start-up (zalo-gui behaviour).
         if !this.prefs.str("lockHash", "").is_empty() {
@@ -1134,11 +1176,11 @@ impl ShellView {
         .detach();
     }
 
-    /// Voice bubble ▶ / ■: download once to the media cache, play with
-    /// `ffplay` (AMR goes through Zalo's `/mp3?url=` like Zalo PC).
+    /// Voice bubble ▶ / ■: download once to the media cache, play in-process
+    /// via `symphonia` + `CardSpeaker` (AMR goes through Zalo's `/mp3?url=` like Zalo PC).
     pub(crate) fn toggle_voice(&mut self, msg: &ChatMsg, cx: &mut Context<Self>) {
-        if let Some((id, mut child)) = self.voice_playing.take() {
-            let _ = child.kill();
+        if let Some((id, handle)) = self.voice_playing.take() {
+            handle.stop();
             if id == msg.id {
                 cx.notify();
                 return;
@@ -1173,28 +1215,21 @@ impl ShellView {
                         })?;
                         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
                     }
-                    std::process::Command::new("ffplay")
-                        .args(["-nodisp", "-autoexit", "-loglevel", "quiet"])
-                        .arg(&path)
-                        .stdin(std::process::Stdio::null())
-                        .spawn()
-                        .map_err(|e| format!("ffplay: {e}"))
+                    crate::audio_play::play_file(path, None, false, None)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 match ready {
-                    Ok(child) => {
-                        view.voice_playing = Some((id, child));
+                    Ok(handle) => {
+                        view.voice_playing = Some((id, handle));
                         view.note = None;
-                        // Clear the ■ state once ffplay exits.
+                        // Clear the ■ state once in-process playback finishes.
                         cx.spawn(async move |this, cx| loop {
-                            gpui::Timer::after(std::time::Duration::from_millis(400)).await;
+                            gpui::Timer::after(std::time::Duration::from_millis(250)).await;
                             let done = this
                                 .update(cx, |view, cx| {
-                                    let finished = match view.voice_playing.as_mut() {
-                                        Some((pid, child)) if *pid == id => {
-                                            !matches!(child.try_wait(), Ok(None))
-                                        }
+                                    let finished = match view.voice_playing.as_ref() {
+                                        Some((pid, handle)) if *pid == id => handle.is_finished(),
                                         _ => true,
                                     };
                                     if finished {
@@ -1318,14 +1353,34 @@ impl ShellView {
         cx: &mut Context<Self>,
         server_logout: bool,
     ) {
-        let dir = self.session_dir.clone().or_else(crate::data::config_dir);
-        if server_logout {
-            if let Some(d) = dir.clone().filter(|_| self.has_session) {
-                crate::bridge::spawn_live(crate::bridge::LiveAction::Logout, d);
-            }
+        if self.left_for_login {
+            return;
         }
+        self.left_for_login = true;
+        self.kick_to_login = false;
+        // Stop the shared realtime hub & WebSocket immediately so the logged-out
+        // account cannot emit notifications and a subsequent login starts clean.
+        crate::background::stop();
+        let dir = self.session_dir.clone().or_else(crate::data::config_dir);
+        let logout_snapshot = if server_logout && self.has_session {
+            dir.as_ref().and_then(|d| {
+                let device = zalo_client::Device::load_or_create(d).ok()?;
+                let session = zalo_client::StoredSession::load(d).ok()?;
+                Some((device, session, d.clone()))
+            })
+        } else {
+            None
+        };
         if let Some(d) = dir {
-            crate::data::wipe_session_file(&d);
+            // Drop the bearer session and the current-user pointer. The account
+            // directory (chats of this userId) stays. Another account lives in
+            // its own directory and is not opened until its own QR succeeds.
+            crate::data::detach_account(&d);
+        }
+        if let Some((device, session, d)) = logout_snapshot {
+            crate::bridge::spawn_logout_snapshot(device, session, d);
+        } else {
+            crate::bridge::clear_login_cache();
         }
         self.has_session = false;
         self.dialog = None;
@@ -1336,7 +1391,7 @@ impl ShellView {
         zalo_shell::set_unread_badge(0);
         // Open login window first so the app never hits zero windows on Wayland,
         // then close this currently borrowed shell window directly and defer-close
-        // any remaining solo/auxiliary shell windows.
+        // any remaining solo/auxiliary windows (PhotoWindow, CallView, Notice, etc.).
         crate::open_login_window(cx);
         window.remove_window();
         cx.defer(crate::close_all_shell_windows);
@@ -1421,7 +1476,7 @@ impl ShellView {
         .detach();
     }
 
-    /// Queue a screen popup. `body` is clipped so the card stays one line.
+    /// Queue a screen popup. Newlines become spaces, then the 352×82 card clips.
     pub(crate) fn show_msg_notice(
         &mut self,
         title: String,
@@ -1429,6 +1484,7 @@ impl ShellView {
         initial: String,
         image: Option<Arc<RenderImage>>,
     ) {
+        let body = crate::notice::notice_line(&body);
         let body = {
             const N: usize = 140;
             if body.chars().count() <= N {
@@ -1439,11 +1495,13 @@ impl ShellView {
                 s
             }
         };
+        let thread_key = self.notice_thread.clone().unwrap_or_default();
         self.pending_notice = Some(crate::notice::NoticeContent {
             title,
             body,
             initial,
             image,
+            thread_key,
         });
     }
 
@@ -1549,6 +1607,12 @@ impl ShellView {
         }
     }
 
+    /// Drop the live socket so the next frame opens the account just imported.
+    pub(crate) fn mark_realtime_stale(&mut self) {
+        crate::background::stop();
+        self.rt_started = false;
+    }
+
     /// Start the `zpw_ws` listener once per window when a session exists.
     fn start_realtime(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use futures::StreamExt;
@@ -1610,13 +1674,21 @@ impl ShellView {
     ) {
         use crate::realtime::RtEvent;
         match event {
-            RtEvent::Online => self.rt_status = None,
+            RtEvent::Online => {
+                self.rt_status = None;
+                if self.has_session {
+                    if let Some(dir) = self.session_dir.clone() {
+                        crate::bridge::flush_outbox(dir);
+                    }
+                }
+            }
             RtEvent::Offline(why) => {
                 eprintln!("zalo-gpui realtime offline: {why}");
                 if crate::login_flow::is_session_error(&why) {
-                    self.has_session = false;
-                    self.rt_status =
-                        Some("Phiên đăng nhập đã hết hạn — bấm «Đăng nhập lại» trên thanh thông báo để quét QR".into());
+                    // 102, 600, or -69. Do not call server logout: the session
+                    // is already dead, and the account directory stays.
+                    self.leave_to_login(window, cx, false);
+                    return;
                 } else if zalo_client::listener::is_transient_disconnect(&why)
                     || why.contains("http://")
                     || why.contains("https://")
@@ -1628,7 +1700,11 @@ impl ShellView {
                 }
             }
             RtEvent::Replaced => {
-                self.rt_status = Some("Phiên này đã được mở ở nơi khác — ngừng nhận tin".into());
+                // Cmd 3000 or close 3000. Electron retries the close, then a
+                // real kick is error 600. This client already stopped the
+                // socket on 3000, so return to QR instead of staying in chat.
+                // Close 3003 never becomes Replaced.
+                self.leave_to_login(window, cx, false);
             }
             RtEvent::Voip(_) => {}
             RtEvent::Status(status) => self.apply_status(status),
@@ -1649,8 +1725,6 @@ impl ShellView {
             RtEvent::Reactions(list) => self.apply_reactions(list),
             RtEvent::Pinned(raw_ids) => self.apply_server_pinned(&raw_ids),
             RtEvent::Archived(raw_ids) => self.apply_server_archived(&raw_ids),
-            RtEvent::SyncSignal(cmd, data) => self.on_sync_signal(cmd, data),
-            RtEvent::BackupReply(cmd, data) => crate::backup_msg::on_backup_reply(cmd, data),
             RtEvent::Messages(list, live) => {
                 let active = window.is_window_active();
                 for m in list {
@@ -1678,7 +1752,7 @@ impl ShellView {
                     .map
                     .get(&m.thread_id)
                     .map(|p| p.name.clone())
-                    .filter(|n| !n.is_empty())
+                    .filter(|n| !n.is_empty() && !crate::profiles::is_id_label(&m.thread_id, n))
                     .unwrap_or_else(|| {
                         if m.is_group {
                             "Nhóm".to_owned()
@@ -1686,6 +1760,12 @@ impl ShellView {
                             m.sender_name.clone()
                         }
                     });
+                if m.is_group
+                    && name != "Nhóm"
+                    && !crate::profiles::is_id_label(&m.thread_id, &name)
+                {
+                    data::persist_thread_title(&m.thread_id, &name);
+                }
                 let id = data::hash_id(&m.thread_id);
                 self.convs.insert(
                     0,
@@ -1702,6 +1782,16 @@ impl ShellView {
                     },
                 );
                 self.avatars_queued = true;
+                // A group with no real server name still needs getmg-v2.
+                if m.is_group {
+                    let named = self.profiles.map.get(&m.thread_id).is_some_and(|p| {
+                        let label = p.name.trim();
+                        !label.is_empty() && !crate::profiles::is_id_label(&m.thread_id, label)
+                    });
+                    if !named {
+                        self.profile_gaps_started = false;
+                    }
+                }
                 id
             }
         };
@@ -1749,6 +1839,9 @@ impl ShellView {
                 } else if row.href.is_empty() && !m.href.is_empty() {
                     row.href = m.href.clone();
                 }
+                if m.group_layout_id != 0 {
+                    row.group_layout_id = m.group_layout_id;
+                }
                 Some(row.id)
             });
             if let Some(id) = id {
@@ -1788,6 +1881,9 @@ impl ShellView {
                 }
                 if own.href.is_empty() {
                     own.href = m.href.clone();
+                }
+                if m.group_layout_id != 0 {
+                    own.group_layout_id = m.group_layout_id;
                 }
                 if own.file_size == 0 {
                     own.file_size = m.file_size;
@@ -1842,6 +1938,7 @@ impl ShellView {
             m.global_msg_id,
         );
         msg.kind = m.kind;
+        msg.group_layout_id = m.group_layout_id;
         msg.media_url = m.media_url.clone();
         msg.media_w = m.width;
         msg.media_h = m.height;
@@ -1957,7 +2054,13 @@ impl ShellView {
                     .next()
                     .map(|ch| ch.to_string())
                     .unwrap_or_else(|| "Z".into());
-                let image = self.avatar_of(&conv.thread_id);
+                self.notice_thread = Some(conv.thread_id.clone());
+                let image = self.shown_photo(&conv.thread_id);
+                if image.is_none() {
+                    self.avatar_miss.remove(&conv.thread_id);
+                    self.avatar_miss.remove(&alt_profile_key(&conv.thread_id));
+                    self.avatars_queued = true;
+                }
                 self.show_msg_notice(conv.name.clone(), body, initial, image);
             }
         }
@@ -2364,7 +2467,7 @@ impl ShellView {
         self.profiles_refresh = self.has_session;
     }
 
-    /// Clipboard image → temp PNG/JPEG → pending photo above the composer.
+    /// Clipboard image → temp PNG/JPEG → photo tray under the composer.
     pub(crate) fn paste_image(&mut self, image: &gpui::Image) {
         let ext = match image.format {
             gpui::ImageFormat::Jpeg => "jpg",
@@ -2504,10 +2607,7 @@ impl ShellView {
                             Err(err) => {
                                 eprintln!("zalo-gpui profiles: {err}");
                                 if crate::login_flow::is_session_error(&err) {
-                                    view.has_session = false;
-                                    view.set_note(
-                                        "Phiên đăng nhập đã hết hạn — bấm «Đăng nhập lại» trên thanh thông báo để quét QR",
-                                    );
+                                    view.kick_to_login = true;
                                 }
                             }
                         }
@@ -2520,11 +2620,46 @@ impl ShellView {
         if !std::mem::take(&mut self.avatars_queued) {
             return;
         }
-        // Only the avatars the window can show: threads, recent senders, me.
-        let mut keys: Vec<String> = self.convs.iter().map(|c| c.thread_id.clone()).collect();
+        // Friends first while Danh bạ is open, so the visible rows get photos
+        // before the rest of the cache. Then threads, recent senders, me.
+        let mut keys: Vec<String> = Vec::new();
+        if self.rail == Rail::Contacts {
+            let groups = self.contact_tab == crate::sidebar::ContactTab::Groups;
+            keys.extend(self.contact_rows(groups).into_iter().map(|(uid, _, _)| uid));
+        }
+        keys.extend(self.convs.iter().map(|c| c.thread_id.clone()));
         keys.push(crate::profiles::ME.into());
         if self.avatar_all {
             keys.extend(self.profiles.map.keys().cloned());
+        }
+        // Groups with no photo of their own use up to four member photos,
+        // the same collage Zalo PC paints instead of a letter. The open
+        // group still needs every member face in the info column, even
+        // when the group itself already has a photo.
+        let open_group = self.selected.and_then(|id| {
+            self.convs
+                .iter()
+                .find(|c| c.id == id && c.is_group)
+                .map(|c| c.thread_id.clone())
+        });
+        for conv in &self.convs {
+            if !conv.is_group {
+                continue;
+            }
+            let own_photo = profile_avatar(&self.profiles, &conv.thread_id).is_some();
+            let open_here = open_group.as_deref() == Some(conv.thread_id.as_str());
+            if own_photo && !open_here {
+                continue;
+            }
+            let Some(profile) = self.profiles.map.get(&conv.thread_id) else {
+                continue;
+            };
+            let limit = if open_here { 40 } else { 4 };
+            for uid in profile.member_ids.iter().take(limit) {
+                if !keys.contains(uid) {
+                    keys.push(uid.clone());
+                }
+            }
         }
         for msgs in self.messages.values() {
             for m in msgs.iter().rev().take(80) {
@@ -2533,13 +2668,32 @@ impl ShellView {
                 }
             }
         }
-        let jobs: Vec<(String, crate::fetch::Job)> = keys
+        if let Some(key) = self.notice_thread.clone() {
+            if self.shown_photo(&key).is_none() {
+                keys.retain(|item| item != &key);
+                keys.insert(0, key);
+            }
+        }
+        let mut seen = HashSet::new();
+        let pending: Vec<(String, String)> = keys
             .into_iter()
-            .filter(|k| !self.avatars.contains_key(k))
+            .filter(|k| {
+                seen.insert(k.clone())
+                    && !self.avatars.contains_key(k)
+                    && !self.avatar_miss.contains(k)
+            })
             .filter_map(|k| {
                 let url = profile_avatar(&self.profiles, &k)?;
-                url.starts_with("https://").then_some((k, url))
+                (url.starts_with("https://") && !url.contains("/default")).then_some((k, url))
             })
+            .collect();
+        // One batch paints before the next starts. A full friend list is
+        // hundreds of decodes; waiting for all of them left every row a letter.
+        const AVATAR_CHUNK: usize = 16;
+        let more = pending.len() > AVATAR_CHUNK;
+        let jobs: Vec<(String, crate::fetch::Job)> = pending
+            .into_iter()
+            .take(AVATAR_CHUNK)
             .enumerate()
             .map(|(i, (k, url))| {
                 (
@@ -2564,11 +2718,27 @@ impl ShellView {
                 .spawn(async move { crate::fetch::run_batch(dir.as_deref(), jobs) })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                let mut got = 0usize;
                 for d in done {
-                    if let (Some(img), Some(key)) = (d.image, keys.get(d.msg_id as usize)) {
+                    let Some(key) = keys.get(d.msg_id as usize) else {
+                        continue;
+                    };
+                    if let Some(img) = d.image {
                         view.avatars.insert(key.clone(), img);
+                        got += 1;
+                    } else {
+                        view.avatar_miss.insert(key.clone());
                     }
                 }
+                eprintln!(
+                    "zalo-gpui avatars: chunk {got}/{} ok, miss {}, more={more}",
+                    keys.len(),
+                    view.avatar_miss.len()
+                );
+                if more {
+                    view.avatars_queued = true;
+                }
+                view.refresh_notice_avatar(cx);
                 cx.notify();
             });
         })
@@ -2604,19 +2774,81 @@ impl ShellView {
             .into_iter()
             .take(80)
             .collect();
-        self.profile_gaps_started = true;
-        if missing.is_empty() {
+        let thread_ids: Vec<String> = self.convs.iter().map(|c| c.thread_id.clone()).collect();
+        let groups = crate::profiles::groups_needing_info(&self.profiles, &thread_ids);
+        if missing.is_empty() && groups.is_empty() {
             return;
         }
+        self.profile_gaps_started = true;
+        let dir_groups = dir.clone();
+        let group_count = groups.len();
+        eprintln!("zalo-gpui profile gaps: {group_count} nhóm, {} người", missing.len());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         cx.spawn(async move |this, cx| {
-            let got = cx
+            // Group names are what the list is waiting on. Do not wait for the
+            // user-profile chunks to finish first; those can take several timeouts.
+            let users_task = cx
                 .background_executor()
-                .spawn(async move { crate::profiles::fetch_missing(&dir, &missing) })
-                .await;
+                .spawn(async move { crate::profiles::fetch_missing(&dir, &missing) });
+            let groups_task = cx.background_executor().spawn(async move {
+                crate::profiles::fetch_missing_groups(&dir_groups, &groups)
+            });
+            let got_groups = groups_task.await;
             let _ = this.update(cx, |view, cx| {
+                let mut changed = false;
+                match got_groups {
+                    Ok((groups, members)) => {
+                        for (id, got) in groups {
+                            let slot = view.profiles.map.entry(id).or_default();
+                            if !got.name.is_empty() && slot.name != got.name {
+                                slot.name = got.name;
+                                changed = true;
+                            }
+                            if got.avatar.starts_with("https://")
+                                && slot.avatar != got.avatar
+                            {
+                                slot.avatar = got.avatar;
+                                changed = true;
+                            }
+                            if got.members > 0 && slot.members != got.members {
+                                slot.members = got.members;
+                                changed = true;
+                            }
+                            if !got.member_ids.is_empty() && slot.member_ids != got.member_ids {
+                                slot.member_ids = got.member_ids;
+                                changed = true;
+                            }
+                        }
+                        for (uid, got) in members {
+                            if let std::collections::hash_map::Entry::Vacant(slot) =
+                                view.profiles.map.entry(uid)
+                            {
+                                slot.insert(got);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("zalo-gpui group gaps: {err}");
+                        if crate::login_flow::is_session_error(&err) {
+                            view.kick_to_login = true;
+                        }
+                    }
+                }
+                if changed {
+                    view.apply_profile_aliases();
+                    if let Some(path) = crate::profiles::cache_path() {
+                        view.profiles.save(&path);
+                    }
+                    view.avatars_queued = true;
+                }
+                cx.notify();
+            });
+            let got = users_task.await;
+            let _ = this.update(cx, |view, cx| {
+                let mut changed = false;
                 match got {
                     Ok(map) => {
-                        let mut changed = false;
                         for (uid, got) in map {
                             let slot = view.profiles.map.entry(uid).or_default();
                             if got.avatar.starts_with("https://")
@@ -2630,19 +2862,113 @@ impl ShellView {
                                 changed = true;
                             }
                         }
-                        if changed {
-                            if let Some(path) = crate::profiles::cache_path() {
-                                view.profiles.save(&path);
-                            }
-                            view.avatars_queued = true;
+                    }
+                    Err(err) => {
+                        eprintln!("zalo-gpui profile gaps: {err}");
+                        if crate::login_flow::is_session_error(&err) {
+                            view.kick_to_login = true;
                         }
                     }
-                    Err(err) => eprintln!("zalo-gpui profile gaps: {err}"),
+                }
+                if changed {
+                    view.apply_profile_aliases();
+                    if let Some(path) = crate::profiles::cache_path() {
+                        view.profiles.save(&path);
+                    }
+                    view.avatars_queued = true;
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Fill the open popup once this thread's photo has been decoded.
+    fn refresh_notice_avatar(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.notice_thread.clone() else {
+            return;
+        };
+        let Some(image) = self.shown_photo(&key) else {
+            return;
+        };
+        if let Some(pending) = self.pending_notice.as_mut() {
+            if pending.thread_key == key && pending.image.is_none() {
+                pending.image = Some(image.clone());
+            }
+        }
+        crate::notice::patch_avatar(cx, &key, image);
+    }
+
+    /// Profile stored under `key` or its `g_` / bare twin.
+    fn profile_ref(&self, key: &str) -> Option<&crate::profiles::Profile> {
+        self.profiles
+            .map
+            .get(key)
+            .or_else(|| self.profiles.map.get(&alt_profile_key(key)))
+    }
+
+    /// Bitmap Electron would paint. A URL containing `/default` is not a photo.
+    pub(crate) fn shown_photo(&self, id: &str) -> Option<Arc<RenderImage>> {
+        if self
+            .profile_ref(id)
+            .is_some_and(|profile| profile.avatar.contains("/default"))
+        {
+            return None;
+        }
+        self.avatar_of(id)
+    }
+
+    /// Overlapping collage cells for a group that has no photo of its own.
+    /// Empty when the group photo is real and already decoded, so that photo
+    /// stays a single image on the list, the header, and the info panel.
+    pub(crate) fn group_collage_faces(&self, thread_id: &str) -> Vec<crate::sidebar::CollageFace> {
+        let Some((avatar, ids, members, creator, admins)) = self.profile_ref(thread_id).map(|profile| {
+            (
+                profile.avatar.clone(),
+                profile.member_ids.clone(),
+                profile.members,
+                profile.creator_id.clone(),
+                profile.admin_ids.clone(),
+            )
+        }) else {
+            return Vec::new();
+        };
+        if crate::sidebar::is_real_avatar(&avatar) && self.avatar_of(thread_id).is_some() {
+            return Vec::new();
+        }
+        let total = if members > 0 {
+            members
+        } else {
+            u32::try_from(ids.len()).unwrap_or(u32::MAX)
+        };
+        let me = self.self_uid().map(str::to_owned);
+        crate::sidebar::collage_picks(&ids, total, me.as_deref(), &creator, &admins)
+            .into_iter()
+            .map(|pick| match pick {
+                crate::sidebar::CollagePick::Face(index) => {
+                    self.member_collage_face(ids.get(index).map(String::as_str).unwrap_or(""))
+                }
+                crate::sidebar::CollagePick::Count(n) => crate::sidebar::CollageFace::Count(n),
+                crate::sidebar::CollagePick::Placeholder => crate::sidebar::CollageFace::Placeholder,
+            })
+            .collect()
+    }
+
+    /// One collage cell: a decoded photo, otherwise initials coloured by user id.
+    fn member_collage_face(&self, uid: &str) -> crate::sidebar::CollageFace {
+        let (name, url) = self
+            .profile_ref(uid)
+            .map(|profile| (profile.name.clone(), profile.avatar.clone()))
+            .unwrap_or_default();
+        if crate::sidebar::is_real_avatar(&url) {
+            if let Some(image) = self.avatar_of(uid) {
+                return crate::sidebar::CollageFace::Photo(image);
+            }
+        }
+        crate::sidebar::CollageFace::Letter {
+            text: crate::sidebar::avatar_initials(&name),
+            fill: crate::sidebar::avatar_color(uid),
+        }
     }
 
     /// Load labels once, on the first menu that shows them (user click).
@@ -2958,6 +3284,7 @@ impl ShellView {
             .convs
             .iter()
             .filter(|row| self.conv_visible_in_tab(row, &query, pin_match))
+            .filter(|row| !is_left_group_name(&row.name))
             .filter(|row| {
                 conv_matches_list_filter(
                     self.list_filter,
@@ -3061,6 +3388,9 @@ impl ShellView {
             self.msg_search_presets_open = false;
         }
         self.selected = Some(id);
+        if self.convs.iter().any(|c| c.id == id && c.is_group) {
+            self.avatars_queued = true;
+        }
         self.rail = Rail::Chats;
         self.note = None;
         self.sticker_open = false;
@@ -3141,11 +3471,33 @@ impl ShellView {
             .unwrap_or(&[])
     }
 
-    pub(crate) fn send_draft(&mut self, text: &str, _cx: &mut Context<Self>) {
+    pub(crate) fn send_draft(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.commit_caption_edit(cx);
         let text = text.trim();
-        if let Some(path) = self.pending_photo.take() {
-            self.pending_thumb = None;
-            self.send_photo_now(path, text);
+        if !self.pending_photos.is_empty() {
+            if self.selected_conv().is_none() {
+                self.set_note("Chọn một hội thoại để gửi");
+                return;
+            }
+            let photos = std::mem::take(&mut self.pending_photos);
+            let captions = std::mem::take(&mut self.pending_captions);
+            self.pending_thumbs.clear();
+            self.caption_edit = None;
+            let total = photos.len() as u32;
+            let layout = if total > 1 { data::now_ms() } else { 0 };
+            for (i, path) in photos.into_iter().enumerate() {
+                let cell = captions
+                    .get(i)
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                let caption = match (i, cell) {
+                    (0, Some(c)) if !text.is_empty() && c != text => format!("{text}\n{c}"),
+                    (_, Some(c)) => c,
+                    (0, None) => text.to_owned(),
+                    _ => String::new(),
+                };
+                self.send_photo_now_at(path, &caption, i as i64, layout, total, i as u32);
+            }
             return;
         }
         if text.is_empty() {
@@ -3262,7 +3614,6 @@ impl ShellView {
 
     pub(crate) fn maybe_live(&self, action: LiveAction) {
         let allowed = match &action {
-            LiveAction::Logout => true,
             LiveAction::Block { uid } => data::live_allowed(uid),
             LiveAction::Send { thread_id, .. }
             | LiveAction::SendContact { thread_id, .. }
@@ -3463,15 +3814,82 @@ impl ShellView {
         .detach();
     }
 
-    /// Photo waiting above the composer; Enter sends it with the typed caption.
+    /// Append one photo to the composer tray. Enter sends the whole tray.
     pub(crate) fn set_pending_photo(&mut self, path: PathBuf) {
-        self.pending_thumb = crate::media::decode_thumb(&path, 160);
-        self.pending_photo = Some(path);
+        self.add_pending_photos(std::iter::once(path));
+    }
+
+    /// Append picked photos. Electron's tray holds several; 50 matches a full row set.
+    pub(crate) fn add_pending_photos(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        const MAX: usize = 50;
+        for path in paths {
+            if self.pending_photos.len() >= MAX {
+                self.set_note("Đã đủ 50 ảnh");
+                break;
+            }
+            let thumb = crate::media::decode_thumb(&path, 160);
+            self.pending_photos.push(path);
+            self.pending_thumbs.push(thumb);
+            self.pending_captions.push(String::new());
+        }
     }
 
     pub(crate) fn clear_pending_photo(&mut self) {
-        self.pending_photo = None;
-        self.pending_thumb = None;
+        self.pending_photos.clear();
+        self.pending_thumbs.clear();
+        self.pending_captions.clear();
+        self.caption_edit = None;
+    }
+
+    /// Drop one tray photo. The trash button on that thumb calls this.
+    pub(crate) fn remove_pending_photo(&mut self, index: usize) {
+        if index >= self.pending_photos.len() {
+            return;
+        }
+        self.pending_photos.remove(index);
+        if index < self.pending_thumbs.len() {
+            self.pending_thumbs.remove(index);
+        }
+        if index < self.pending_captions.len() {
+            self.pending_captions.remove(index);
+        }
+        self.caption_edit = match self.caption_edit {
+            Some(cur) if self.pending_photos.is_empty() || cur == index => None,
+            Some(cur) if cur > index => Some(cur - 1),
+            other => other,
+        };
+    }
+
+    /// Pencil on a thumb: edit that photo's caption, not the shared composer.
+    pub(crate) fn begin_caption_edit(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.pending_photos.len() {
+            return;
+        }
+        self.commit_caption_edit(cx);
+        while self.pending_captions.len() < self.pending_photos.len() {
+            self.pending_captions.push(String::new());
+        }
+        let text = self.pending_captions.get(index).cloned().unwrap_or_default();
+        self.caption_edit = Some(index);
+        self.caption_input
+            .update(cx, |input, cx| input.set_text(text, cx));
+        let handle = gpui::Focusable::focus_handle(self.caption_input.read(cx), cx);
+        window.focus(&handle);
+    }
+
+    pub(crate) fn commit_caption_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.caption_edit else {
+            return;
+        };
+        if index >= self.pending_captions.len() {
+            return;
+        }
+        self.pending_captions[index] = self.caption_input.read(cx).text();
     }
 
     /// Upload a local file to the open conversation (asyncfile flow).
@@ -3575,11 +3993,25 @@ impl ShellView {
 
     /// Local bubble + real upload (`upload_photo` → `send_photo`).
     pub(crate) fn send_photo_now(&mut self, path: PathBuf, caption: &str) {
+        self.send_photo_now_at(path, caption, 0, 0, 1, 0);
+    }
+
+    /// `stagger_ms` keeps `client_id` unique when several photos leave in one tick.
+    /// `layout_id` is Electron's `groupLayoutId` for a multi-photo send (`0` for one photo).
+    fn send_photo_now_at(
+        &mut self,
+        path: PathBuf,
+        caption: &str,
+        stagger_ms: i64,
+        layout_id: i64,
+        group_total: u32,
+        group_index: u32,
+    ) {
         let Some(conv) = self.selected_conv() else {
             self.set_note("Chọn một hội thoại để gửi");
             return;
         };
-        let now = data::now_ms();
+        let now = data::now_ms().saturating_add(stagger_ms);
         let id = self.next_msg_id;
         self.next_msg_id += 1;
         let (w, h) = image::image_dimensions(&path).unwrap_or((0, 0));
@@ -3604,6 +4036,10 @@ impl ShellView {
         msg.media_path = Some(path.clone());
         msg.media_w = w;
         msg.media_h = h;
+        if group_total > 1 && layout_id != 0 {
+            msg.group_layout_id = layout_id;
+        }
+        let sent_layout = msg.group_layout_id;
         self.push_message(msg);
         self.warm_media(conv.id);
         if conv.live && self.has_session {
@@ -3613,6 +4049,9 @@ impl ShellView {
                 is_group: conv.is_group,
                 path,
                 caption: caption.to_owned(),
+                group_layout_id: sent_layout,
+                group_total,
+                group_index,
             });
             self.set_note("Đang gửi ảnh lên máy chủ…");
         } else {
@@ -3622,16 +4061,15 @@ impl ShellView {
 
     pub(crate) fn pick_and_attach(&mut self, photo: bool) {
         self.sticker_open = false;
-        let picked = if photo {
-            crate::plugins::pick_photo()
-        } else {
-            crate::plugins::pick_file()
-        };
-        match picked {
-            Ok(Some(path)) if photo => {
-                self.set_pending_photo(path);
-                self.set_note("Nhập chú thích (nếu cần) rồi nhấn Enter để gửi ảnh");
+        if photo {
+            match crate::plugins::pick_photos() {
+                Ok(paths) if !paths.is_empty() => self.add_pending_photos(paths),
+                Ok(_) => {}
+                Err(err) => self.set_note(err),
             }
+            return;
+        }
+        match crate::plugins::pick_file() {
             Ok(Some(path)) if crate::video::is_video_path(&path) => self.send_video_now(path),
             Ok(Some(path)) => self.send_file_now(path),
             Ok(None) => {}
@@ -3741,6 +4179,12 @@ impl Render for ShellView {
         if self.pending_notice.is_some() {
             cx.defer_in(window, |this, window, cx| this.flush_notice(window, cx));
         }
+        if self.kick_to_login {
+            self.kick_to_login = false;
+            cx.defer_in(window, |this, window, cx| {
+                this.leave_to_login(window, cx, false);
+            });
+        }
         let menu = self.menu.is_some();
         let forward = self.forward_of.is_some();
         let selected = self.selected_conv();
@@ -3780,10 +4224,17 @@ impl Render for ShellView {
         self.drain_media_queue(cx);
         self.drain_sticker_thumbs(cx);
         self.drain_labels(cx);
+        // The friend list is not in the conversation keys, so its photos never
+        // download until every cached profile is queued.
+        if self.rail == Rail::Contacts && !self.avatar_all {
+            self.avatar_all = true;
+            self.avatars_queued = true;
+        }
         self.drain_profiles(cx);
         self.fill_profile_gaps(cx);
         self.drain_presence(cx);
         self.drain_media_store(cx);
+        self.drain_info_join(cx);
         self.start_realtime(window, cx);
         self.start_shortcuts(window, cx);
         self.ensure_privacy_loaded(cx);
@@ -3988,9 +4439,10 @@ impl Render for ShellView {
                                 .when(self.msg_search_open && selected.is_some(), |el| {
                                     el.child(self.msg_search_panel(selected.as_ref(), corners, cx))
                                 })
-                                .when(info && !self.msg_search_open, |el| {
-                                    el.child(self.info_slot(selected.as_ref(), corners, cx))
-                                }),
+                                .when(
+                                    info && self.rail != Rail::Contacts && !self.msg_search_open,
+                                    |el| el.child(self.info_slot(selected.as_ref(), corners, cx)),
+                                ),
                         ),
                 )
                 .when(self.settings_open, |el| {
@@ -4013,6 +4465,7 @@ impl Render for ShellView {
                 })
                 .when(forward, |el| el.child(self.forward_overlay(cx)))
                 .when_some(toast, |el, text| el.child(toast_el(text)))
+                .when(self.export_ui.popup_open(), |el| el.child(self.transfer_popup(cx)))
                 .when(self.locked, |el| el.child(self.lock_overlay(cx))),
         )
     }
@@ -4191,7 +4644,15 @@ pub(crate) fn open_thread_into(
 ) -> Option<u64> {
     let raw_tid = thread_id.trim();
     let normalized_tid = if is_group && !raw_tid.is_empty() && !raw_tid.starts_with("preview:") {
-        format!("g_{}", raw_tid.strip_prefix("g_").unwrap_or(raw_tid))
+        let clean = raw_tid
+            .strip_prefix("g_")
+            .or_else(|| {
+                raw_tid
+                    .strip_prefix('g')
+                    .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+            })
+            .unwrap_or(raw_tid);
+        format!("g_{clean}")
     } else {
         raw_tid.to_owned()
     };
@@ -4236,6 +4697,13 @@ pub(crate) fn open_thread_into(
     Some(next_id)
 }
 
+/// getgi error 164 stores this placeholder when the account has left the group.
+/// Those rows are not conversations Electron keeps in the list.
+#[must_use]
+pub(crate) fn is_left_group_name(name: &str) -> bool {
+    name.trim() == "Nhóm đã rời"
+}
+
 /// Shared `ListFilter` predicate used by `ShellView::listed_convs` and unit tests.
 pub(crate) fn conv_matches_list_filter(
     filter: ListFilter,
@@ -4244,8 +4712,11 @@ pub(crate) fn conv_matches_list_filter(
     unread: u32,
     label: Option<i64>,
 ) -> bool {
+    let _ = query;
     match filter {
-        ListFilter::All => !query.is_empty() || !stranger,
+        // Electron's list for this account has no "Tin nhắn từ người lạ" folder.
+        // Those threads are ordinary rows, so a right-click can delete them.
+        ListFilter::All => true,
         ListFilter::Unread => unread > 0,
         ListFilter::Strangers => stranger,
         ListFilter::Label(id) => label == Some(id),
@@ -4656,14 +5127,16 @@ mod tests {
             Some("111")
         ));
 
-        // Folding: strangers stay out of default All view unless searching, and appear in Strangers view.
-        assert!(!conv_matches_list_filter(
+        // Strangers stay in the default list. Electron has no stranger folder row.
+        assert!(conv_matches_list_filter(
             ListFilter::All,
             "",
             true,
             2,
             None
         ));
+        assert!(is_left_group_name("Nhóm đã rời"));
+        assert!(!is_left_group_name("Trường Group"));
         assert!(conv_matches_list_filter(
             ListFilter::All,
             "người",

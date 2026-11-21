@@ -7,7 +7,7 @@ Zalo-Rust/
 ├── Cargo.toml         # Unified cross-platform Rust workspace manifest
 ├── protocol.json      # Canonical Zalo protocol parameters (zpw_ver, api_type, User-Agent)
 ├── core/              # 10 OS-independent pure-Rust crates shared by all platforms
-├── assets/            # Shared runtime fonts, UI images, call sounds, emoji tiles, sync2 WASM
+├── assets/            # Shared runtime fonts, UI images, call sounds, emoji tiles, backup WASM
 ├── vendor/            # Linux libc compatibility patch for xattr 0.2.3
 ├── zalo-linux/        # Linux platform crates (zalo-shell, zcall-audio, zcall-engine, zalo-gpui) + packaging
 ├── zalo-windows/      # Target workspace directory for Windows port (Win32/DirectX GPUI, WASAPI, DXGI)
@@ -24,7 +24,6 @@ All pure-Rust protocol, storage, media, and call-engine crates live in `core/` s
 | `core/` | `zalo-protocol` | None (pure Rust) | AES/CBC, ParamCipher v2, request signing, dynamic `protocol.json` overrides |
 | `core/` | `zalo-client` | None (pure Rust) | REST API client, QR login flow, realtime WebSocket, media/file transfers |
 | `core/` | `zalo-storage` | None (SQLite) | Local database for conversations, messages, search, ZDB4 decryption |
-| `core/` | `zalo-sync2` | None (`wasmi`) | Phone-to-desktop message sync v2 decryption & record decoding |
 | `core/` | `zalo-design` | None (pure Rust) | Design tokens, layout constants, localized UI string tables |
 | `core/` | `zcall-core` | None (pure Rust) | Call engine state machine, ZRTP/SRTP/RTP/RTCP, P2P NAT traversal, bitrate control |
 | `core/` | `zimage`, `zjxl`, `zocr` | None / ONNX Runtime | Thumbnail resizing, JPEG XL codec, PP-OCR text recognition |

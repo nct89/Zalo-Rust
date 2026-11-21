@@ -369,6 +369,12 @@ fn try_v4l(
             }
             continue;
         };
+        while let Ok(msg) = ctrl_rx.try_recv() {
+            match msg {
+                CamCtrl::Profile(next) => *profile = next,
+                CamCtrl::ForceKey => force_key = true,
+            }
+        }
         tx_stats.captured += 1;
         let now = Instant::now();
         if let Some(prev) = last_cap_at {
@@ -761,7 +767,7 @@ impl V4lGrab {
     /// The newest queued frame. Older buffers are discarded so a slow encode
     /// does not send a picture that is already hundreds of milliseconds old.
     fn latest_frame(&mut self) -> Option<Vec<u8>> {
-        let mut frame = self.read_frame_timeout(200)?;
+        let mut frame = self.read_frame_timeout(40)?;
         while self.frame_pending() {
             match self.read_frame_timeout(0) {
                 Some(newer) => frame = newer,
@@ -881,27 +887,58 @@ fn yuyv_to_i420(src: &[u8], width: usize, height: usize) -> Vec<u8> {
 
 fn rgb_to_i420(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     let y_len = width * height;
-    let c_len = y_len / 4;
+    let c_len = (width / 2) * (height / 2);
     let mut out = vec![0_u8; y_len + c_len * 2];
     let (y, rest) = out.split_at_mut(y_len);
     let (u, v) = rest.split_at_mut(c_len);
     for row in 0..height {
+        let row_off = row * width;
         for col in 0..width {
-            let p = (row * width + col) * 3;
+            let p = (row_off + col) * 3;
             let r = u32::from(rgb[p]);
             let g = u32::from(rgb[p + 1]);
             let b = u32::from(rgb[p + 2]);
-            y[row * width + col] =
+            y[row_off + col] =
                 ((66 * r + 129 * g + 25 * b + 128) >> 8).saturating_add(16) as u8;
-            if row % 2 == 0 && col % 2 == 0 {
-                let c = (row / 2) * (width / 2) + col / 2;
-                u[c] = ((-38 * r as i32 - 74 * g as i32 + 112 * b as i32 + 128) >> 8)
-                    .saturating_add(128)
-                    .clamp(0, 255) as u8;
-                v[c] = ((112 * r as i32 - 94 * g as i32 - 18 * b as i32 + 128) >> 8)
-                    .saturating_add(128)
-                    .clamp(0, 255) as u8;
-            }
+        }
+    }
+    let cw = width / 2;
+    let ch = height / 2;
+    for cy in 0..ch {
+        let r0 = (cy * 2) * width;
+        let r1 = r0 + width;
+        for cx in 0..cw {
+            let c0 = cx * 2;
+            let c1 = c0 + 1;
+            let p00 = (r0 + c0) * 3;
+            let p01 = (r0 + c1) * 3;
+            let p10 = (r1 + c0) * 3;
+            let p11 = (r1 + c1) * 3;
+            let r = (i32::from(rgb[p00])
+                + i32::from(rgb[p01])
+                + i32::from(rgb[p10])
+                + i32::from(rgb[p11])
+                + 2)
+                >> 2;
+            let g = (i32::from(rgb[p00 + 1])
+                + i32::from(rgb[p01 + 1])
+                + i32::from(rgb[p10 + 1])
+                + i32::from(rgb[p11 + 1])
+                + 2)
+                >> 2;
+            let b = (i32::from(rgb[p00 + 2])
+                + i32::from(rgb[p01 + 2])
+                + i32::from(rgb[p10 + 2])
+                + i32::from(rgb[p11 + 2])
+                + 2)
+                >> 2;
+            let idx = cy * cw + cx;
+            u[idx] = ((-38 * r - 74 * g + 112 * b + 128) >> 8)
+                .saturating_add(128)
+                .clamp(0, 255) as u8;
+            v[idx] = ((112 * r - 94 * g - 18 * b + 128) >> 8)
+                .saturating_add(128)
+                .clamp(0, 255) as u8;
         }
     }
     out

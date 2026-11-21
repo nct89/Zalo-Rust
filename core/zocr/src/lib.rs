@@ -48,10 +48,22 @@ pub enum OcrError {
     Runtime(String),
 }
 
+/// Runtime library filenames searched per target OS.
+#[cfg(target_os = "windows")]
+const RUNTIME_FILENAMES: &[&str] = &["onnxruntime.dll"];
+
+/// Runtime library filenames searched per target OS.
+#[cfg(target_os = "macos")]
+const RUNTIME_FILENAMES: &[&str] = &["libonnxruntime.dylib"];
+
+/// Runtime library filenames searched per target OS.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const RUNTIME_FILENAMES: &[&str] = &["libonnxruntime.so", "libonnxruntime.so.1"];
+
 /// Runtime library and manifest found in one OCR directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OcrInstall {
-    /// `libonnxruntime.so`.
+    /// Dynamic ONNX Runtime library (`libonnxruntime.so`, `onnxruntime.dll`, or `libonnxruntime.dylib`).
     pub runtime: PathBuf,
     /// `models.json`.
     pub manifest: PathBuf,
@@ -59,7 +71,7 @@ pub struct OcrInstall {
 
 /// The runtime and manifest inside `dir`, if both are there.
 pub fn install_in(dir: &Path) -> Option<OcrInstall> {
-    let runtime = ["libonnxruntime.so", "libonnxruntime.so.1"]
+    let runtime = RUNTIME_FILENAMES
         .iter()
         .map(|name| dir.join(name))
         .find(|p| p.is_file())?;
@@ -78,12 +90,36 @@ pub fn search_dirs() -> Vec<PathBuf> {
     if let Some(dir) = std::env::var_os("ZALO_OCR_DIR").filter(|v| !v.is_empty()) {
         dirs.push(PathBuf::from(dir));
     }
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-    if let Some(data) = data {
-        dirs.push(data.join("zalo-rust").join("ocr"));
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .filter(|v| !v.is_empty())
+        {
+            dirs.push(PathBuf::from(local).join("zalo-rust").join("ocr"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            dirs.push(
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("zalo-rust")
+                    .join("ocr"),
+            );
+        }
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+        if let Some(data) = data {
+            dirs.push(data.join("zalo-rust").join("ocr"));
+        }
     }
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
@@ -91,7 +127,10 @@ pub fn search_dirs() -> Vec<PathBuf> {
     {
         dirs.push(exe_dir.join("ocr"));
     }
-    dirs.push(PathBuf::from("/usr/share/zalo-rust/ocr"));
+    #[cfg(unix)]
+    {
+        dirs.push(PathBuf::from("/usr/share/zalo-rust/ocr"));
+    }
     dirs
 }
 
@@ -100,8 +139,7 @@ pub fn find_ocr_dir() -> Option<OcrInstall> {
     search_dirs().iter().find_map(|dir| install_in(dir))
 }
 
-static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
-static LAST_USED: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static ENGINE: Mutex<Option<(Engine, std::time::Instant)>> = Mutex::new(None);
 static REAPER_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// Default idle TTL before releasing cached ONNX Runtime sessions (~400 MB RAM).
@@ -133,21 +171,14 @@ pub fn parse_idle_ttl(raw: Option<&str>) -> Option<std::time::Duration> {
 /// Drops the cached OCR engine if it has been idle for at least `ttl`.
 /// Returns `true` when a loaded engine was released.
 pub fn release_idle(ttl: std::time::Duration) -> bool {
-    let last = LAST_USED.lock().ok().and_then(|g| *g);
-    let Some(last) = last else {
-        return false;
-    };
-    if last.elapsed() < ttl {
-        return false;
-    }
     let Ok(mut guard) = ENGINE.lock() else {
         return false;
     };
-    if guard.is_some() {
+    let should_release = guard
+        .as_ref()
+        .is_some_and(|(_, last_used)| last_used.elapsed() >= ttl);
+    if should_release {
         *guard = None;
-        if let Ok(mut ts) = LAST_USED.lock() {
-            *ts = None;
-        }
         return true;
     }
     false
@@ -203,19 +234,14 @@ pub fn recognize_lines(image: &RgbImage) -> Result<Vec<Line>, OcrError> {
         .map_err(|_| OcrError::Runtime("engine lock poisoned".into()))?;
     if guard.is_none() {
         let install = find_ocr_dir().ok_or(OcrError::ModelMissing)?;
-        *guard = Some(Engine::open(
-            &install.runtime,
-            &install.manifest,
-            Options::default(),
-        )?);
+        let engine = Engine::open(&install.runtime, &install.manifest, Options::default())?;
+        *guard = Some((engine, std::time::Instant::now()));
     }
-    let res = match guard.as_mut() {
-        Some(engine) => engine.recognize(image),
-        None => Err(OcrError::ModelMissing),
+    let Some((engine, last_used)) = guard.as_mut() else {
+        return Err(OcrError::ModelMissing);
     };
-    if let Ok(mut ts) = LAST_USED.lock() {
-        *ts = Some(std::time::Instant::now());
-    }
+    let res = engine.recognize(image);
+    *last_used = std::time::Instant::now();
     res
 }
 
@@ -229,7 +255,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("zocr")).expect("dir");
         assert_eq!(install_in(&dir), None);
-        std::fs::write(dir.join("libonnxruntime.so"), b"").expect("lib");
+        std::fs::write(dir.join(RUNTIME_FILENAMES[0]), b"").expect("lib");
         assert_eq!(install_in(&dir), None);
         std::fs::write(dir.join("zocr/models.json"), b"{}").expect("manifest");
         let found = install_in(&dir).expect("install");

@@ -48,7 +48,6 @@ zimage = { workspace = true }
 zcall-core = { workspace = true }
 zcall-audio = { path = "../zcall-audio" }
 zcall-engine = { path = "../zcall-engine" }
-zalo-sync2 = { workspace = true }
 zocr = { workspace = true }
 openh264 = "0.8"
 libc = "0.2"
@@ -59,3 +58,7 @@ sha2 = "0.10"
 hex = { workspace = true }
 zstd = "0.13"
 resvg = "0.45"
+base64 = { workspace = true }
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "ogg", "vorbis", "isomp4", "pcm", "wav", "adpcm"] }
+rusty_mp3 = "1.1"
+mp4 = "0.14"

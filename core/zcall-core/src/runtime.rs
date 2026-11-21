@@ -16,6 +16,8 @@ pub struct MediaDriver {
     /// The underlying media state machine.
     pub media: MediaSession,
     socket: Arc<UdpSocket>,
+    /// Dedicated UDP socket for group `ShareScreenPeer` (`uid = shareScreenId`).
+    share_socket: Option<Arc<UdpSocket>>,
     /// Ping period while the call is up.
     pub ping_interval: Duration,
     /// ReqForward status period while the call is up.
@@ -46,6 +48,7 @@ impl MediaDriver {
         Ok(Self {
             media,
             socket,
+            share_socket: None,
             ping_interval: Duration::from_secs(6),
             status_interval: Duration::from_secs(1),
             init_wait: Duration::from_millis(600),
@@ -58,6 +61,30 @@ impl MediaDriver {
     /// The bound local address.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.socket.local_addr()
+    }
+
+    /// Starts the group `ShareScreenPeer` on its own ephemeral UDP socket (or
+    /// sets the 1-1 screen-share SSRC on the main socket).
+    pub fn start_share(&mut self, share_id: u32) {
+        if self.media.group && share_id > 0 {
+            if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+                let _ = sock.set_nonblocking(true);
+                let sock = Arc::new(sock);
+                let send_sock = Arc::clone(&sock);
+                self.media.set_share_send(move |packet, server, _what| {
+                    let _ = send_sock.send_to(packet, (server.host.as_str(), server.port));
+                });
+                self.share_socket = Some(sock);
+            }
+        }
+        self.media.start_share(share_id);
+    }
+
+    /// Stops screen sharing and closes any dedicated group share UDP socket.
+    pub fn stop_share(&mut self) {
+        self.media.stop_share();
+        self.media.clear_share_send();
+        self.share_socket = None;
     }
 
     /// Sends a raw datagram to an arbitrary address (P2P NAT hole punching).
@@ -109,6 +136,18 @@ impl MediaDriver {
             }
         }
         let _ = self.socket.set_nonblocking(false);
+        if let Some(share_sock) = self.share_socket.as_ref() {
+            for _ in 0..32 {
+                match share_sock.recv_from(&mut self.buf) {
+                    Ok((n, _)) => {
+                        any = true;
+                        let packet = self.buf[..n].to_vec();
+                        self.media.receive_share_packet(&packet);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
         any
     }
 
@@ -195,6 +234,8 @@ impl MediaDriver {
     /// Ends the call on the active server.
     pub fn stop(&mut self) {
         self.media.stop();
+        self.media.clear_share_send();
+        self.share_socket = None;
     }
 }
 

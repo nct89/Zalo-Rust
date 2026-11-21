@@ -96,12 +96,29 @@ impl LoginView {
         }
         match event {
             LoginEvent::Status(text) => self.status = Some(text),
-            LoginEvent::Qr(url, _) => {
-                self.qr = encode_qr_image(&url);
-                self.status = None;
+            LoginEvent::Qr(prompt) => {
+                self.qr = encode_qr_prompt(&prompt);
+                self.expired = false;
+                self.error = None;
+                self.scanned = None;
+                if prompt.security_step {
+                    self.status = Some(
+                        prompt
+                            .message
+                            .filter(|m| !m.trim().is_empty())
+                            .map(|m| format!("Xác nhận bảo mật: {m} — Quét lại mã QR mới trên điện thoại."))
+                            .unwrap_or_else(|| {
+                                "Xác nhận bảo mật: Mở Zalo trên điện thoại và quét lại mã QR mới này."
+                                    .into()
+                            }),
+                    );
+                } else {
+                    self.status = None;
+                }
             }
             LoginEvent::Scanned(name) => {
                 self.scanned = Some(name.unwrap_or_default());
+                self.status = None;
             }
             LoginEvent::Expired => {
                 self.expired = true;
@@ -109,6 +126,7 @@ impl LoginView {
             }
             LoginEvent::Failed(err) => {
                 self.error = Some(err);
+                self.scanned = None;
                 self.expired = true;
             }
             LoginEvent::Done => {
@@ -269,10 +287,41 @@ fn expire_if_current(
 }
 
 fn encode_qr_image(payload: &str) -> Option<Arc<RenderImage>> {
+    if payload.is_empty() {
+        return None;
+    }
     let bitmap = rasterize_qr(payload, zalo_design::LOGIN_QR_IMAGE as u32).ok()?;
     Some(Arc::new(RenderImage::new([Frame::new(
         crate::media::rgba_to_bgra(bitmap),
     )])))
+}
+
+fn encode_qr_base64(raw_b64: &str) -> Option<Arc<RenderImage>> {
+    use base64::Engine as _;
+    let trimmed = raw_b64
+        .trim()
+        .strip_prefix("data:image/png;base64,")
+        .or_else(|| raw_b64.trim().strip_prefix("data:image/jpeg;base64,"))
+        .unwrap_or_else(|| raw_b64.trim());
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .ok()?;
+    let rgba = crate::media::decode_rgba(&bytes, zalo_design::LOGIN_QR_IMAGE as u32)?;
+    Some(Arc::new(RenderImage::new([Frame::new(
+        crate::media::rgba_to_bgra(rgba),
+    )])))
+}
+
+fn encode_qr_prompt(prompt: &crate::login_flow::QrPrompt) -> Option<Arc<RenderImage>> {
+    if !prompt.url.is_empty() {
+        if let Some(img) = encode_qr_image(&prompt.url) {
+            return Some(img);
+        }
+    }
+    prompt
+        .base64_png
+        .as_deref()
+        .and_then(encode_qr_base64)
 }
 
 impl Render for LoginView {
@@ -379,7 +428,12 @@ fn login_status(
             blue,
         )
     } else if let Some(s) = status {
-        (s.to_owned(), muted)
+        let c = if s.starts_with("Xác nhận bảo mật") {
+            blue
+        } else {
+            muted
+        };
+        (s.to_owned(), c)
     } else {
         (String::new(), muted)
     };

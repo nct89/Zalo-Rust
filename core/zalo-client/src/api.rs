@@ -56,8 +56,10 @@ pub enum ClientError {
 pub struct QrTicket {
     /// Server token, for diagnostics.
     pub token_id: String,
-    /// URL encoded in the QR image.
+    /// URL/payload encoded in the QR image (may be empty if only `base64_qr` was supplied).
     pub qr_url: String,
+    /// Optional server-rendered base64 PNG image (used by multi-layer `-20` QR renewals).
+    pub base64_qr: Option<String>,
     /// Long-poll URL that waits for the phone to scan.
     pub wait_scan: String,
     /// URL that turns a confirmed scan into a session.
@@ -68,6 +70,21 @@ pub struct QrTicket {
     pub retry: u64,
     /// Raw response, useful while bringing up a new endpoint.
     pub raw: Value,
+}
+
+/// Result of one `chk_wait_scan` step.
+#[derive(Clone, Debug)]
+pub enum QrScanOutcome {
+    /// The phone scanned the QR; caller should now call [`ZaloApi::wait_for_confirm`].
+    Scanned(Value),
+    /// Zalo returned `error_code == -20` (multi-layer QR / "Xác nhận bảo mật"):
+    /// caller must display the renewed [`QrTicket`] and continue polling `wait_for_scan_step`.
+    RenewQr {
+        /// Replacement QR ticket issued by the server for security verification.
+        ticket: QrTicket,
+        /// Server message describing the verification step.
+        message: String,
+    },
 }
 
 /// Account facts returned by getLoginInfo.
@@ -900,22 +917,37 @@ impl ZaloApi {
         QrTicket::from_value(value)
     }
 
-    /// Long-polls chk_wait_scan until the phone scans the code.
+    /// Long-polls `chk_wait_scan` until the phone scans the code or the server
+    /// issues a multi-layer security QR (`error_code == -20`).
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError::Timeout`] after qr_timeout, or the transport or
+    /// Returns [`ClientError::Timeout`] after `qr_timeout`, or the transport or
     /// Zalo error that stopped the poll.
-    pub async fn wait_for_scan(&self, ticket: &QrTicket) -> Result<Value, ClientError> {
+    pub async fn wait_for_scan_step(&self, ticket: &QrTicket) -> Result<QrScanOutcome, ClientError> {
         let deadline = Instant::now() + Duration::from_secs(ticket.timeout_seconds.max(30));
         let url = with_language(&ticket.wait_scan);
         loop {
             if Instant::now() >= deadline {
                 return Err(ClientError::Timeout(ticket.timeout_seconds));
             }
-            let response = self.http.get(&url).send().await?;
+            let response = match self.http.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) if e.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(e) => return Err(ClientError::Http(e)),
+            };
             let status = response.status();
-            let body = response.text().await?;
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) if e.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(e) => return Err(ClientError::Http(e)),
+            };
             if status == StatusCode::REQUEST_TIMEOUT {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
@@ -927,15 +959,41 @@ impl ZaloApi {
             }
             let value: Value = serde_json::from_str(&body)?;
             if let Some((code, message)) = zalo_error(&value) {
-                if code == 18012 {
+                if code == 18012 || code == 8 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
+                }
+                if code == -20 {
+                    let next = QrTicket::from_value(value)?;
+                    return Ok(QrScanOutcome::RenewQr {
+                        ticket: next,
+                        message,
+                    });
                 }
                 if code != 0 {
                     return Err(ClientError::Zalo { code, message });
                 }
             }
-            return Ok(value);
+            return Ok(QrScanOutcome::Scanned(value));
+        }
+    }
+
+    /// Long-polls chk_wait_scan until the phone scans the code.
+    ///
+    /// For multi-layer QR ("Xác nhận bảo mật", `error_code == -20`), prefer
+    /// [`Self::wait_for_scan_step`] so the UI can display the renewed QR.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Timeout`] after qr_timeout, or the transport or
+    /// Zalo error that stopped the poll.
+    pub async fn wait_for_scan(&self, ticket: &QrTicket) -> Result<Value, ClientError> {
+        match self.wait_for_scan_step(ticket).await? {
+            QrScanOutcome::Scanned(value) => Ok(value),
+            QrScanOutcome::RenewQr { message, .. } => Err(ClientError::Zalo {
+                code: -20,
+                message,
+            }),
         }
     }
 
@@ -952,9 +1010,23 @@ impl ZaloApi {
             if Instant::now() >= deadline {
                 return Err(ClientError::Timeout(ticket.timeout_seconds));
             }
-            let response = self.http.get(&url).send().await?;
+            let response = match self.http.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) if e.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(e) => return Err(ClientError::Http(e)),
+            };
             let status = response.status();
-            let body = response.text().await?;
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) if e.is_timeout() => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(e) => return Err(ClientError::Http(e)),
+            };
             if status == StatusCode::REQUEST_TIMEOUT {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
@@ -966,7 +1038,7 @@ impl ZaloApi {
             }
             let value: Value = serde_json::from_str(&body)?;
             if let Some((code, message)) = zalo_error(&value) {
-                if code == 18012 {
+                if code == 18012 || code == 8 {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -2520,6 +2592,7 @@ impl ZaloApi {
         width: u32,
         height: u32,
         caption: &str,
+        group: Option<(i64, u32, u32)>,
     ) -> Result<Value, ClientError> {
         let target = thread_id.strip_prefix("g_").unwrap_or(thread_id);
         let mut payload = serde_json::json!({
@@ -2538,6 +2611,14 @@ impl ZaloApi {
             "ttl": 0,
             "jcp": "{\"convertible\":\"jxl\"}",
         });
+        if let Some((layout_id, total, index)) = group {
+            if total > 1 && layout_id != 0 {
+                payload["groupLayoutId"] = Value::from(layout_id);
+                payload["isGroupLayout"] = Value::from(1);
+                payload["totalItemInGroup"] = Value::from(total);
+                payload["idInGroup"] = Value::from(index);
+            }
+        }
         if is_group {
             payload["grid"] = Value::from(target);
             payload["oriUrl"] = Value::from(upload.normal_url.as_str());
@@ -2632,10 +2713,13 @@ impl ZaloApi {
     ///
     /// Returns `(fileId, total size)`.
     ///
+    /// Uploads a file from disk in 3 MiB chunks (`asyncfile/upload`) without
+    /// loading the entire file into RAM or blocking the async executor.
+    ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the file is missing or empty, or on
-    /// transport, Zalo or decryption errors.
+    /// Returns [`ClientError`] when the file is missing, empty, modified/truncated
+    /// mid-read, or on transport, Zalo or decryption errors.
     pub async fn upload_async_file_path(
         &self,
         thread_id: &str,
@@ -2644,48 +2728,129 @@ impl ZaloApi {
         file_name: &str,
         client_id: u64,
     ) -> Result<(String, u64), ClientError> {
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| ClientError::Unexpected(format!("open {}: {e}", path.display())))?;
-        let total_size = file
-            .metadata()
-            .map_err(|e| ClientError::Unexpected(e.to_string()))?
-            .len();
+        let url = format!("{}asyncfile/upload", self.file_base(is_group));
+        self.upload_chunks_from_path(
+            &url,
+            thread_id,
+            is_group,
+            path,
+            file_name,
+            client_id,
+            "fileId",
+            "asyncfile/upload returned no fileId",
+        )
+        .await
+    }
+
+    /// Uploads a video from disk in 3 MiB chunks (`video/file/upload`) without
+    /// loading the entire video into RAM. Returns `(file_id, total_size)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the file is missing, empty, modified/truncated
+    /// mid-read, or on transport, Zalo or decryption errors.
+    pub async fn upload_video_file_path(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        path: &std::path::Path,
+        file_name: &str,
+        client_id: u64,
+    ) -> Result<(String, u64), ClientError> {
+        let url = format!("{}video/file/upload", self.file_base(is_group));
+        self.upload_chunks_from_path(
+            &url,
+            thread_id,
+            is_group,
+            path,
+            file_name,
+            client_id,
+            "fileId",
+            "video/file/upload returned no fileId",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_chunks_from_path(
+        &self,
+        url: &str,
+        thread_id: &str,
+        is_group: bool,
+        path: &std::path::Path,
+        file_name: &str,
+        client_id: u64,
+        id_field: &str,
+        missing_id_msg: &str,
+    ) -> Result<(String, u64), ClientError> {
+        let open_path = path.to_path_buf();
+        let (mut file, total_size) = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&open_path)
+                .map_err(|e| format!("open {}: {e}", open_path.display()))?;
+            let total_size = file
+                .metadata()
+                .map_err(|e| e.to_string())?
+                .len();
+            Ok::<_, String>((file, total_size))
+        })
+        .await
+        .map_err(|e| ClientError::Unexpected(e.to_string()))?
+        .map_err(ClientError::Unexpected)?;
+
         if total_size == 0 {
             return Err(ClientError::Unexpected("empty file".to_owned()));
         }
-        let chunk = crate::ops::ASYNC_CHUNK_BYTES;
+        let chunk_len = crate::ops::ASYNC_CHUNK_BYTES as usize;
         let total_chunks = crate::ops::async_chunk_count(total_size);
-        let url = format!("{}asyncfile/upload", self.file_base(is_group));
         let mut file_id = String::new();
-        let mut buf = vec![0u8; chunk as usize];
+        let mut bytes_sent = 0_u64;
         for index in 0..total_chunks {
-            let n = std::io::Read::read(&mut file, &mut buf)
-                .map_err(|e| ClientError::Unexpected(e.to_string()))?;
-            if n == 0 {
+            let remaining = total_size.saturating_sub(bytes_sent);
+            if remaining == 0 {
                 break;
             }
+            let target = (remaining as usize).min(chunk_len);
+            let (returned_file, chunk_buf) = tokio::task::spawn_blocking(move || {
+                let mut buf = vec![0u8; target];
+                let n = read_chunk_full(&mut file, &mut buf).map_err(|e| e.to_string())?;
+                buf.truncate(n);
+                Ok::<_, String>((file, buf))
+            })
+            .await
+            .map_err(|e| ClientError::Unexpected(e.to_string()))?
+            .map_err(ClientError::Unexpected)?;
+            file = returned_file;
+            if chunk_buf.is_empty() {
+                return Err(ClientError::Unexpected(format!(
+                    "file truncated while reading ({bytes_sent}/{total_size} bytes)"
+                )));
+            }
+            bytes_sent += chunk_buf.len() as u64;
             let id = self
                 .post_upload_chunk(
-                    &url,
+                    url,
                     thread_id,
                     is_group,
-                    &buf[..n],
+                    &chunk_buf,
                     file_name,
                     client_id,
                     total_size,
                     total_chunks,
                     index,
-                    "fileId",
+                    id_field,
                 )
                 .await?;
             if !id.is_empty() && id != "-1" {
                 file_id = id;
             }
         }
+        if bytes_sent != total_size {
+            return Err(ClientError::Unexpected(format!(
+                "file size changed while uploading ({bytes_sent}/{total_size} bytes)"
+            )));
+        }
         if file_id.is_empty() {
-            return Err(ClientError::Unexpected(
-                "asyncfile/upload returned no fileId".to_owned(),
-            ));
+            return Err(ClientError::Unexpected(missing_id_msg.to_owned()));
         }
         Ok((file_id, total_size))
     }
@@ -3381,7 +3546,12 @@ fn decrypt_login_reply(cipher: &ParamCipher, value: Value) -> Result<Value, Clie
 
 impl QrTicket {
     fn from_value(value: Value) -> Result<Self, ClientError> {
-        let qr_url = string_field(&value, "qr_cnt").ok_or(ClientError::MissingField("qr_cnt"))?;
+        let base64_qr = string_field(&value, "base64_qr").filter(|s| !s.is_empty());
+        let qr_url = string_field(&value, "qr_cnt")
+            .filter(|s| !s.is_empty())
+            .or_else(|| string_field(&value, "ntk").filter(|s| !s.is_empty()))
+            .or_else(|| base64_qr.as_ref().map(|_| String::new()))
+            .ok_or(ClientError::MissingField("qr_cnt"))?;
         let token_id = string_field(&value, "token_id").unwrap_or_default();
         let wait_scan = string_field(&value, "chk_wait_scan")
             .ok_or(ClientError::MissingField("chk_wait_scan"))?;
@@ -3398,6 +3568,7 @@ impl QrTicket {
         Ok(Self {
             token_id,
             qr_url,
+            base64_qr,
             wait_scan,
             wait_confirm,
             timeout_seconds,
@@ -3405,6 +3576,12 @@ impl QrTicket {
             raw: value,
         })
     }
+}
+
+/// Extracts `zpw_sek` from a `chk_wait_cfirm` JSON response when present.
+#[must_use]
+pub fn confirm_zpw_sek(value: &Value) -> Option<String> {
+    string_field(value, "zpw_sek").filter(|s| !s.is_empty())
 }
 
 fn field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
@@ -3474,6 +3651,20 @@ fn add_domain_cookie(jar: &Jar, name: &str, value: &str, domain: &str, anchor: &
     };
     let cookie = format!("{name}={value}; Domain={domain}; Path=/");
     jar.add_cookie_str(&cookie, &url);
+}
+
+/// Reads until `buf` is completely filled or EOF is reached, retrying on `Interrupted`.
+fn read_chunk_full<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(test)]
@@ -3788,5 +3979,64 @@ mod tests {
             api.decrypt_data(&json!({"error_code": 0, "data": failed})),
             Err(ClientError::Zalo { code: 114, .. })
         ));
+    }
+
+    #[test]
+    fn read_chunk_full_handles_short_reads_without_truncation() {
+        struct ShortReader {
+            data: Vec<u8>,
+            pos: usize,
+            max_step: usize,
+        }
+        impl std::io::Read for ShortReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let left = self.data.len().saturating_sub(self.pos);
+                let n = left.min(buf.len()).min(self.max_step);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+        let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        let mut reader = ShortReader {
+            data: payload.clone(),
+            pos: 0,
+            max_step: 13,
+        };
+        let mut out = vec![0u8; 400];
+        let mut reassembled = Vec::new();
+        loop {
+            let n = read_chunk_full(&mut reader, &mut out).expect("read");
+            if n == 0 {
+                break;
+            }
+            reassembled.extend_from_slice(&out[..n]);
+        }
+        assert_eq!(reassembled, payload);
+    }
+
+    #[test]
+    fn qr_ticket_parses_base64_and_confirm_helpers() {
+        let renew = json!({
+            "error_code": -20,
+            "error_message": "Xac nhan bao mat",
+            "data": {
+                "base64_qr": "iVBORw0KGgo=",
+                "chk_wait_scan": "https://qr-id.zaloapp.com/scan2",
+                "chk_wait_cfirm": "https://qr-id.zaloapp.com/cfm2",
+                "qr_timeout": 120
+            }
+        });
+        let ticket = QrTicket::from_value(renew).expect("base64-only -20 renewal parses");
+        assert_eq!(ticket.base64_qr.as_deref(), Some("iVBORw0KGgo="));
+        assert!(ticket.qr_url.is_empty());
+        assert_eq!(ticket.wait_scan, "https://qr-id.zaloapp.com/scan2");
+        assert_eq!(ticket.wait_confirm, "https://qr-id.zaloapp.com/cfm2");
+        assert_eq!(ticket.timeout_seconds, 120);
+
+        assert_eq!(
+            confirm_zpw_sek(&json!({"data": {"zpw_sek": "sek.abc"}})).as_deref(),
+            Some("sek.abc")
+        );
     }
 }

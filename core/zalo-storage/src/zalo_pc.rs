@@ -49,6 +49,47 @@ pub fn zalo_pc_index_db(config_home: &Path, uid: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Discovers an official Zalo Desktop `Index.db` on the current OS (Linux XDG,
+/// Windows `%LOCALAPPDATA%\ZaloPC` / `%APPDATA%\ZaloData`, or macOS
+/// `~/Library/Application Support/ZaloData`).
+pub fn zalo_pc_index_db_default(uid: &str) -> Option<PathBuf> {
+    if uid.is_empty() || !uid.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for var in ["APPDATA", "LOCALAPPDATA"] {
+            if let Some(base) = std::env::var_os(var).map(PathBuf::from) {
+                if let Some(found) = zalo_pc_index_db(&base, uid) {
+                    return Some(found);
+                }
+                let legacy = base
+                    .join("ZaloPC")
+                    .join(uid)
+                    .join("Core")
+                    .join("Index.db");
+                if legacy.is_file() {
+                    return Some(legacy);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = PathBuf::from(std::env::var_os("HOME")?);
+        zalo_pc_index_db(&home.join("Library").join("Application Support"), uid)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        zalo_pc_index_db(&config, uid)
+    }
+}
+
 /// Friends as Zalo PC lists them in Contacts: `isFr = 1`, `isValid = 1`,
 /// `type = 0`, without the account itself.
 ///
@@ -75,13 +116,17 @@ fn with_copied_index<T>(
     prefix: &str,
     read: impl FnOnce(&Path) -> Result<T, StorageError>,
 ) -> Result<T, StorageError> {
-    let scratch = std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+    static NEXT_COPY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = NEXT_COPY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scratch = std::env::temp_dir().join(format!("{prefix}-{}-{seq}", std::process::id()));
     std::fs::create_dir_all(&scratch)?;
     let result = (|| {
         let copy = scratch.join("Index.db");
         std::fs::copy(index_db, &copy)?;
         for suffix in ["-wal", "-shm"] {
-            let side = PathBuf::from(format!("{}{suffix}", index_db.display()));
+            let mut side = index_db.as_os_str().to_os_string();
+            side.push(suffix);
+            let side = PathBuf::from(side);
             if side.is_file() {
                 std::fs::copy(&side, scratch.join(format!("Index.db{suffix}")))?;
             }

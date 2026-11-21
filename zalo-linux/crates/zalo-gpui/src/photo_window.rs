@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::data::ChatMsg;
@@ -168,7 +168,7 @@ struct PhotoView {
 
 struct VideoPump {
     stop: Arc<AtomicBool>,
-    pid: Arc<AtomicU32>,
+    audio: Option<crate::audio_play::AudioHandle>,
     id: u64,
 }
 
@@ -608,44 +608,53 @@ impl PhotoView {
             self.note = Some("Video chưa có trên máy".to_owned());
             return;
         };
-        // Frames only: ffmpeg is not on this machine for the current account,
-        // so a missing binary keeps the external player (with sound).
-        if ffmpeg_on_path() && self.start_video(path.clone(), cx) {
-            return;
-        }
-        if self.mute_video && spawn_muted(&path) {
-            self.note = Some("Đang phát video (tắt tiếng)".to_owned());
+        if self.start_video(path.clone(), cx) {
             return;
         }
         cx.open_with_system(&path);
-        self.note = Some("Đang mở video".to_owned());
+        self.note = Some("Đang mở video bằng trình phát hệ thống".to_owned());
     }
 
     fn stop_video(&mut self) {
         if let Some(pump) = self.video_pump.take() {
             pump.stop.store(true, Ordering::Relaxed);
-            end_pid(pump.pid.load(Ordering::Relaxed));
+            if let Some(audio) = pump.audio {
+                audio.stop();
+            }
         }
     }
 
-    /// Start a silent in-frame decode. `false` when ffmpeg did not spawn.
+    /// Start native in-frame H.264 MP4 decode (+ in-process audio when unmuted).
+    /// Returns `false` when the container/codec is not an H.264 MP4.
     fn start_video(&mut self, path: PathBuf, cx: &mut Context<Self>) -> bool {
+        if crate::video::open_h264_mp4(&path).is_none() {
+            return false;
+        }
         self.video_seq = self.video_seq.wrapping_add(1);
         let id = self.video_seq;
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(Mutex::new(VecDeque::new()));
-        let pid = Arc::new(AtomicU32::new(0));
-        if !spawn_ffmpeg_frames(&path, stop.clone(), frames.clone(), pid.clone()) {
+        if !spawn_mp4_frames(&path, stop.clone(), frames.clone()) {
             return false;
         }
+        let audio = if self.mute_video {
+            None
+        } else {
+            crate::audio_play::play_file(path, None, false, None).ok()
+        };
+        let muted = audio.is_none();
         self.video_pump = Some(VideoPump {
             stop: stop.clone(),
-            pid,
+            audio,
             id,
         });
-        self.note = Some("Đang phát trong khung (không tiếng)".to_owned());
+        self.note = Some(if muted {
+            "Đang phát trong khung (tắt tiếng)".to_owned()
+        } else {
+            "Đang phát trong khung".to_owned()
+        });
         cx.spawn(async move |this, cx| loop {
-            gpui::Timer::after(std::time::Duration::from_millis(80)).await;
+            gpui::Timer::after(std::time::Duration::from_millis(33)).await;
             let queue = frames.clone();
             let stopped = stop.load(Ordering::Relaxed);
             let alive = this
@@ -1580,137 +1589,86 @@ fn video_file(msg: &ChatMsg) -> Option<PathBuf> {
         })
 }
 
-fn spawn_muted(path: &Path) -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    std::process::Command::new("ffplay")
-        .args(["-an", "-autoexit", "-loglevel", "quiet"])
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .is_ok()
-}
-
-fn ffmpeg_on_path() -> bool {
-    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ONCE.get_or_init(|| {
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    })
-}
-
-fn end_pid(pid: u32) {
-    if pid == 0 {
-        return;
-    }
-    let _ = std::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-/// PNG stream from `ffmpeg -f image2pipe`. Returns false when the process
-/// did not start. The child is killed when `stop` flips.
-fn spawn_ffmpeg_frames(
+/// Native in-process MP4 H.264 frame pump using `mp4` + `openh264` (zero `ffmpeg`/`ffplay`/`kill`).
+fn spawn_mp4_frames(
     path: &Path,
     stop: Arc<AtomicBool>,
     frames: Arc<Mutex<VecDeque<Arc<RenderImage>>>>,
-    pid: Arc<AtomicU32>,
 ) -> bool {
     let path = path.to_path_buf();
     std::thread::Builder::new()
         .name("zalo-video".into())
         .spawn(move || {
-            let mut child = match std::process::Command::new("ffmpeg")
-                .args(["-hide_banner", "-loglevel", "error", "-an", "-i"])
-                .arg(&path)
-                .args([
-                    "-vf",
-                    "scale=480:-2",
-                    "-r",
-                    "8",
-                    "-f",
-                    "image2pipe",
-                    "-vcodec",
-                    "png",
-                    "pipe:1",
-                ])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(child) => child,
-                Err(_) => {
-                    stop.store(true, Ordering::Relaxed);
-                    return;
-                }
-            };
-            pid.store(child.id(), Ordering::Relaxed);
-            let Some(mut stdout) = child.stdout.take() else {
-                let _ = child.kill();
+            let Some((mut reader, track_id, sps, pps, timescale, sample_count)) =
+                crate::video::open_h264_mp4(&path)
+            else {
                 stop.store(true, Ordering::Relaxed);
                 return;
             };
-            let mut buf = Vec::new();
-            let mut tmp = [0_u8; 8192];
-            loop {
+            let Ok(mut decoder) = openh264::decoder::Decoder::new() else {
+                stop.store(true, Ordering::Relaxed);
+                return;
+            };
+            use openh264::formats::YUVSource;
+            let started = std::time::Instant::now();
+            for idx in 1..=sample_count {
                 if stop.load(Ordering::Relaxed) {
-                    let _ = child.kill();
                     break;
                 }
-                match std::io::Read::read(&mut stdout, &mut tmp) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&tmp[..n]);
-                        for frame in take_png_frames(&mut buf) {
-                            if let Some(image) = png_frame(&frame) {
-                                if let Ok(mut queue) = frames.lock() {
-                                    queue.push_back(image);
-                                    while queue.len() > 3 {
-                                        queue.pop_front();
-                                    }
-                                }
-                            }
+                let Ok(Some(sample)) = reader.read_sample(track_id, idx) else {
+                    break;
+                };
+                // Pace frame delivery to match real MP4 presentation time.
+                let pts_ms = sample
+                    .start_time
+                    .saturating_mul(1_000)
+                    / u64::from(timescale);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if pts_ms > elapsed_ms + 5 {
+                    let wait = (pts_ms - elapsed_ms).min(250);
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                let annex_b = if idx == 1 || sample.is_sync {
+                    crate::video::avcc_to_annex_b(&sample.bytes, Some(&sps), Some(&pps))
+                } else {
+                    crate::video::avcc_to_annex_b(&sample.bytes, None, None)
+                };
+                let Ok(Some(yuv)) = decoder.decode(&annex_b) else {
+                    continue;
+                };
+                let (w, h) = yuv.dimensions();
+                if w == 0 || h == 0 {
+                    continue;
+                }
+                let bgra = crate::call_video::yuv_to_bgra(&yuv, w, h);
+                let (sw, sh) = (w as u32, h as u32);
+                let max_edge = 960_u32;
+                let (dw, dh, out_bgra) = if sw.max(sh) > max_edge {
+                    let (nw, nh) = if sw >= sh {
+                        (max_edge, ((u64::from(sh) * u64::from(max_edge)) / u64::from(sw)).max(2) as u32)
+                    } else {
+                        (((u64::from(sw) * u64::from(max_edge)) / u64::from(sh)).max(2) as u32, max_edge)
+                    };
+                    (nw, nh, crate::call_video::scale_bgra_bilinear(&bgra, sw, sh, nw, nh))
+                } else {
+                    (sw, sh, bgra)
+                };
+                if let Some(buf) = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_raw(dw, dh, out_bgra) {
+                    let image = Arc::new(RenderImage::new([image::Frame::new(buf)]));
+                    if let Ok(mut queue) = frames.lock() {
+                        queue.push_back(image);
+                        while queue.len() > 3 {
+                            queue.pop_front();
                         }
                     }
                 }
             }
-            let _ = child.wait();
             stop.store(true, Ordering::Relaxed);
         })
         .is_ok()
-}
-
-/// Split a PNG byte stream on the IEND chunk. Incomplete tail stays in `buf`.
-fn take_png_frames(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    const END: &[u8] = &[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
-    let mut out = Vec::new();
-    loop {
-        let Some(pos) = buf.windows(END.len()).position(|window| window == END) else {
-            break;
-        };
-        let end = pos + END.len();
-        out.push(buf.drain(..end).collect());
-    }
-    out
-}
-
-fn png_frame(bytes: &[u8]) -> Option<Arc<RenderImage>> {
-    let rgba = crate::media::decode_rgba(bytes, 480)?;
-    Some(Arc::new(RenderImage::new([image::Frame::new(
-        crate::media::rgba_to_bgra(rgba),
-    )])))
 }
 
 impl Drop for PhotoView {
@@ -1798,22 +1756,5 @@ mod tests {
         let (_, month, day) = crate::data::vn_ymd(older);
         assert_eq!(filmstrip_day(older, now), format!("{day:02}/{month:02}"));
         assert!(filmstrip_day(0, now).is_empty());
-    }
-
-    #[test]
-    fn png_stream_splits_on_iend_and_keeps_the_tail() {
-        let end = [
-            0_u8, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
-        ];
-        let mut buf = b"one".to_vec();
-        buf.extend_from_slice(&end);
-        buf.extend_from_slice(b"two");
-        buf.extend_from_slice(&end);
-        buf.extend_from_slice(b"tail");
-        let frames = take_png_frames(&mut buf);
-        assert_eq!(frames.len(), 2);
-        assert!(frames[0].starts_with(b"one"));
-        assert!(frames[1].starts_with(b"two"));
-        assert_eq!(buf, b"tail");
     }
 }

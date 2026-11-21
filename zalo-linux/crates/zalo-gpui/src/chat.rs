@@ -16,6 +16,30 @@ use crate::shell::ShellView;
 use crate::widgets::tip;
 use crate::window_frame::CsdCorners;
 
+/// Clipboard pastes are stored as `zalo-gpui-paste-<ms>.<ext>`. The chip shows
+/// the picture, not that temporary name.
+#[must_use]
+pub(crate) fn pending_chip_label(file_name: &str) -> String {
+    if file_name.starts_with("zalo-gpui-paste-") {
+        "Ảnh".to_owned()
+    } else {
+        file_name.to_owned()
+    }
+}
+
+/// Electron header: count plus `STR_PHOTO_LOWER` / `STR_PHOTOS_LOWER` (`ảnh$0$`).
+/// `$0$` is a comma only when files are attached too. This tray is photos only.
+#[must_use]
+pub(crate) fn preview_count_label(n: usize) -> String {
+    let key = if n == 1 {
+        "STR_PHOTO_LOWER"
+    } else {
+        "STR_PHOTOS_LOWER"
+    };
+    let word = str_vi(key, "ảnh").replace("$0$", "");
+    format!("{n} {word}")
+}
+
 /// Saved wallpaper is used only when the user picked a file on this machine.
 #[must_use]
 pub(crate) fn wallpaper_file<'a>(mode: &str, path: &'a str) -> Option<&'a str> {
@@ -28,7 +52,7 @@ pub(crate) fn wallpaper_file<'a>(mode: &str, path: &'a str) -> Option<&'a str> {
 
 #[cfg(test)]
 mod wallpaper_tests {
-    use super::wallpaper_file;
+    use super::{pending_chip_label, preview_count_label, wallpaper_file};
 
     #[test]
     fn only_a_picked_file_is_a_wallpaper() {
@@ -38,6 +62,13 @@ mod wallpaper_tests {
         assert_eq!(wallpaper_file("paper", "/tmp/a.png"), None);
         assert_eq!(wallpaper_file("avatar", "/tmp/a.png"), None);
         assert_eq!(wallpaper_file("mist", ""), None);
+        assert_eq!(
+            pending_chip_label("zalo-gpui-paste-12.png"),
+            "Ảnh"
+        );
+        assert_eq!(pending_chip_label("hop-dong.pdf"), "hop-dong.pdf");
+        assert_eq!(preview_count_label(1), "1 ảnh");
+        assert_eq!(preview_count_label(2), "2 ảnh");
         assert_eq!(wallpaper_file("ink", ""), None);
     }
 }
@@ -382,7 +413,7 @@ impl ShellView {
                 .map(|n| n as usize)
                 .unwrap_or_else(|| self.members_of(row).len().max(1))
         });
-        let photo = conv.and_then(|row| self.avatar_of(&row.thread_id));
+        let photo = conv.and_then(|row| self.shown_photo(&row.thread_id));
         let cloud = conv.is_some_and(|row| {
             crate::shell::is_my_documents(&row.name, &row.thread_id, self.send2me_id.as_deref())
         });
@@ -667,6 +698,8 @@ impl ShellView {
             .as_ref()
             .filter(|msg| conv_id == Some(msg.conv));
         let round_br = (!self.info_open || self.info_overlay) && !self.msg_search_open;
+        let draft_ready = !self.pending_photos.is_empty()
+            || !self.composer.read(cx).text().trim().is_empty();
         corners
             .apply(
                 div()
@@ -687,9 +720,6 @@ impl ShellView {
             .when_some(self.mention_strip(cx), |el, strip| el.child(strip))
             .when_some(self.format_strip(cx), |el, strip| el.child(strip))
             .when_some(reply, |el, msg| el.child(self.reply_bar(msg, cx)))
-            .when_some(self.pending_photo.clone(), |el, path| {
-                el.child(self.pending_bar(&path, cx))
-            })
             .when(self.voice_rec.is_some(), |el| {
                 el.child(self.voice_record_bar(cx))
             })
@@ -834,21 +864,42 @@ impl ShellView {
                             fonts::icon_el(ic::TB_EMOJI, "☺", 18.).into_any_element(),
                             "Biểu cảm",
                             cx,
-                            false,
+                            ComposerSide::Emoji,
                         )
                         .ml(px(4.)),
                     )
                     .child(
                         self.input_btn(
-                            "cmp-like",
-                            like_el(20.),
-                            "Gửi nhanh biểu tượng cảm xúc",
+                            if draft_ready { "cmp-send" } else { "cmp-like" },
+                            if draft_ready {
+                                fonts::fa_icon(
+                                    fonts::FA_PAPER_PLANE,
+                                    "➤",
+                                    18.,
+                                    token_rgb("--B55", "#0068ff"),
+                                )
+                                .into_any_element()
+                            } else {
+                                like_el(20.)
+                            },
+                            if draft_ready {
+                                str_vi("STR_SEND", "Gửi")
+                            } else {
+                                "Gửi nhanh biểu tượng cảm xúc"
+                            },
                             cx,
-                            true,
+                            if draft_ready {
+                                ComposerSide::Send
+                            } else {
+                                ComposerSide::Like
+                            },
                         )
                         .ml(px(6.)),
                     ),
             )
+            .when(!self.pending_photos.is_empty(), |el| {
+                el.child(self.photo_tray(cx))
+            })
     }
 
     /// `.chat-input-link-preview`: 64 px thumb, title, description, site, close.
@@ -951,85 +1002,245 @@ impl ShellView {
             )
     }
 
-    /// Screenshot / picked photo waiting to be sent (Enter sends, × drops).
-    fn pending_bar(&self, path: &std::path::Path, cx: &mut Context<Self>) -> impl IntoElement {
+    /// `.input-preview-area` under `#chatInput`. Enter and the send arrow send the tray.
+    fn photo_tray(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let n = self.pending_photos.len();
+        let label = preview_count_label(n);
+        let (count, word) = label.split_once(' ').unwrap_or(("1", "ảnh"));
+        let count = count.to_owned();
+        let word = word.to_owned();
+        let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("ảnh")
-            .to_owned();
+        let border = rgb(token_rgb("--border", "#d9d9d9"));
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(8.))
+            .w_full();
+        for (index, thumb) in self.pending_thumbs.clone().into_iter().enumerate() {
+            row = row.child(self.preview_thumb(index, thumb, cx));
+        }
+        row = row.child(self.preview_add(cx));
         div()
-            .id("pending-photo")
+            .id("input-preview-area")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .px(px(12.))
+            .pb(px(12.))
+            .border_t_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .mt(px(8.))
+                    .mb(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(3.))
+                            .min_w(px(0.))
+                            .text_size(px(14.))
+                            .line_height(px(20.))
+                            .text_color(rgb(ink))
+                            .child(div().font_family(FAMILY_SEMIBOLD).child(count))
+                            .child(word),
+                    )
+                    .child(
+                        div()
+                            .id("preview-remove-all")
+                            .flex_none()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
+                            .text_color(rgb(muted))
+                            .cursor_pointer()
+                            .hover(|st| {
+                                st.text_color(rgb(token_rgb(
+                                    "--button-tertiary-primary-focus-text",
+                                    "#005ae0",
+                                )))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_pending_photo();
+                                cx.notify();
+                            }))
+                            .child(str_vi("STR_REMOVE_ALL", "Xoá tất cả")),
+                    ),
+            )
+            .child(row)
+            .when(self.caption_edit.is_some(), |el| {
+                el.child(self.caption_editor(cx))
+            })
+    }
+
+    /// One 72 px thumb with Electron's pencil and trash at the top-right.
+    fn preview_thumb(
+        &self,
+        index: usize,
+        thumb: Option<std::sync::Arc<gpui::RenderImage>>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let border = rgb(token_rgb("--border", "#d9d9d9"));
+        let subtle = rgb(token_rgb("--layer-background-subtle", "#ebecf0"));
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let caption = self
+            .pending_captions
+            .get(index)
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        let edit_tip = str_vi(
+            "STR_INPUT_PREVIEW_EDIT_PHOTO_CAPTION",
+            "Chỉnh sửa mô tả ảnh",
+        );
+        let del_tip = str_vi("STR_INPUT_PREVIEW_DELETE_IMAGE", "Xoá ảnh");
+        let mut cell = div()
+            .id(("preview-thumb", index as u64))
+            .relative()
+            .size(px(72.))
+            .flex_none()
+            .rounded(px(4.))
+            .overflow_hidden()
+            .border_1()
+            .border_color(border)
+            .bg(subtle);
+        if let Some(image) = thumb {
+            cell = cell.child(img(image).size(px(72.)).object_fit(ObjectFit::Cover));
+        }
+        if let Some(text) = caption {
+            cell = cell.child(
+                div()
+                    .absolute()
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .px(px(4.))
+                    .py(px(2.))
+                    .bg(gpui::hsla(0., 0., 0., 0.55))
+                    .text_size(px(11.))
+                    .line_height(px(14.))
+                    .text_color(rgb(0xffffff))
+                    .truncate()
+                    .child(text),
+            );
+        }
+        cell.child(
+            div()
+                .absolute()
+                .top(px(4.))
+                .right(px(4.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.))
+                .p(px(2.))
+                .rounded(px(3.))
+                .bg(rgb(0xffffff))
+                .child(preview_action(
+                    ("preview-edit", index as u64),
+                    ic::EDIT_PHOTO,
+                    "✎",
+                    edit_tip,
+                    ink,
+                    cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if event.standard_click() {
+                            this.begin_caption_edit(index, window, cx);
+                            cx.notify();
+                        }
+                    }),
+                ))
+                .child(preview_action(
+                    ("preview-trash", index as u64),
+                    ic::TRASH_LINE,
+                    "🗑",
+                    del_tip,
+                    ink,
+                    cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        if event.standard_click() {
+                            this.remove_pending_photo(index);
+                            cx.notify();
+                        }
+                    }),
+                )),
+        )
+    }
+
+    /// Caption field opened by the pencil on one pending photo.
+    fn caption_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let blue = token_rgb("--B55", "#0068ff");
+        div()
+            .id("preview-caption-edit")
+            .mt(px(8.))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(12.))
-            .px(px(16.))
-            .py(px(8.))
-            .border_t_1()
-            .border_color(crate::color::border_subtle())
-            .when_some(self.pending_thumb.clone(), |el, thumb| {
-                el.child(
-                    img(thumb)
-                        .h(px(64.))
-                        .max_w(px(120.))
-                        .rounded(px(4.))
-                        .object_fit(ObjectFit::Contain),
-                )
-            })
+            .gap(px(8.))
+            .w_full()
             .child(
                 div()
-                    .flex()
-                    .flex_col()
                     .flex_1()
                     .min_w(px(0.))
-                    .child(div().text_size(px(14.)).truncate().child(name))
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(muted))
-                            .child("Nhập chú thích rồi nhấn Enter để gửi ảnh"),
-                    ),
+                    .h(px(32.))
+                    .child(self.caption_input.clone()),
             )
             .child(
                 div()
-                    .id("pending-send")
-                    .px(px(12.))
-                    .h(px(32.))
+                    .id("preview-caption-done")
+                    .flex_none()
+                    .px(px(8.))
+                    .h(px(28.))
                     .flex()
                     .items_center()
                     .rounded(px(4.))
-                    .bg(rgb(token_rgb("--B55", "#0068ff")))
-                    .text_color(rgb(0xffffff))
+                    .cursor_pointer()
+                    .text_size(px(13.))
                     .font_family(FAMILY_SEMIBOLD)
-                    .text_size(px(14.))
-                    .cursor_pointer()
+                    .text_color(rgb(blue))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        let caption = this.composer.read(cx).text();
-                        this.send_draft(&caption, cx);
-                        this.composer.update(cx, |input, cx| input.clear(cx));
+                        this.commit_caption_edit(cx);
+                        this.caption_edit = None;
                         cx.notify();
                     }))
-                    .child("Gửi"),
+                    .child("Xong"),
             )
-            .child(
-                div()
-                    .id("pending-drop")
-                    .size(px(28.))
-                    .rounded(px(14.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.clear_pending_photo();
-                        this.note = None;
-                        cx.notify();
-                    }))
-                    .child("×"),
-            )
+    }
+
+    /// `.add-more-item`: 72×72, 2 px dashed, Plus_24 at 32 px.
+    fn preview_add(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let border = rgb(token_rgb("--border", "#d9d9d9"));
+        let subtle = rgb(token_rgb("--layer-background-subtle", "#ebecf0"));
+        let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+        let title = str_vi("STR_ADD_MORE_MEDIA_TITLE", "Đính kèm thêm ảnh/file");
+        div()
+            .id("preview-add")
+            .size(px(72.))
+            .flex_none()
+            .rounded(px(4.))
+            .border_2()
+            .border_dashed()
+            .border_color(border)
+            .bg(subtle)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|st| st.bg(rgb(hover)))
+            .tooltip(move |_, cx| tip(title, cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.pick_and_attach(true);
+                cx.notify();
+            }))
+            .child(fonts::icon_el(ic::PLUS_24, "+", 48.))
     }
 
     #[allow(dead_code)]
@@ -1078,7 +1289,7 @@ impl ShellView {
         content: gpui::AnyElement,
         label: &'static str,
         cx: &mut Context<Self>,
-        like: bool,
+        side: ComposerSide,
     ) -> gpui::Stateful<gpui::Div> {
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
         div()
@@ -1094,13 +1305,19 @@ impl ShellView {
             .hover(|st| st.bg(rgb(hover)))
             .tooltip(move |_, cx| tip(label, cx))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if like {
-                    this.send_draft("👍", cx);
-                } else {
-                    this.sticker_open = !this.sticker_open;
-                    this.sticker_tab = crate::stickers::StickerTab::Emoji;
-                    if this.sticker_open {
-                        this.ensure_sticker_data(cx);
+                match side {
+                    ComposerSide::Like => this.send_draft("👍", cx),
+                    ComposerSide::Send => {
+                        let text = this.composer.read(cx).text();
+                        this.send_draft(&text, cx);
+                        this.composer.update(cx, |input, cx| input.clear(cx));
+                    }
+                    ComposerSide::Emoji => {
+                        this.sticker_open = !this.sticker_open;
+                        this.sticker_tab = crate::stickers::StickerTab::Emoji;
+                        if this.sticker_open {
+                            this.ensure_sticker_data(cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -1193,6 +1410,13 @@ impl ShellView {
             }))
             .child(fonts::icon_el(code, fallback, 18.))
     }
+}
+
+#[derive(Clone, Copy)]
+enum ComposerSide {
+    Emoji,
+    Like,
+    Send,
 }
 
 #[derive(Clone, Copy)]
@@ -1620,7 +1844,9 @@ impl ShellView {
             .rev()
             .find(|m| m.from_me && !m.recalled)
             .map(|m| m.id);
-        for (i, msg) in msgs.iter().enumerate() {
+        let mut i = 0;
+        while i < msgs.len() {
+            let msg = &msgs[i];
             let day = (msg.at_ms > 0).then(|| data::vn_day(msg.at_ms));
             let new_day = day != last_day;
             if new_day {
@@ -1632,21 +1858,39 @@ impl ShellView {
                 items.push(date_chip(&chip).into_any_element());
                 last_day = day;
             }
+            let album_end = data::photo_album_end(msgs, i);
+            let span = if album_end > i + 1 { album_end } else { i + 1 };
+            let head = &msgs[i];
+            let tail = &msgs[span - 1];
             let prev = if new_day {
                 None
             } else {
                 i.checked_sub(1).and_then(|j| msgs.get(j))
             };
-            let next = msgs.get(i + 1);
-            let first = prev.is_none_or(|p| !same_block(p, msg));
-            let last = next.is_none_or(|n| !same_block(msg, n));
-            let first = first || i == 0;
-            let status_pill = (row.live && msg.from_me && Some(msg.id) == last_own_id)
-                .then(|| self.outgoing_status(row, msg));
-            items.push(self.bubble(msg.clone(), is_group, first, last, status_pill, cx));
+            let next = msgs.get(span);
+            let first = prev.is_none_or(|p| !same_block(p, head)) || i == 0;
+            let last = next.is_none_or(|n| !same_block(tail, n));
+            let shown = tail.clone();
+            let status_pill = (row.live && shown.from_me && Some(shown.id) == last_own_id)
+                .then(|| self.outgoing_status(row, &shown));
+            let album: Vec<ChatMsg> = if span > i + 1 {
+                msgs[i..span].to_vec()
+            } else {
+                Vec::new()
+            };
+            items.push(self.bubble(
+                shown,
+                is_group,
+                first,
+                last,
+                status_pill,
+                &album,
+                cx,
+            ));
+            i = span;
         }
-        // The like button hangs 12px under the card. Scroll padding does not
-        // extend the scroll extent, so the last bubble sat on the composer.
+        // Scroll padding does not extend the scroll extent, so the last
+        // bubble sat on the composer. Keep a gap under the last card.
         if !msgs.is_empty() {
             items.push(div().h(px(48.)).w_full().flex_none().into_any_element());
         }
@@ -1888,6 +2132,7 @@ impl ShellView {
         first: bool,
         last: bool,
         status_pill: Option<OutgoingStatus>,
+        album: &[ChatMsg],
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let ink = token_rgb("--text-primary", "#081b3a");
@@ -1916,7 +2161,11 @@ impl ShellView {
         let bare = matches!(msg.kind, MsgKind::Sticker | MsgKind::Gif) && !msg.recalled;
         let quote_box = self.quote_card(&msg, media, cx);
         let has_quote = quote_box.is_some();
-        let body = self.bubble_body(&msg, fill, ink, muted, cx);
+        let body = if album.len() > 1 {
+            self.album_body(album, ink, cx)
+        } else {
+            self.bubble_body(&msg, fill, ink, muted, cx)
+        };
         let show_sender = is_group && !msg.from_me && first;
         let urgency = self.urgency_msgs.get(&row_id).copied().unwrap_or(0);
         let group = SharedString::from(format!("bubble-{row_id}"));
@@ -2039,8 +2288,8 @@ impl ShellView {
         let react = div()
             .id(("react", row_id))
             .absolute()
-            .right(px(-8.))
-            .bottom(px(-12.))
+            .right(px(4.))
+            .bottom(px(4.))
             .h(px(24.))
             .min_w(px(24.))
             .when(has_reacts, |el| el.px(px(6.)))
@@ -2168,7 +2417,11 @@ impl ShellView {
             .when(!msg.from_me, |el| {
                 el.justify_start().pr(px(48.)).child(
                     div().flex_none().w(px(40.)).mr(px(10.)).when(first, |el| {
-                        el.child(small_avatar(&msg.sender, self.avatar_of(&msg.sender_uid)))
+                        el.child(small_avatar(
+                            &msg.sender,
+                            &msg.sender_uid,
+                            self.shown_photo(&msg.sender_uid),
+                        ))
                     }),
                 )
             })
@@ -3861,6 +4114,77 @@ impl ShellView {
             .when_some(date_popover, |d, pop| d.child(pop))
     }
 
+    /// One Electron `.card--group-photo`: cells in a row, caption once underneath.
+    fn album_body(
+        &self,
+        album: &[ChatMsg],
+        ink: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        const MAX_W: f32 = 400.0;
+        const GAP: f32 = 2.0;
+        let cols = if album.len() <= 4 { album.len() } else { 3 };
+        let cols = cols.max(1);
+        let cell_w = ((MAX_W - GAP * (cols as f32 - 1.0)) / cols as f32).max(72.0);
+        let cell_h = if cols >= 4 { 110.0 } else { 140.0 };
+        let field = token_rgb("--layer-background-subtle", "#ebecf0");
+        let mut col = div().flex().flex_col().gap(px(GAP)).flex_none();
+        for chunk in album.chunks(cols) {
+            let mut row = div().flex().flex_row().gap(px(GAP)).flex_none();
+            for msg in chunk {
+                row = row.child(self.album_cell(msg, cell_w, cell_h, field, cx));
+            }
+            col = col.child(row);
+        }
+        let caption = album_caption(album);
+        if !caption.is_empty() {
+            col = col.child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .max_w(px(MAX_W))
+                    .text_size(px(14.))
+                    .line_height(px(20.))
+                    .text_color(rgb(ink))
+                    .child(caption),
+            );
+        }
+        col.into_any_element()
+    }
+
+    fn album_cell(
+        &self,
+        msg: &ChatMsg,
+        w: f32,
+        h: f32,
+        field: u32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let open = msg.clone();
+        let image = self.media_bitmaps.get(&msg.id).cloned();
+        div()
+            .id(("album-cell", msg.id))
+            .w(px(w))
+            .h(px(h))
+            .flex_none()
+            .overflow_hidden()
+            .rounded(px(4.))
+            .bg(rgb(field))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_viewer(open.clone(), window, cx);
+                cx.notify();
+            }))
+            .when_some(image, |el, image| {
+                el.child(
+                    img(image)
+                        .w(px(w))
+                        .h(px(h))
+                        .object_fit(ObjectFit::Cover),
+                )
+            })
+    }
+
     fn bubble_body(
         &self,
         msg: &ChatMsg,
@@ -5354,6 +5678,44 @@ fn peek_cover(group: &SharedString, fill: u32) -> gpui::AnyElement {
         .into_any_element()
 }
 
+fn album_caption(album: &[ChatMsg]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for msg in album {
+        let text = msg.text.trim();
+        if text.is_empty() || media::hide_marker_text(MsgKind::Photo, text) {
+            continue;
+        }
+        if !lines.iter().any(|line| line == text) {
+            lines.push(text.to_owned());
+        }
+    }
+    lines.join("\n")
+}
+
+fn preview_action(
+    id: (&'static str, u64),
+    glyph: char,
+    fallback: &'static str,
+    label: &'static str,
+    ink: u32,
+    click: impl Fn(&ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(20.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .cursor_pointer()
+        .text_color(rgb(ink))
+        .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
+        .tooltip(move |_, cx| tip(label, cx))
+        .on_click(click)
+        .child(fonts::icon_el(glyph, fallback, 14.))
+}
+
 /// Zalo's yellow like at `size` px, or a text fallback.
 fn like_el(size: f32) -> gpui::AnyElement {
     match media::like_icon() {
@@ -5430,7 +5792,11 @@ fn receipt_name(text: &str, color: u32) -> gpui::AnyElement {
 }
 
 /// 40 px peer avatar beside the first bubble of a block.
-fn small_avatar(name: &str, photo: Option<std::sync::Arc<gpui::RenderImage>>) -> gpui::AnyElement {
+fn small_avatar(
+    name: &str,
+    uid: &str,
+    photo: Option<std::sync::Arc<gpui::RenderImage>>,
+) -> gpui::AnyElement {
     if let Some(p) = photo {
         return img(p)
             .size(px(40.))
@@ -5438,21 +5804,12 @@ fn small_avatar(name: &str, photo: Option<std::sync::Arc<gpui::RenderImage>>) ->
             .object_fit(ObjectFit::Cover)
             .into_any_element();
     }
-    let initial = name.chars().next().unwrap_or('?').to_string();
-    div()
-        .size(px(40.))
-        .rounded(px(20.))
-        .bg(rgb(token_rgb("--B55", "#0068ff")))
-        .border_1()
-        .border_color(crate::color::border_subtle())
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(rgb(0xffffff))
-        .text_size(px(16.))
-        .font_family(FAMILY_SEMIBOLD)
-        .child(initial)
-        .into_any_element()
+    crate::sidebar::letter_disc(
+        &crate::sidebar::avatar_initials(name),
+        crate::sidebar::avatar_color(uid),
+        40.,
+    )
+    .into_any_element()
 }
 
 /// Theme-aware `--timestamp` pill background (Electron: `rgba(0,0,0,0.2)` light,
@@ -5555,13 +5912,26 @@ impl ShellView {
         let has_prev = members.is_some() || activity.is_some();
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
     let blue = token_rgb("--B55", "#0068ff");
-    let (name, initial) = match conv {
+    let (name, initial, fill) = match conv {
         Some(row) => (
             row.name.clone(),
-            row.name.chars().next().unwrap_or('?').to_string(),
+            crate::sidebar::avatar_initials(&row.name),
+            if row.is_group {
+                0x0068ff
+            } else {
+                crate::sidebar::avatar_color(&row.thread_id)
+            },
         ),
-        None => ("Zalo".to_owned(), "Z".to_owned()),
+        None => ("Zalo".to_owned(), "Z".to_owned(), 0x0068ff),
     };
+    let is_group = conv.is_some_and(|row| row.is_group);
+    let faces = if is_group && photo.is_none() && !cloud {
+        conv.map(|row| self.group_collage_faces(&row.thread_id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let paint = crate::sidebar::avatar_paint(is_group, photo.is_some(), cloud, faces.len());
     div()
         .flex()
         .flex_row()
@@ -5572,15 +5942,17 @@ impl ShellView {
                 .relative()
                 .size(px(48.))
                 .flex_none()
-                .when_some(photo.clone(), |el, p| {
-                    el.child(
-                        img(p)
-                            .size(px(48.))
-                            .rounded(px(24.))
-                            .object_fit(ObjectFit::Cover),
-                    )
+                .when(paint == crate::sidebar::AvatarPaint::Photo, |el| {
+                    el.when_some(photo.clone(), |el, p| {
+                        el.child(
+                            img(p)
+                                .size(px(48.))
+                                .rounded(px(24.))
+                                .object_fit(ObjectFit::Cover),
+                        )
+                    })
                 })
-                .when(photo.is_none() && cloud, |el| {
+                .when(paint == crate::sidebar::AvatarPaint::Cloud, |el| {
                     el.child(
                         div()
                             .size(px(48.))
@@ -5593,22 +5965,14 @@ impl ShellView {
                             .child(fonts::icon_el(ic::DOCS_ON, "☁", 32.)),
                     )
                 })
-                .when(photo.is_none() && !cloud, |el| {
-                    el.child(
-                        div()
-                            .size(px(48.))
-                            .rounded(px(24.))
-                            .bg(rgb(blue))
-                            .border_1()
-                            .border_color(crate::color::border_subtle())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_color(rgb(0xffffff))
-                            .text_size(px(18.))
-                            .font_family(FAMILY_SEMIBOLD)
-                            .child(initial),
-                    )
+                .when(paint == crate::sidebar::AvatarPaint::Collage, |el| {
+                    el.child(crate::sidebar::group_collage(&faces, 48.))
+                })
+                .when(paint == crate::sidebar::AvatarPaint::GroupMark, |el| {
+                    el.child(crate::sidebar::group_mark(48.))
+                })
+                .when(paint == crate::sidebar::AvatarPaint::Letter, |el| {
+                    el.child(crate::sidebar::letter_disc(&initial, fill, 48.))
                 })
                 .when(online, |el| {
                     el.child(

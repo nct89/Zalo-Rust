@@ -263,6 +263,10 @@ enum MenuAction {
     CallPhone(String),
     /// Look the number up, then send a friend request. Does not print it.
     AddFriendPhone(String),
+    /// In-app export dialog. Does not open a folder picker.
+    OpenPcExport,
+    /// In-app import dialog. Does not open a file picker.
+    OpenPcImport,
 }
 
 fn menu_width(kind: &MenuKind) -> f32 {
@@ -1332,6 +1336,8 @@ impl ShellView {
             MenuAction::About => {
                 self.set_note("Zalo cho Linux theo Zalo PC 26.10.10");
             }
+            MenuAction::OpenPcExport => self.open_pc_export(cx),
+            MenuAction::OpenPcImport => self.open_pc_import(cx),
         }
     }
 
@@ -1955,6 +1961,8 @@ fn gear_rows(logged_in: bool, english: bool) -> Vec<Row> {
                     str_vi("STR_RESOURCE_MANAGE", "Quản lý dữ liệu"),
                     MenuAction::OpenSettingsPage(crate::settings::SettingsPage::Data),
                 ),
+                item(str_vi("STR_EXPORT", "Xuất dữ liệu"), MenuAction::OpenPcExport),
+                item(str_vi("STR_IMPORT", "Nhập dữ liệu"), MenuAction::OpenPcImport),
             ],
         ),
         lang,

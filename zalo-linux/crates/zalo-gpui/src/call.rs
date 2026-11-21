@@ -16,7 +16,7 @@
 //! at 640×360, the same baseline profile Electron sends.
 
 use std::collections::{BTreeSet, HashMap};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -557,13 +557,13 @@ fn pactl_devices(kind: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Looping / one-shot call sound through `ffplay`.
+/// Looping / one-shot call sound decoded and played in-process (`symphonia` + `CardSpeaker`).
 #[derive(Default)]
 struct Sound {
     /// Resolved file path, or empty when silent. Changing it restarts playback.
     key: String,
     looped: bool,
-    child: Option<Child>,
+    handle: Option<crate::audio_play::AudioHandle>,
 }
 
 impl Sound {
@@ -577,24 +577,12 @@ impl Sound {
         let Some(path) = path.filter(|p| p.is_file()) else {
             return;
         };
-        let mut cmd = Command::new("ffplay");
-        cmd.args(["-nodisp", "-autoexit", "-loglevel", "quiet"]);
-        if looped {
-            cmd.args(["-loop", "0"]);
-        }
-        self.child = cmd
-            .arg(path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok();
+        self.handle = crate::audio_play::play_file(path.to_path_buf(), None, looped, None).ok();
     }
 
     fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(handle) = self.handle.take() {
+            handle.stop();
         }
     }
 }
@@ -1204,7 +1192,7 @@ impl CallView {
         self.flush_held_pictures(window);
         let pics_changed = self.take_pictures();
         let (state, connected, ended, notice, debug) = self.snapshot();
-        if let Ok(mut s) = self.shared.lock() {
+        if let Ok(s) = self.shared.lock() {
             self.camera_on = s.camera_on;
             self.sharing = s.sharing;
             if s.share_label != self.share_label {
@@ -5206,16 +5194,32 @@ fn drive_screen(
     let Some(cap) = screen_cap.as_ref() else {
         return;
     };
-    if !group {
-        if let Some(preview) = cap.take_preview() {
-            set(shared, |state| {
-                state.local_preview = Some(crate::call_video::RemotePicture {
-                    w: preview.w,
-                    h: preview.h,
-                    bgra: preview.bgra,
-                });
-                state.local_preview_gen = state.local_preview_gen.wrapping_add(1);
+    if let Some(preview) = cap.take_preview() {
+        if group {
+            if let Some(backend) = zrtc {
+                if let Ok(mut b) = backend.lock() {
+                    if let (Ok(w), Ok(h)) = (u16::try_from(preview.w), u16::try_from(preview.h)) {
+                        b.set_share_dimensions(w, h);
+                    }
+                }
+            }
+        }
+        set(shared, |state| {
+            state.local_preview = Some(crate::call_video::RemotePicture {
+                w: preview.w,
+                h: preview.h,
+                bgra: preview.bgra,
             });
+            state.local_preview_gen = state.local_preview_gen.wrapping_add(1);
+        });
+    }
+    if group {
+        if let Some(backend) = zrtc {
+            if let Ok(mut b) = backend.lock() {
+                if b.take_share_key_frame_request() {
+                    cap.request_key_frame();
+                }
+            }
         }
     }
     let mut failure = None;
@@ -5860,26 +5864,19 @@ pub(crate) fn resolve_call_sound(kind: &str, custom: &str) -> Option<std::path::
     stock_sound_path(file)
 }
 
-/// Plays `path` for two seconds. Used by Settings › Advanced › Preview.
+/// Plays `path` for two seconds in-process. Used by Settings › Advanced › Preview.
 pub(crate) fn preview_call_sound(path: &std::path::Path) {
     if cfg!(test) || !path.is_file() {
         return;
     }
-    let path = path.to_path_buf();
-    let _ = std::thread::Builder::new()
-        .name("zalo-sound-preview".into())
-        .spawn(move || {
-            let _ = Command::new("ffplay")
-                .args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-t", "2"])
-                .arg(path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        });
+    crate::audio_play::play_detached(
+        path.to_path_buf(),
+        None,
+        Some(Duration::from_secs(2)),
+    );
 }
 
-/// Plays a brief test chime on the chosen Pulse sink (or default device) for Settings › Call.
+/// Plays a brief test chime on the chosen Pulse/PipeWire sink (or default device) for Settings › Call.
 pub(crate) fn play_speaker_test(sink_name: Option<&str>) {
     if cfg!(test) {
         return;
@@ -5890,21 +5887,7 @@ pub(crate) fn play_speaker_test(sink_name: Option<&str>) {
     let sink = sink_name
         .filter(|s| !s.is_empty() && *s != "Mặc định")
         .map(str::to_owned);
-    let _ = std::thread::Builder::new()
-        .name("zalo-speaker-test".into())
-        .spawn(move || {
-            let mut cmd = Command::new("ffplay");
-            cmd.args(["-nodisp", "-autoexit", "-loglevel", "quiet", "-t", "1.4"]);
-            if let Some(s) = sink {
-                cmd.env("PULSE_SINK", s);
-            }
-            let _ = cmd
-                .arg(path)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        });
+    crate::audio_play::play_detached(path, sink, Some(Duration::from_millis(1400)));
 }
 
 #[cfg(test)]

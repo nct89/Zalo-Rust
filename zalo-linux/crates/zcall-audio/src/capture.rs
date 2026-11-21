@@ -168,13 +168,28 @@ pub struct CardSpeaker {
 }
 
 impl CardSpeaker {
-    /// Opens the default sink, or `device` when it is set.
+    /// Opens the default sink, or `device` when it is set, at 16 kHz mono for calls.
     ///
     /// # Errors
     ///
     /// Returns an error when `libpulse-simple` cannot connect. Callers fall
     /// back to [`Speaker`].
     pub fn open(device: Option<&str>) -> Result<Self, std::io::Error> {
+        Self::open_spec(device, 16_000, 1, "Call")
+    }
+
+    /// Opens the default sink, or `device` when set, with an arbitrary PCM
+    /// sample rate and channel count (`S16le`) for in-process media/chime playout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream spec is invalid or `libpulse-simple` cannot connect.
+    pub fn open_spec(
+        device: Option<&str>,
+        rate: u32,
+        channels: u8,
+        stream_name: &str,
+    ) -> Result<Self, std::io::Error> {
         use libpulse_binding::def::BufferAttr;
         use libpulse_binding::sample::{Format, Spec};
         use libpulse_binding::stream::Direction;
@@ -182,17 +197,18 @@ impl CardSpeaker {
 
         let spec = Spec {
             format: Format::S16le,
-            rate: 16_000,
-            channels: 1,
+            rate,
+            channels,
         };
         if !spec.is_valid() {
             return Err(std::io::Error::other("invalid playback spec"));
         }
-        // `u32::MAX` is the "leave this field alone" value (`0xFFFFFFFF`).
-        // `tlength` is 60 ms: 640 bytes × 60 / 20.
+        // Target ~60 ms buffer scaled to the chosen sample rate and channel count.
+        let bytes_per_20ms = (rate as usize * usize::from(channels) * 2 / 50).max(640);
+        let tlength = (bytes_per_20ms as u32).saturating_mul(CARD_LATENCY_MS / 20);
         let attr = BufferAttr {
             maxlength: u32::MAX,
-            tlength: (FRAME_BYTES as u32) * CARD_LATENCY_MS / 20,
+            tlength,
             prebuf: u32::MAX,
             minreq: u32::MAX,
             fragsize: u32::MAX,
@@ -202,7 +218,7 @@ impl CardSpeaker {
             "Zalo",
             Direction::Playback,
             device,
-            "Call",
+            stream_name,
             &spec,
             None,
             Some(&attr),

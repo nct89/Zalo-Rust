@@ -63,6 +63,30 @@ impl ShellView {
         self.media_shelf.links.iter().take(3).cloned().collect()
     }
 
+    /// Every cached photo, for "Xem tất cả" inside the info column.
+    pub(crate) fn cloud_images_all(&self, thread: &str) -> Vec<MediaItem> {
+        if !self.shelf_ready(thread) {
+            return Vec::new();
+        }
+        self.media_shelf.images.clone()
+    }
+
+    /// Every cached file.
+    pub(crate) fn cloud_files_all(&self, thread: &str) -> Vec<MediaItem> {
+        if !self.shelf_ready(thread) {
+            return Vec::new();
+        }
+        self.media_shelf.files.clone()
+    }
+
+    /// Every cached link.
+    pub(crate) fn cloud_links_all(&self, thread: &str) -> Vec<MediaItem> {
+        if !self.shelf_ready(thread) {
+            return Vec::new();
+        }
+        self.media_shelf.links.clone()
+    }
+
     pub(crate) fn store_thumb(&self, id: &str) -> Option<Arc<RenderImage>> {
         self.media_shelf.thumbs.get(id).cloned()
     }
@@ -135,7 +159,6 @@ impl ShellView {
             .media_shelf
             .images
             .iter()
-            .take(8)
             .filter_map(|item| {
                 let url = if item.thumb.starts_with("http") {
                     item.thumb.clone()

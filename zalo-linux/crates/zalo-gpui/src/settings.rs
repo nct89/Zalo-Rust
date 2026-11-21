@@ -529,8 +529,7 @@ impl ShellView {
             )
     }
 
-    /// Electron "Sync & Backup": two illustrated cards, not a button list.
-    /// The PC dialog has no "Decrypt Backup" row.
+    /// Xuất/Nhập. The PC-to-phone backup card is not on this page.
     fn sync_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
@@ -539,12 +538,11 @@ impl ShellView {
         let card_bg = if dark { 0x2a_2c_31 } else { 0xf4_f6_f8 };
         let card_border = if dark { 0x3a_3e_46 } else { 0xe1_e5_ea };
         let hover = if dark { 0x32_35_3b } else { 0xea_ee_f4 };
-        let active = self.phone_sync.active();
-        let sync_desc = self
-            .phone_sync
-            .status_line()
-            .unwrap_or_else(|| "Đồng bộ tin nhắn từ điện thoại sang Zalo PC".to_owned());
-        let card = |key: &'static str, art: gpui::AnyElement, title: &'static str, desc: String| {
+        let card = |key: &'static str,
+                    art: gpui::AnyElement,
+                    title: &'static str,
+                    desc: String,
+                    one_line: bool| {
             div()
                 .id(key)
                 .flex()
@@ -552,9 +550,9 @@ impl ShellView {
                 .items_center()
                 .justify_center()
                 .w_full()
-                .mt(px(12.))
-                .px(px(24.))
-                .py(px(28.))
+                .mt(px(8.))
+                .px(px(12.))
+                .py(px(10.))
                 .rounded(px(8.))
                 .bg(rgb(card_bg))
                 .border_1()
@@ -564,7 +562,7 @@ impl ShellView {
                 .child(art)
                 .child(
                     div()
-                        .mt(px(14.))
+                        .mt(px(6.))
                         .text_size(px(16.))
                         .line_height(px(22.))
                         .font_family(FAMILY_SEMIBOLD)
@@ -573,24 +571,31 @@ impl ShellView {
                 )
                 .child(
                     div()
-                        .mt(px(6.))
+                        .mt(px(2.))
+                        .w_full()
                         .text_size(px(13.))
                         .line_height(px(18.))
                         .text_color(rgb(muted))
                         .text_center()
-                        .child(crate::media::wrap_ui_note(&desc, 460.)),
+                        .when(one_line, |el| el.whitespace_nowrap())
+                        .child(if one_line {
+                            desc
+                        } else {
+                            crate::media::wrap_ui_note(&desc, 520.)
+                        }),
                 )
         };
         div()
             .id("setting-sync")
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .px(px(28.))
-            .pt(px(20.))
-            .pb(px(24.))
+            .px(px(16.))
+            .pt(px(12.))
+            .pb(px(12.))
             .text_color(rgb(ink))
             .child(
                 div()
@@ -599,55 +604,16 @@ impl ShellView {
                     .font_family(FAMILY_SEMIBOLD)
                     .child("Chọn phương thức:"),
             )
-            .child({
-                let mut el = card(
-                    "sync-from-phone",
-                    sync_art_phone_to_pc(blue),
-                    "Đồng bộ tin nhắn",
-                    sync_desc,
-                );
-                if active {
-                    el = el.child(
-                        div()
-                            .id("sync-cancel")
-                            .mt(px(12.))
-                            .px(px(14.))
-                            .h(px(28.))
-                            .rounded(px(4.))
-                            .flex()
-                            .items_center()
-                            .bg(rgb(blue))
-                            .text_size(px(13.))
-                            .text_color(rgb(0xffffff))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.run_setting_action(SAction::CancelPhoneSync, cx);
-                                cx.notify();
-                            }))
-                            .child("Hủy"),
-                    );
-                }
-                el.on_click(cx.listener(move |this, _, _, cx| {
-                    if this.phone_sync.active() {
-                        return;
-                    }
-                    this.run_setting_action(SAction::StartPhoneSync, cx);
-                    cx.notify();
-                }))
-            })
             .child(
                 card(
-                    "sync-backup",
-                    sync_art_pc_to_phone(blue),
-                    "Sao lưu tin nhắn",
-                    crate::i18n::t(
-                        "Tạo bản sao lưu tin nhắn văn bản trên Zalo PC để khôi phục trên điện thoại",
-                    ),
+                    "sync-pc-export",
+                    sync_art_pc_to_pc(blue),
+                    "Xuất dữ liệu/ Nhập dữ liệu",
+                    "Xuất dữ liệu khi chuyển máy, đổi máy tính mới".to_owned(),
+                    true,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.run_setting_action(SAction::ExportBackup, cx);
-                    cx.notify();
+                    this.open_pc_export(cx);
                 })),
             )
     }
@@ -1747,8 +1713,6 @@ impl ShellView {
             SAction::LockHidden => self.lock_hidden_chats(),
             SAction::QuickMessages => self.open_quick_messages(cx),
             SAction::AutoReply => self.open_auto_reply(cx),
-            SAction::StartPhoneSync => self.start_phone_sync(cx),
-            SAction::CancelPhoneSync => self.cancel_phone_sync(),
             SAction::ClearCache => {
                 let n = crate::media::media_root()
                     .map(|r| r.join("thumbs"))
@@ -1836,7 +1800,6 @@ impl ShellView {
                 crate::call::play_speaker_test((!sink.is_empty()).then_some(sink.as_str()));
                 self.set_note("Đang phát thử âm thanh qua loa đã chọn");
             }
-            SAction::ExportBackup => self.start_pc_backup_lookup(cx),
             SAction::Toggle2Fa(turn_on) => self.open_two_factor_dialog(turn_on, cx),
             SAction::PickCallSound(key) => {
                 let title = if key == "linuxRingtone" {
@@ -2013,11 +1976,6 @@ enum SAction {
     LockHidden,
     QuickMessages,
     AutoReply,
-    StartPhoneSync,
-    CancelPhoneSync,
-    /// PC → phone backup. Asks the server with cmd 634 and 632.
-    /// Does not write a local JSON file.
-    ExportBackup,
     /// Kept so the decrypt dialog in `account.rs` still has a call site.
     /// The PC settings page does not show this row.
     #[allow(dead_code)]
@@ -2753,22 +2711,6 @@ fn sync_dash(blue: u32) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn sync_phone(blue: u32) -> gpui::AnyElement {
-    div()
-        .w(px(22.))
-        .h(px(36.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(rgb(blue))
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_end()
-        .pb(px(4.))
-        .child(div().w(px(8.)).h(px(2.)).rounded(px(1.)).bg(rgb(blue)))
-        .into_any_element()
-}
-
 fn sync_monitor(blue: u32, mark: &'static str) -> gpui::AnyElement {
     div()
         .flex()
@@ -2795,52 +2737,18 @@ fn sync_monitor(blue: u32, mark: &'static str) -> gpui::AnyElement {
         .into_any_element()
 }
 
-fn sync_server(blue: u32) -> gpui::AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .gap(px(3.))
-        .children((0..3).map(|_| {
-            div()
-                .w(px(28.))
-                .h(px(8.))
-                .rounded(px(4.))
-                .border_1()
-                .border_color(rgb(blue))
-        }))
-        .into_any_element()
-}
-
-/// Phone → PC, the first Electron sync card.
-fn sync_art_phone_to_pc(blue: u32) -> gpui::AnyElement {
+/// Two computers, this client's export/import card.
+fn sync_art_pc_to_pc(blue: u32) -> gpui::AnyElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .justify_center()
         .gap(px(10.))
-        .h(px(52.))
-        .child(sync_phone(blue))
-        .child(sync_dash(blue))
-        .child(sync_monitor(blue, "↻"))
-        .into_any_element()
-}
-
-/// PC → backup → phone, the second Electron sync card.
-fn sync_art_pc_to_phone(blue: u32) -> gpui::AnyElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_center()
-        .gap(px(10.))
-        .h(px(52.))
+        .h(px(40.))
         .child(sync_monitor(blue, ""))
         .child(sync_dash(blue))
-        .child(sync_server(blue))
-        .child(sync_dash(blue))
-        .child(sync_phone(blue))
+        .child(sync_monitor(blue, ""))
         .into_any_element()
 }
 

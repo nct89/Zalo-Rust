@@ -29,6 +29,10 @@ pub struct Profile {
     pub members: u32,
     /// Group member uids (`memberIds` / `memVerList`), empty for people.
     pub member_ids: Vec<String>,
+    /// `creatorId`. Empty until a group-info response has been stored.
+    pub creator_id: String,
+    /// `adminIds`, in server order.
+    pub admin_ids: Vec<String>,
     /// From `get_friends` (Contacts › Friends), not a group member or sender.
     pub friend: bool,
 }
@@ -89,6 +93,17 @@ impl Profiles {
                                     .collect()
                             })
                             .unwrap_or_default(),
+                        creator_id: str_of(v, "creatorId"),
+                        admin_ids: v
+                            .get("adminIds")
+                            .and_then(Value::as_array)
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                         friend: v.get("friend").and_then(Value::as_bool).unwrap_or(false),
                     },
                 );
@@ -117,7 +132,7 @@ impl Profiles {
             .map(|(k, p)| {
                 (
                     k.clone(),
-                    serde_json::json!({"name": p.name, "avatar": p.avatar, "members": p.members, "memberIds": p.member_ids, "friend": p.friend}),
+                    serde_json::json!({"name": p.name, "avatar": p.avatar, "members": p.members, "memberIds": p.member_ids, "creatorId": p.creator_id, "adminIds": p.admin_ids, "friend": p.friend}),
                 )
             })
             .collect();
@@ -140,11 +155,48 @@ fn str_of(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_owned()
 }
 
-/// `~/.cache/zalo-rust/gpui-profiles.json`.
+/// String or integer id (`creatorId` arrives as either).
+fn id_of(v: &Value, key: &str) -> String {
+    match v.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn id_list(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::String(text) if !text.is_empty() => Some(text.clone()),
+                    Value::Number(n) => n.as_u64().map(|n| n.to_string()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Profile cache for the account that is open.
+///
+/// The file sits in that account's directory. The old global
+/// `~/.cache/zalo-rust/gpui-profiles.json` mixed names and avatars of every
+/// account that had logged in on this machine, so it is not read once an
+/// account directory exists.
 #[must_use]
 pub fn cache_path() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
+    }
+    if let Some(dir) = crate::data::active_data_dir() {
+        return Some(dir.join("profiles.json"));
     }
     let xdg = zalo_core::XdgDirs::from_env().ok()?;
     let dir = xdg.cache_home().join("zalo-rust");
@@ -292,12 +344,23 @@ pub fn is_id_label(thread_id: &str, name: &str) -> bool {
 #[must_use]
 pub fn group_display_name(thread_id: &str, current: &str, profile_name: &str) -> String {
     let profile = profile_name.trim();
+    let current_trim = current.trim();
+    // Error 164 has no group name. "Nhóm đã rời" is only the placeholder.
+    // A title the list already shows (from the phone store) stays.
+    if profile == "Nhóm đã rời" {
+        if !current_trim.is_empty()
+            && current_trim != "Nhóm"
+            && !is_id_label(thread_id, current_trim)
+        {
+            return current_trim.to_owned();
+        }
+        return "Nhóm đã rời".to_owned();
+    }
     if !profile.is_empty() && !is_id_label(thread_id, profile) {
         return profile.to_owned();
     }
-    let current = current.trim();
-    if !current.is_empty() {
-        return current.to_owned();
+    if !current_trim.is_empty() {
+        return current_trim.to_owned();
     }
     thread_id.to_owned()
 }
@@ -333,6 +396,8 @@ pub fn groups_from(value: &Value) -> HashMap<String, Profile> {
                 avatar: find_str(item, &["fullAvt", "avt", "avatar"]).unwrap_or_default(),
                 members,
                 member_ids: member_ids(item),
+                creator_id: id_of(item, "creatorId"),
+                admin_ids: id_list(item, "adminIds"),
                 friend: false,
             },
         );
@@ -388,6 +453,29 @@ pub fn is_numeric_uid(uid: &str) -> bool {
     !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Group thread ids that still have no server name. The chat list otherwise
+/// paints the placeholder "Nhóm" and a letter disc.
+#[must_use]
+pub fn groups_needing_info(profiles: &Profiles, thread_ids: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in thread_ids {
+        if !id.starts_with("g_") || id.starts_with("preview:") {
+            continue;
+        }
+        let needs = match profiles.map.get(id) {
+            None => true,
+            Some(profile) => {
+                let name = profile.name.trim();
+                name.is_empty() || is_id_label(id, name)
+            }
+        };
+        if needs && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
 /// Uids in `want` that have no https avatar and can be asked on `getprofiles/v2`.
 #[must_use]
 pub fn missing_avatar_uids(profiles: &Profiles, want: &[String]) -> Vec<String> {
@@ -406,6 +494,156 @@ pub fn missing_avatar_uids(profiles: &Profiles, want: &[String]) -> Vec<String> 
         }
     }
     out
+}
+
+/// Keys only. Group replies can carry encrypted blobs; do not print those.
+fn value_shape(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<&str> = map.keys().take(8).map(String::as_str).collect();
+            let nested = map
+                .get("data")
+                .filter(|v| !v.is_string())
+                .map(|v| format!(" data={}", value_shape(v)))
+                .unwrap_or_default();
+            format!("{{{keys:?}}}{nested}")
+        }
+        Value::Array(items) => format!("[{}]", items.len()),
+        Value::String(text) => format!("str{}", text.len()),
+        Value::Null => "null".into(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(on) => on.to_string(),
+    }
+}
+
+/// Group name, photo and members for thread ids missing from the friend/group cache.
+///
+/// `getlg/v4` does not list every group that `fetchImportant` already showed.
+/// Those rows stay on the placeholder "Nhóm" until `getmg-v2` is asked for
+/// their ids. The second map is member photos, inserted only when that uid
+/// is not already a friend.
+///
+/// # Errors
+///
+/// Returns a short message without a session or when every chunk fails.
+pub fn fetch_missing_groups(
+    dir: &Path,
+    ids: &[String],
+) -> Result<(HashMap<String, Profile>, HashMap<String, Profile>), String> {
+    if ids.is_empty() {
+        return Ok((HashMap::new(), HashMap::new()));
+    }
+    eprintln!("zalo-gpui group gaps: hỏi getmg-v2 cho {} nhóm", ids.len());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let session = StoredSession::load(dir).map_err(|e| e.to_string())?;
+    if session.zpw_sek().is_none() || !dir.join("device.json").is_file() {
+        return Err("no session".into());
+    }
+    let device = Device::load_or_create(dir).map_err(|e| e.to_string())?;
+    let mut api = ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut groups = HashMap::new();
+    let mut members = HashMap::new();
+    let mut errors = Vec::new();
+    rt.block_on(async {
+        if let Err(e) = api.get_login_info().await {
+            errors.push(format!("login_info: {e}"));
+        }
+        for chunk in ids.chunks(50) {
+            let owned: Vec<String> = chunk.iter().map(|id| (*id).clone()).collect();
+            match api.get_multi_group_info(&owned).await {
+                Ok(value) => {
+                    let parsed = groups_from(&value);
+                    if parsed.is_empty() {
+                        eprintln!(
+                            "zalo-gpui group gaps: getmg-v2 không có nhóm ({})",
+                            value_shape(&value)
+                        );
+                    }
+                    groups.extend(parsed);
+                    members.extend(member_profiles_from(&value));
+                }
+                Err(e) => errors.push(format!("getmg: {e}")),
+            }
+            // `getlg/v4` omits some threads that are already on screen.
+            // `getmg-v2` then answers an empty map. `getgi/v2` is the
+            // per-group profile the info column already uses.
+            for id in &owned {
+                let key = if id.starts_with("g_") {
+                    id.clone()
+                } else {
+                    format!("g_{id}")
+                };
+                if groups.contains_key(&key) {
+                    continue;
+                }
+                match api.get_group_info_v2(id, 1).await {
+                    Ok(value) => {
+                        let parsed = groups_from(&value);
+                        if parsed.is_empty() {
+                            eprintln!(
+                                "zalo-gpui group gaps: getgi {key} không có tên ({})",
+                                value_shape(&value)
+                            );
+                        }
+                        // Keep the thread id even when the server keys the
+                        // map by a different grid.
+                        if parsed.len() == 1 && !parsed.contains_key(&key) {
+                            if let Some(profile) = parsed.into_values().next() {
+                                groups.insert(key, profile);
+                            }
+                        } else {
+                            groups.extend(parsed);
+                        }
+                        members.extend(member_profiles_from(&value));
+                        for member in zalo_client::GroupMember::list_from(&value) {
+                            let Some(avatar) = member.avatar else { continue };
+                            members.entry(member.uid).or_insert(Profile {
+                                name: member.name,
+                                avatar,
+                                friend: false,
+                                ..Profile::default()
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        // 164: the account is no longer in the group. The
+                        // server will not send a name or a photo.
+                        if msg.contains("164") {
+                            groups.insert(
+                                key,
+                                Profile {
+                                    name: "Nhóm đã rời".into(),
+                                    ..Profile::default()
+                                },
+                            );
+                        } else {
+                            errors.push(format!("getgi {key}: {msg}"));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    eprintln!(
+        "zalo-gpui group gaps: nhận {} nhóm, {} thành viên{}",
+        groups.len(),
+        members.len(),
+        if errors.is_empty() {
+            String::new()
+        } else {
+            format!(", lỗi {}", errors.join("; "))
+        }
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    if groups.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok((groups, members))
 }
 
 /// Fetches avatar URLs for `uids` via `/api/social/friend/getprofiles/v2`.
@@ -580,7 +818,7 @@ mod tests {
         assert_eq!(f["1"].avatar, "");
         assert!(f["1"].friend);
         let groups = serde_json::json!({"data": {"gridInfoMap": {
-            "200000000000000002": {"name": "Team Group", "fullAvt": "https://ava-grp-talk.zadn.vn/x.jpg", "totalMember": 4, "memVerList": ["11_0", "22_3"]}
+            "200000000000000002": {"name": "Team Group", "fullAvt": "https://ava-grp-talk.zadn.vn/x.jpg", "totalMember": 4, "memVerList": ["11_0", "22_3"], "creatorId": "11", "adminIds": ["22"]}
         }}});
         let g = groups_from(&groups);
         assert_eq!(g["g_200000000000000002"].members, 4);
@@ -611,6 +849,8 @@ mod tests {
         let back = Profiles::load(Some(&dir));
         assert_eq!(back.map["g_200000000000000002"].name, "Team Group");
         assert_eq!(back.map["g_200000000000000002"].member_ids, ["11", "22"]);
+        assert_eq!(back.map["g_200000000000000002"].creator_id, "11");
+        assert_eq!(back.map["g_200000000000000002"].admin_ids, ["22"]);
         assert_eq!(back.alias_or("1", "Original"), "User One");
         assert_eq!(back.saved_at, 5);
         assert!(back.stale(5 + MAX_AGE_MS + 1));
@@ -620,7 +860,28 @@ mod tests {
         assert_eq!(group_display_name(id, id, ""), id);
         assert_eq!(group_display_name(id, "Old Name", id), "Old Name");
         assert_eq!(group_display_name(id, "Old Name", "New Name"), "New Name");
+        assert_eq!(
+            group_display_name(id, "Phòng Zoom", "Nhóm đã rời"),
+            "Phòng Zoom"
+        );
+        assert_eq!(group_display_name(id, id, "Nhóm đã rời"), "Nhóm đã rời");
+        assert_eq!(group_display_name(id, "Nhóm", "Nhóm đã rời"), "Nhóm đã rời");
         assert!(is_id_label(id, "200000000000000002"));
+        let mut cached = Profiles::default();
+        cached.map.insert(
+            id.into(),
+            Profile {
+                name: "Team Group".into(),
+                ..Profile::default()
+            },
+        );
+        let want = vec![
+            id.to_owned(),
+            "g_999".into(),
+            "g_999".into(),
+            "42".into(),
+        ];
+        assert_eq!(groups_needing_info(&cached, &want), vec!["g_999".to_owned()]);
     }
 
     #[test]

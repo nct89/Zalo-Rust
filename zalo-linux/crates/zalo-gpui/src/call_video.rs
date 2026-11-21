@@ -133,7 +133,7 @@ pub(crate) fn preview_bgra(picture: &RemotePicture) -> Option<(u32, u32, Vec<u8>
     ))
 }
 
-fn scale_bgra_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+pub(crate) fn scale_bgra_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let mut dst = vec![0_u8; (dw as usize) * (dh as usize) * 4];
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
         return dst;
@@ -190,7 +190,7 @@ fn scale_bgra_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8
 
 /// Converts OpenH264 YUV420p planes directly into packed BGRA `[B, G, R, 255]`
 /// matching GPUI's `RenderImage` pixel layout without an intermediate RGB copy.
-fn yuv_to_bgra(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
+pub(crate) fn yuv_to_bgra(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
     let (y_stride, u_stride, v_stride) = yuv.strides();
     let y_plane = yuv.y();
     let u_plane = yuv.u();

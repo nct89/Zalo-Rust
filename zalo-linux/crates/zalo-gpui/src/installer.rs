@@ -366,6 +366,14 @@ fn user_bin_path() -> PathBuf {
     PathBuf::from("/tmp/zalo-gpui")
 }
 
+/// Folder of the user-local binary, when that file is already installed.
+#[must_use]
+pub fn installed_bin_dir() -> Option<PathBuf> {
+    let path = user_bin_path();
+    let dir = path.parent()?.to_path_buf();
+    path.is_file().then_some(dir)
+}
+
 /// Scan `/etc/os-release`, session type, existing install, and distro dependencies.
 #[must_use]
 pub fn scan_system() -> SystemScan {
@@ -470,18 +478,6 @@ pub fn scan_system() -> SystemScan {
                 fallback_bin: Some("pactl"),
                 fallback_lib: Some("libpulse.so.0"),
                 required: true,
-            },
-        ),
-        check_dep(
-            family,
-            DepSpec {
-                label: "Chuông báo & xem video nội bộ (ffmpeg / ffplay)",
-                deb: "ffmpeg",
-                rpm: "ffmpeg-free",
-                arch: "ffmpeg",
-                fallback_bin: Some("ffplay"),
-                fallback_lib: None,
-                required: false,
             },
         ),
     ];

@@ -3,13 +3,14 @@
 use anyhow::{Context, Result};
 use std::fs;
 use zalo_client::{Device, StoredSession, ZaloApi};
-use zalo_core::XdgDirs;
+use zalo_core::AppPaths;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let xdg = XdgDirs::from_env().context("resolve XDG directories")?;
-    let config_dir = xdg.config_home().join("zalo-rust");
+    let paths = AppPaths::from_env("zalo-rust").context("resolve application directories")?;
+    let config_dir = paths.config_dir().to_path_buf();
     fs::create_dir_all(&config_dir).context("create config directory")?;
+    zalo_protocol::init_from_dir(&config_dir);
 
     let device = Device::load_or_create(&config_dir).context("load device identity")?;
     let mut session =

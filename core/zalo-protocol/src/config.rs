@@ -12,7 +12,18 @@ use std::path::Path;
 use std::sync::{OnceLock, RwLock};
 use thiserror::Error;
 
-/// Default User-Agent string matching the pinned Zalo Desktop release.
+/// Default User-Agent string matching the pinned Zalo Desktop release for the target OS.
+#[cfg(target_os = "windows")]
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
+
+/// Default User-Agent string matching the pinned Zalo Desktop release for the target OS.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
+
+/// Default User-Agent string matching the pinned Zalo Desktop release for the target OS.
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
 
@@ -217,14 +228,50 @@ pub fn apply_env_overrides() -> Result<ProtocolConfig, ProtocolConfigError> {
     apply_overrides(&overrides)
 }
 
-/// Initializes protocol overrides from `<config_dir>/protocol.json` (if present),
-/// followed by environment variables (which take precedence).
+/// Returns candidate packaged/system `protocol.json` locations checked before
+/// the user's config directory (lowest precedence first).
+fn system_protocol_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(unix)]
+    {
+        paths.push(std::path::PathBuf::from("/usr/share/zalo-rust").join(PROTOCOL_CONFIG_FILE));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            if let Some(prefix) = bin_dir.parent() {
+                paths.push(
+                    prefix
+                        .join("share")
+                        .join("zalo-rust")
+                        .join(PROTOCOL_CONFIG_FILE),
+                );
+            }
+            paths.push(bin_dir.join(PROTOCOL_CONFIG_FILE));
+        }
+    }
+    paths
+}
+
+/// Initializes protocol overrides in order of increasing precedence:
+/// 1. Packaged/system `protocol.json` (`/usr/share/zalo-rust/protocol.json`,
+///    `<prefix>/share/zalo-rust/protocol.json`, or beside the binary)
+/// 2. User `<config_dir>/protocol.json`
+/// 3. Environment variables (`ZALO_CLIENT_VERSION`, `ZALO_API_TYPE`,
+///    `ZALO_USER_AGENT`, `ZALO_PARAM_CIPHER_KEY`, `ZALO_DESKTOP_VERSION`)
 ///
-/// Invalid files or env vars are logged to `stderr` and leave built-in defaults intact.
+/// Invalid files or env vars are logged to `stderr` and leave prior values intact.
 pub fn init_from_dir(config_dir: &Path) -> ProtocolConfig {
-    let path = config_dir.join(PROTOCOL_CONFIG_FILE);
-    if let Err(err) = load_overrides_from_file(&path) {
-        eprintln!("zalo-protocol: ignoring {}: {err}", path.display());
+    let user_path = config_dir.join(PROTOCOL_CONFIG_FILE);
+    for path in system_protocol_paths() {
+        if path == user_path {
+            continue;
+        }
+        if let Err(err) = load_overrides_from_file(&path) {
+            eprintln!("zalo-protocol: ignoring {}: {err}", path.display());
+        }
+    }
+    if let Err(err) = load_overrides_from_file(&user_path) {
+        eprintln!("zalo-protocol: ignoring {}: {err}", user_path.display());
     }
     if let Err(err) = apply_env_overrides() {
         eprintln!("zalo-protocol: ignoring env override: {err}");

@@ -8,12 +8,13 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::time::Duration;
 use zalo_client::{run_listener, Device, ListenerEvent, StoredSession, ZaloApi};
-use zalo_core::XdgDirs;
+use zalo_core::AppPaths;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let xdg = XdgDirs::from_env().context("resolve XDG directories")?;
-    let config_dir = xdg.config_home().join("zalo-rust");
+    let paths = AppPaths::from_env("zalo-rust").context("resolve application directories")?;
+    let config_dir = paths.config_dir().to_path_buf();
+    zalo_protocol::init_from_dir(&config_dir);
     let device = Device::load_or_create(&config_dir).context("load device identity")?;
     let session =
         StoredSession::load(&config_dir).context("load session (run zalo-login first)")?;

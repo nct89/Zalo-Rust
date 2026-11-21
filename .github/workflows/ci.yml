@@ -64,3 +64,34 @@ jobs:
 
       - name: Build release binary (universal Wayland + X11)
         run: cargo build --release -p zalo-gpui --features tray-xembed
+
+  core-cross-platform:
+    name: Core Crates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test OS-independent core crates
+        run: >-
+          cargo test
+          -p zalo-core
+          -p zalo-protocol
+          -p zalo-client
+          -p zalo-storage
+          -p zalo-sync2
+          -p zalo-design
+          -p zimage
+          -p zjxl
+          -p zocr
+          -- --test-threads=1

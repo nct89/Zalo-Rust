@@ -105,6 +105,48 @@ impl Prefs {
         self.save(shared);
     }
 
+    /// Removes account-scoped keys from `ui-state.json` and `gpui-prefs.json`
+    /// while preserving device/app settings (theme, language, window size, audio devices).
+    pub fn reset_account_keys(&mut self) {
+        const SHARED_ACCOUNT: &[&str] = &["pinned", "muted", "other", "read", "quick"];
+        const OWN_ACCOUNT: &[&str] = &[
+            "archived",
+            "hidden",
+            "hiddenPin",
+            "lockHash",
+            "receipts",
+            "labels",
+            "convLabels",
+            "drafts",
+            "readAt",
+            "aliases",
+        ];
+        for k in SHARED_ACCOUNT {
+            self.shared.remove(*k);
+        }
+        for k in OWN_ACCOUNT {
+            self.own.remove(*k);
+        }
+        let Some(dir) = self.dir.as_ref() else {
+            return;
+        };
+        let mut current = std::fs::read_to_string(dir.join("ui-state.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        for k in SHARED_ACCOUNT {
+            current.remove(*k);
+        }
+        if let Ok(text) = serde_json::to_string(&Value::Object(current)) {
+            let tmp = dir.join(".ui-state.json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, dir.join("ui-state.json"));
+            }
+        }
+        self.save(false);
+    }
+
     fn save(&self, shared: bool) {
         let Some(dir) = self.dir.as_ref() else {
             return;

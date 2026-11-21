@@ -124,8 +124,6 @@ pub enum LiveAction {
         /// Friend uid.
         uid: String,
     },
-    /// Logout the saved session.
-    Logout,
     /// Upload + send one photo (`upload_photo` → `send_photo`).
     SendPhoto {
         /// `clientId` shared with the local bubble (dedupes the echo).
@@ -138,6 +136,12 @@ pub enum LiveAction {
         path: PathBuf,
         /// Caption (may be empty).
         caption: String,
+        /// Electron `groupLayoutId`. `0` when this photo is not part of an album.
+        group_layout_id: i64,
+        /// `totalItemInGroup`.
+        group_total: u32,
+        /// `idInGroup`.
+        group_index: u32,
     },
     /// Upload + send one file (`sharefile_full`).
     SendFile {
@@ -362,12 +366,29 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
         &action,
         LiveAction::Seen { .. } | LiveAction::Delivered { .. } | LiveAction::Typing { .. }
     );
-    let is_logout = matches!(&action, LiveAction::Logout);
+    let outbox_candidate = match &action {
+        LiveAction::Send {
+            thread_id,
+            is_group,
+            text,
+            quote,
+            urgency,
+            client_id,
+        } => Some((
+            thread_id.clone(),
+            *is_group,
+            text.clone(),
+            quote.clone(),
+            *urgency,
+            *client_id,
+        )),
+        _ => None,
+    };
     let _ = std::thread::Builder::new()
         .name("zalo-gpui-bridge".into())
         .spawn(move || {
             let started = std::time::Instant::now();
-            match run_live(action, session_dir) {
+            match run_live(action, session_dir.clone()) {
                 Ok(()) => {
                     if let Some(l) = label {
                         eprintln!("zalo-gpui bridge: {l} ok in {} ms", started.elapsed().as_millis());
@@ -378,17 +399,157 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
                 }
                 Err(err) => {
                     eprintln!("zalo-gpui bridge: {err}");
-                    if is_logout {
-                        // Local wipe already left the session; 102/600 is expected.
-                    } else if crate::login_flow::is_session_error(&err) {
+                    if crate::login_flow::is_session_error(&err) {
                         report(
                             "Phiên đăng nhập đã hết hạn — bấm «Đăng nhập lại» trên thanh thông báo để quét QR"
                                 .into(),
                         );
+                    } else if let Some((thread_id, is_group, text, quote, urgency, client_id)) =
+                        outbox_candidate
+                    {
+                        if is_offline_send_error(&err)
+                            && enqueue_offline_send(
+                                &session_dir,
+                                &thread_id,
+                                is_group,
+                                &text,
+                                quote.as_ref(),
+                                urgency,
+                                client_id,
+                            )
+                        {
+                            report(
+                                "Mất mạng — tin nhắn đã lưu hàng đợi và sẽ tự gửi khi có kết nối"
+                                    .into(),
+                            );
+                        } else if !silent {
+                            report(format!(
+                                "{} thất bại: {}",
+                                label.unwrap_or("Thao tác"),
+                                short(&err)
+                            ));
+                        }
                     } else if !silent {
                         report(format!("{} thất bại: {}", label.unwrap_or("Thao tác"), short(&err)));
                     }
                 }
+            }
+        });
+}
+
+fn is_offline_send_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("zalo error") || crate::login_flow::is_session_error(err) {
+        return false;
+    }
+    zalo_client::listener::is_transient_disconnect(err)
+        || lower.contains("dns")
+        || lower.contains("network")
+        || lower.contains("connect")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("error sending request")
+}
+
+fn enqueue_offline_send(
+    session_dir: &std::path::Path,
+    thread_id: &str,
+    is_group: bool,
+    text: &str,
+    quote: Option<&QuoteTarget>,
+    urgency: u8,
+    client_id: u64,
+) -> bool {
+    let Ok(store) = zalo_storage::LocalStore::open(&session_dir.join("store.db")) else {
+        return false;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let rec = zalo_storage::OutboxRecord {
+        id: 0,
+        thread_id: thread_id.to_owned(),
+        is_group,
+        body: text.to_owned(),
+        urgency,
+        client_id,
+        quote_json: quote.and_then(|q| serde_json::to_string(q).ok()),
+        created_at: now_ms,
+        attempts: 0,
+    };
+    store.enqueue_outbox(&rec).is_ok()
+}
+
+static OUTBOX_FLUSHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Flushes queued offline text messages in FIFO order on reconnect (`RtEvent::Online`).
+pub fn flush_outbox(session_dir: PathBuf) {
+    if OUTBOX_FLUSHING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("zalo-gpui-outbox".into())
+        .spawn(move || {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    OUTBOX_FLUSHING.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = Guard;
+            let store_path = session_dir.join("store.db");
+            let Ok(store) = zalo_storage::LocalStore::open(&store_path) else {
+                return;
+            };
+            let Ok(pending) = store.list_outbox() else {
+                return;
+            };
+            if pending.is_empty() {
+                return;
+            }
+            let mut sent = 0usize;
+            for item in pending {
+                if item.attempts >= 5 {
+                    let _ = store.remove_outbox(item.id);
+                    continue;
+                }
+                let quote = item
+                    .quote_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<QuoteTarget>(raw).ok());
+                let action = LiveAction::Send {
+                    thread_id: item.thread_id.clone(),
+                    is_group: item.is_group,
+                    text: item.body.clone(),
+                    quote,
+                    urgency: item.urgency,
+                    client_id: item.client_id,
+                };
+                match run_live(action, session_dir.clone()) {
+                    Ok(()) => {
+                        let _ = store.remove_outbox(item.id);
+                        sent += 1;
+                    }
+                    Err(err) => {
+                        let _ = store.bump_outbox_attempt(item.id);
+                        eprintln!("zalo-gpui outbox: retry failed ({}): {err}", item.id);
+                        if is_offline_send_error(&err) || crate::login_flow::is_session_error(&err) {
+                            break;
+                        }
+                    }
+                }
+            }
+            if sent > 0 {
+                report(format!("Đã tự động gửi {sent} tin nhắn chờ khi kết nối lại"));
             }
         });
 }
@@ -415,6 +576,50 @@ pub(crate) fn remember_login_info(
             info: info.clone(),
         });
     }
+}
+
+/// Clears cached `zpw_service_map_v3` hosts (e.g. on logout).
+pub(crate) fn clear_login_cache() {
+    if let Ok(mut slot) = LOGIN_CACHE.lock() {
+        *slot = None;
+    }
+}
+
+/// Fires `/api/v2/login/logOut` on a background thread using an in-memory
+/// `(Device, StoredSession)` snapshot captured *before* `session.json` is wiped
+/// from disk, avoiding the race where `wipe_session_file` wins before the worker
+/// reads `session.json`.
+pub(crate) fn spawn_logout_snapshot(
+    device: Device,
+    session: StoredSession,
+    dir: PathBuf,
+) {
+    clear_login_cache();
+    if cfg!(test) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("zalo-gpui-logout".into())
+        .spawn(move || {
+            let Ok(mut api) = ZaloApi::from_session(device, &session) else {
+                return;
+            };
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            let _ = rt.block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                async {
+                    if let Some(sek) = session.zpw_sek() {
+                        let _ = ensure_service_hosts(&mut api, &dir, &sek, false).await;
+                    }
+                    let _ = api.logout().await;
+                },
+            ));
+        });
 }
 
 fn cached_login_info(dir: &std::path::Path, sek: &str) -> Option<zalo_client::LoginInfo> {
@@ -589,6 +794,9 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             is_group,
             path,
             caption,
+            group_layout_id,
+            group_total,
+            group_index,
         } => {
             let (jpeg, w, h) = encode_upload(&path)?;
             let up = api
@@ -601,7 +809,9 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
                 )
                 .await
                 .map_err(|e| format!("upload: {e}"))?;
-            api.send_photo(&thread_id, is_group, &up, w, h, &caption)
+            let group = (group_total > 1 && group_layout_id != 0)
+                .then_some((group_layout_id, group_total, group_index));
+            api.send_photo(&thread_id, is_group, &up, w, h, &caption, group)
                 .await
         }
         LiveAction::SendFile {
@@ -680,14 +890,13 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             if !crate::realtime::listening() {
                 return Err("chưa kết nối realtime (cần để nhận video_done)".into());
             }
-            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("video.mp4")
                 .to_owned();
-            let file_id = api
-                .upload_video_file(&thread_id, is_group, &bytes, &name, cid)
+            let (file_id, file_size) = api
+                .upload_video_file_path(&thread_id, is_group, &path, &name, cid)
                 .await
                 .map_err(|e| format!("upload: {e}"))?;
             let thumb_url = match thumb.as_ref().and_then(|p| std::fs::read(p).ok()) {
@@ -704,7 +913,7 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
                 video_url: url,
                 thumb_url,
                 duration_ms,
-                file_size: bytes.len() as u64,
+                file_size,
                 width,
                 height,
             };
@@ -761,7 +970,6 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             poll_id,
             option_ids,
         } => api.vote_poll(poll_id, &option_ids).await,
-        LiveAction::Logout => api.logout().await,
     }
     .map(|_| ())
     .map_err(|e| e.to_string())

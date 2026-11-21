@@ -12,7 +12,7 @@
 pub mod paths;
 pub mod version;
 
-pub use paths::{PathError, XdgDirs};
+pub use paths::{AppPaths, PathError, XdgDirs};
 pub use version::{
     read_pinned_version, ParseVersionError, PinnedVersionError, Version, PINNED_VERSION_FILE,
 };

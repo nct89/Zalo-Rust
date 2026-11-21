@@ -44,6 +44,8 @@ pub const FA_ROTATE: char = '\u{F2F1}';
 pub const FA_XMARK: char = '\u{F00D}';
 /// `fa-solid fa-plus` (U+F067).
 pub const FA_PLUS: char = '\u{F067}';
+/// `fa-solid fa-paper-plane` (U+F1D8). Composer send arrow.
+pub const FA_PAPER_PLANE: char = '\u{F1D8}';
 /// `fa-solid fa-folder-open` (U+F07C).
 pub const FA_FOLDER_OPEN: char = '\u{F07C}';
 /// `fa-solid fa-right-from-bracket` (U+F2F5).
@@ -622,6 +624,10 @@ pub mod ic {
     pub const EXTEND: char = '\u{EB10}';
     /// `edit-name` — pencil beside the account name.
     pub const EDIT_NAME: char = '\u{EAF2}';
+    /// `Edit_2_24_Line` — pencil on a pending-photo thumb.
+    pub const EDIT_PHOTO: char = '\u{EAEF}';
+    /// `Trash_24_Line` — remove one pending photo.
+    pub const TRASH_LINE: char = '\u{EDCF}';
     /// `zCloud_24_Line`.
     pub const CLOUD: char = '\u{EE13}';
     /// `zCloud_24_Filled`.
@@ -696,6 +702,8 @@ pub mod ic {
     pub const TB_STICKER: char = '\u{ED75}';
     /// `fa-Photo_24_Line` — composer photo.
     pub const TB_PHOTO: char = '\u{ECC5}';
+    /// `Plus_24_Line` — add another photo in the attach tray.
+    pub const PLUS_24: char = '\u{ECD6}';
     /// `fa-Attach_24_Line` — composer file.
     pub const TB_ATTACH: char = '\u{EA22}';
     /// `fa-Namecard_24_Line` — composer business card.

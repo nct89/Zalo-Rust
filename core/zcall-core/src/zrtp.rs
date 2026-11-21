@@ -313,6 +313,44 @@ pub fn build_zavi_ping_packet(uid: u32, token: u32, sess_id: &[u8], video_on: bo
     out
 }
 
+/// Builds a group screen-share peer InitZRTP packet (`ShareScreenPeer` on macOS/Windows).
+/// Uses `uid = shareScreenId`, `cmd = INIT_CALL_CALLEE`, `subCmd = 0x04`, and extra `[0, 0xff, 1, 0]`.
+pub fn build_share_init_zrtp_packet(uid: u32, sess_id: &[u8]) -> Vec<u8> {
+    let mut out = build_control_header(
+        MsgType::CONTROL,
+        MAGIC_BYTE,
+        0,
+        0,
+        uid,
+        0,
+        Command::INIT_CALL_CALLEE,
+        0x04,
+    );
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&u16_string(sess_id));
+    out.extend_from_slice(&u16_string(&[0, 0xff, 1, 0]));
+    out
+}
+
+/// Builds a group screen-share peer ZaviPing packet (`cmd = 0x33`, `subCmd = 0x01`, no camera extra).
+pub fn build_share_zavi_ping_packet(uid: u32, token: u32, sess_id: &[u8]) -> Vec<u8> {
+    let mut out = build_control_header(
+        MsgType::CONTROL,
+        MAGIC_BYTE,
+        0,
+        0,
+        uid,
+        token,
+        Command::INIT_ZAVI_PING,
+        0x01,
+    );
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&0_u32.to_le_bytes());
+    out.extend_from_slice(&u16_string(sess_id));
+    out
+}
+
 /// Builds a ping packet (cmd 2, magic overwritten with 1).
 pub fn build_ping_packet(uid: u32, token: u32, sess_id: &[u8]) -> Vec<u8> {
     let mut out = build_control_header(

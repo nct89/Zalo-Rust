@@ -20,6 +20,8 @@ const MAX_QUICK: usize = 200;
 /// One saved quick-reply template.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuickReply {
+    /// Server-assigned quick-message id, when synced with Zalo cloud.
+    pub id: Option<i64>,
     /// Shortcut trigger without leading `/`.
     pub key: String,
     /// Full message text inserted into the composer.
@@ -34,6 +36,10 @@ pub struct QuickMessagesDlg {
     pub text_input: Entity<LineInput>,
     /// True when the add/edit form is expanded.
     pub form_open: bool,
+    /// Server id of the quick reply currently being edited, if any.
+    pub editing_id: Option<i64>,
+    /// True while a server sync request is in flight.
+    pub syncing: bool,
     /// Non-empty validation message.
     pub error: Option<String>,
 }
@@ -64,7 +70,8 @@ pub(crate) fn load_quick(prefs: &Prefs) -> Vec<QuickReply> {
             if key.is_empty() || text.is_empty() {
                 return None;
             }
-            Some(QuickReply { key, text })
+            let id = item.get("id").and_then(Value::as_i64);
+            Some(QuickReply { id, key, text })
         })
         .collect()
 }
@@ -74,9 +81,41 @@ pub(crate) fn save_quick(prefs: &mut Prefs, list: &[QuickReply]) {
     let arr: Vec<Value> = list
         .iter()
         .take(MAX_QUICK)
-        .map(|q| json!({ "key": q.key, "text": q.text }))
+        .map(|q| match q.id {
+            Some(id) => json!({ "id": id, "key": q.key, "text": q.text }),
+            None => json!({ "key": q.key, "text": q.text }),
+        })
         .collect();
     prefs.set("quick", Value::Array(arr));
+}
+
+/// Merges cloud quick messages with unsynced local-only entries.
+pub(crate) fn merge_server_quick(
+    local: &[QuickReply],
+    remote: &[zalo_client::features::QuickMessageItem],
+) -> Vec<QuickReply> {
+    let mut out: Vec<QuickReply> = remote
+        .iter()
+        .filter_map(|item| {
+            let key = normalize_key(&item.keyword);
+            let text = item.text.trim().to_owned();
+            if key.is_empty() || text.is_empty() {
+                return None;
+            }
+            Some(QuickReply {
+                id: Some(item.id),
+                key,
+                text,
+            })
+        })
+        .collect();
+    for item in local {
+        if item.id.is_none() && !out.iter().any(|r| r.key.eq_ignore_ascii_case(&item.key)) {
+            out.push(item.clone());
+        }
+    }
+    out.truncate(MAX_QUICK);
+    out
 }
 
 /// True when quick-reply suggestions are enabled (`quickOff` is false/unset).
@@ -119,8 +158,70 @@ impl ShellView {
             key_input,
             text_input,
             form_open: false,
+            editing_id: None,
+            syncing: false,
             error: None,
         }));
+        self.sync_quick_messages(None, None, cx);
+    }
+
+    /// Background sync with `/api/quickmessage/{list,create,update,delete}`.
+    fn sync_quick_messages(
+        &mut self,
+        upsert: Option<(Option<i64>, String, String)>,
+        delete_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session) else {
+            return;
+        };
+        if let Some(Dialog::QuickMessages(dlg)) = self.dialog.as_mut() {
+            dlg.syncing = true;
+        }
+        cx.spawn(async move |this, cx| {
+            let got = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if let Some(id) = delete_id {
+                            api.delete_quick_messages(&[id])
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        if let Some((item_id, key, text)) = upsert {
+                            match item_id {
+                                Some(id) => {
+                                    api.update_quick_message(id, &key, &text)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                }
+                                None => {
+                                    api.create_quick_message(&key, &text)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                        }
+                        api.list_quick_messages(0, 0)
+                            .await
+                            .map(|v| zalo_client::features::quick_messages_from(&v).items)
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(remote) = got {
+                    let local = load_quick(&view.prefs);
+                    let merged = merge_server_quick(&local, &remote);
+                    save_quick(&mut view.prefs, &merged);
+                }
+                if let Some(Dialog::QuickMessages(dlg)) = view.dialog.as_mut() {
+                    dlg.syncing = false;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn insert_quick_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -415,6 +516,7 @@ impl ShellView {
                 .children(items.into_iter().enumerate().map(|(i, item)| {
                     let edit_item = item.clone();
                     let del_key = item.key.clone();
+                    let del_id = item.id;
                     div()
                         .id(("qm-row", i as u64))
                         .flex()
@@ -455,6 +557,7 @@ impl ShellView {
                                         let key_e = dlg.key_input.clone();
                                         let text_e = dlg.text_input.clone();
                                         dlg.form_open = true;
+                                        dlg.editing_id = edit_item.id;
                                         dlg.error = None;
                                         key_e.update(cx, |inp, cx| {
                                             inp.set_text(edit_item.key.clone(), cx)
@@ -477,6 +580,9 @@ impl ShellView {
                                     let mut list = load_quick(&this.prefs);
                                     list.retain(|q| q.key != del_key);
                                     save_quick(&mut this.prefs, &list);
+                                    if let Some(id) = del_id {
+                                        this.sync_quick_messages(None, Some(id), cx);
+                                    }
                                     cx.notify();
                                 }))
                                 .child("Xóa"),
@@ -543,6 +649,7 @@ impl ShellView {
                             let key_e = dlg.key_input.clone();
                             let text_e = dlg.text_input.clone();
                             dlg.form_open = true;
+                            dlg.editing_id = None;
                             dlg.error = None;
                             key_e.update(cx, |inp, cx| inp.clear(cx));
                             text_e.update(cx, |inp, cx| inp.clear(cx));
@@ -564,12 +671,23 @@ impl ShellView {
             dlg.error = Some("Nhập cả phím tắt và nội dung tin nhắn.".into());
             return;
         }
+        let editing_id = dlg.editing_id.take();
         dlg.form_open = false;
         dlg.error = None;
         let mut list = load_quick(&self.prefs);
-        list.retain(|q| q.key != key);
-        list.push(QuickReply { key, text });
+        let existing_id = editing_id.or_else(|| {
+            list.iter()
+                .find(|q| q.key == key)
+                .and_then(|q| q.id)
+        });
+        list.retain(|q| q.key != key && (existing_id.is_none() || q.id != existing_id));
+        list.push(QuickReply {
+            id: existing_id,
+            key: key.clone(),
+            text: text.clone(),
+        });
         save_quick(&mut self.prefs, &list);
+        self.sync_quick_messages(Some((existing_id, key, text)), None, cx);
     }
 }
 
@@ -585,10 +703,12 @@ mod tests {
             &mut prefs,
             &[
                 QuickReply {
+                    id: Some(10),
                     key: normalize_key("/xinchao "),
                     text: "Xin chào anh/chị".into(),
                 },
                 QuickReply {
+                    id: None,
                     key: "baogia".into(),
                     text: "Gửi bảng giá".into(),
                 },
@@ -596,7 +716,22 @@ mod tests {
         );
         let loaded = load_quick(&prefs);
         assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, Some(10));
         assert_eq!(loaded[0].key, "xinchao");
+        assert_eq!(loaded[1].id, None);
+
+        let merged = merge_server_quick(
+            &loaded,
+            &[zalo_client::features::QuickMessageItem {
+                id: 10,
+                keyword: "xinchao".into(),
+                text: "Xin chào (cloud)".into(),
+                item_type: 0,
+            }],
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "Xin chào (cloud)");
+        assert_eq!(merged[1].key, "baogia");
 
         assert_eq!(quick_matches(&loaded, "/").len(), 2);
         assert_eq!(quick_matches(&loaded, "/xin").len(), 1);

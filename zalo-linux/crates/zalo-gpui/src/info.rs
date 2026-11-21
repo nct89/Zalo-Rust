@@ -1,20 +1,18 @@
 //! "Group Info" / "Conversation Info" column, after the live Zalo PC
-//! panel (CDP 11/11/2026): 344 wide, centered title, avatar + name, four
-//! round actions, then "Group Members", "Group Board", "Photos/Videos",
-//! "Files", "Links", "Security Settings" (hide conversation, report),
-//! "Delete Chat History" / "Leave Group". A pending-join row appears
-//! when `/api/group/pending-mems/list` returns people. Sections are
-//! separated by 8 px `--layer-background-subtle`.
+//! panel: 344 wide, centered title, avatar + name, four round actions,
+//! members (count, faces, join link), group board, uniform photo grid,
+//! file and link rows with a date, then security (vanish, block sharing,
+//! hide, report, delete, leave). "Xem tất cả" expands inside this column.
+//! Sections are separated by 8 px `--layer-background-subtle`.
 
 use gpui::{
-    div, img, prelude::*, px, rgb, ClickEvent, Context, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled,
+    div, img, prelude::*, px, rgb, ClickEvent, ClipboardItem, Context, InteractiveElement,
+    IntoElement, ParentElement, StatefulInteractiveElement, Styled,
 };
 
 use crate::color::token_rgb;
 use crate::data::ChatConv;
 use crate::fonts::{self, ic, FAMILY_SEMIBOLD};
-use crate::media::MsgKind;
 use crate::shell::ShellView;
 use crate::window_frame::CsdCorners;
 
@@ -47,12 +45,272 @@ mod g {
     pub const CLOCK: char = '\u{EA9C}';
     pub const NOTE: char = '\u{EDAA}';
     pub const CHEVRON: char = '\u{EA8B}';
-    pub const FILE: char = '\u{EB1B}';
     pub const LINK: char = '\u{EC43}';
     pub const HIDE: char = '\u{EB11}';
     pub const TRASH: char = '\u{EDCF}';
     pub const LEAVE: char = '\u{EBC4}';
     pub const WARN: char = '\u{EE04}';
+    pub const COPY: char = '\u{EAC5}';
+    pub const SHARE: char = '\u{ED29}';
+}
+
+/// `https://zalo.me/g/…` → `zalo.me/g/…`.
+fn short_join_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
+/// Host without scheme or a leading `www.`.
+fn link_host_label(url: &str) -> String {
+    let host = crate::media::host_of(url);
+    host.strip_prefix("www.").unwrap_or(host).to_owned()
+}
+
+/// `sendDttm` as `dd/mm/yyyy`. Seconds are scaled up to milliseconds.
+fn shelf_ymd(ms: i64) -> String {
+    if ms <= 0 {
+        return String::new();
+    }
+    let ms = if ms < 1_000_000_000_000 {
+        ms.saturating_mul(1000)
+    } else {
+        ms
+    };
+    let (year, month, day) = crate::data::vn_ymd(ms);
+    format!("{day:02}/{month:02}/{year}")
+}
+
+fn link_row_title(text: &str, file_name: &str, url: &str) -> String {
+    let named = file_name.trim();
+    if !named.is_empty() && named != url && !named.starts_with("http") {
+        return named.to_owned();
+    }
+    let body = text.trim();
+    if !body.is_empty()
+        && body != url
+        && !body.starts_with("http://")
+        && !body.starts_with("https://")
+    {
+        return body.to_owned();
+    }
+    let short = short_join_url(url);
+    if short.is_empty() {
+        url.to_owned()
+    } else {
+        short
+    }
+}
+
+fn file_row_name(file_name: &str, text: &str) -> String {
+    let name = file_name.trim();
+    if !name.is_empty() {
+        return name.to_owned();
+    }
+    let text = text.trim();
+    text.strip_prefix("[File]")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(text)
+        .to_owned()
+}
+
+fn info_section_head(title: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_none()
+        .px(px(16.))
+        .h(px(48.))
+        .child(
+            div()
+                .text_size(px(16.))
+                .font_family(FAMILY_SEMIBOLD)
+                .child(crate::i18n::t(title.trim())),
+        )
+        .child(fonts::icon_el(g::CHEVRON, "▾", 16.))
+}
+
+fn info_empty(text: &'static str, muted: u32) -> impl IntoElement {
+    div()
+        .px(px(16.))
+        .pb(px(12.))
+        .text_size(px(13.))
+        .text_color(rgb(muted))
+        .child(text)
+}
+
+fn file_mark(name: &str) -> gpui::AnyElement {
+    let ext = crate::media::file_ext_label(name);
+    let color = crate::media::file_ext_color(name);
+    let image = matches!(
+        ext.as_str(),
+        "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "BMP" | "HEIC"
+    );
+    div()
+        .flex_none()
+        .w(px(36.))
+        .h(px(44.))
+        .rounded(px(4.))
+        .bg(rgb(color))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(0xffffff))
+        .text_size(px(11.))
+        .font_family(FAMILY_SEMIBOLD)
+        .child(if image {
+            fonts::icon_el(fonts::ic::TB_PHOTO, "", 18.).into_any_element()
+        } else {
+            div().child(ext).into_any_element()
+        })
+        .into_any_element()
+}
+
+fn link_mark() -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .size(px(36.))
+        .rounded(px(8.))
+        .bg(rgb(token_rgb("--layer-background-subtle", "#ebecf0")))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rgb(token_rgb("--text-secondary", "#5a6981")))
+        .child(fonts::icon_el(g::LINK, "🔗", 18.))
+        .into_any_element()
+}
+
+fn square_photo(
+    id: impl Into<gpui::ElementId>,
+    cell: f32,
+    thumb: Option<std::sync::Arc<gpui::RenderImage>>,
+    subtle: u32,
+    muted: u32,
+    cx: &mut Context<ShellView>,
+    click: impl Fn(&mut ShellView, &ClickEvent, &mut gpui::Window, &mut Context<ShellView>) + 'static,
+) -> gpui::AnyElement {
+    let missing = thumb.is_none();
+    div()
+        .id(id)
+        .relative()
+        .flex_none()
+        .w(px(cell))
+        .h(px(cell))
+        .min_w(px(cell))
+        .max_w(px(cell))
+        .min_h(px(cell))
+        .max_h(px(cell))
+        .rounded(px(4.))
+        .overflow_hidden()
+        .bg(rgb(subtle))
+        .cursor_pointer()
+        .on_click(cx.listener(click))
+        .when_some(thumb, |el, image| {
+            el.child(
+                img(image)
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(cell))
+                    .h(px(cell))
+                    .object_fit(gpui::ObjectFit::Cover),
+            )
+        })
+        .when(missing, |el| {
+            el.flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(muted))
+                .child(fonts::icon_el(fonts::ic::TB_PHOTO, "", 22.))
+        })
+        .into_any_element()
+}
+
+fn dated_row(
+    id: impl Into<gpui::ElementId>,
+    mark: impl IntoElement,
+    title: String,
+    meta: String,
+    checked: bool,
+    date: String,
+    cx: &mut Context<ShellView>,
+    click: impl Fn(&mut ShellView, &ClickEvent, &mut gpui::Window, &mut Context<ShellView>) + 'static,
+) -> gpui::AnyElement {
+    let ink = token_rgb("--text-primary", "#081b3a");
+    let muted = token_rgb("--text-secondary", "#5a6981");
+    let show_date = !date.is_empty();
+    let show_meta = !meta.is_empty();
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.))
+        .flex_none()
+        .px(px(16.))
+        .py(px(8.))
+        .min_h(px(56.))
+        .cursor_pointer()
+        .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
+        .on_click(cx.listener(click))
+        .child(mark)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .text_color(rgb(ink))
+                        .truncate()
+                        .child(title),
+                )
+                .when(show_meta, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .min_w(px(0.))
+                                    .text_size(px(12.))
+                                    .text_color(rgb(muted))
+                                    .truncate()
+                                    .child(meta),
+                            )
+                            .when(checked, |row| {
+                                row.child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(0x15_a8_5f))
+                                        .child(fonts::icon_el('\u{EC54}', "✓", 12.)),
+                                )
+                            }),
+                    )
+                }),
+        )
+        .when(show_date, |el| {
+            el.child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(rgb(muted))
+                    .child(date),
+            )
+        })
+        .into_any_element()
 }
 
 /// "Members" sub-page of the info column (live `getgi/v2`).
@@ -251,44 +509,19 @@ impl ShellView {
         if let Some(crate::dialogs::Dialog::GroupManage(g)) = self.dialog.as_ref() {
             return self.group_manage_el(g, corners, cx).into_any_element();
         }
+        if self.info_shelf.is_some_and(|(cid, _)| cid == conv.id) {
+            let kind = self.info_shelf.map(|(_, kind)| kind).unwrap_or(0);
+            return self
+                .media_shelf_panel(&conv, kind, corners, cx)
+                .into_any_element();
+        }
         let is_group = conv.is_group;
         let id = conv.id;
         let members = self
             .members_known(&conv.thread_id)
             .map(|n| n as usize)
             .unwrap_or_else(|| self.members_of(&conv).len().max(1));
-        let msgs = self.messages_of(id);
-        let photos: Vec<_> = msgs
-            .iter()
-            .rev()
-            .filter(|m| {
-                matches!(
-                    m.kind,
-                    MsgKind::Photo | MsgKind::Doodle | MsgKind::Gif | MsgKind::Video
-                )
-            })
-            .take(8)
-            .cloned()
-            .collect();
-        let photo_cell = ((INFO_PANEL_W - 32.0 - 4.0 * 3.0) / 4.0).floor();
         let pending_n = self.group_pending_n.get(&id).copied().unwrap_or(0);
-        let e2ee_line = if is_group {
-            if self
-                .e2ee_groups
-                .as_ref()
-                .is_some_and(|ids| zalo_client::features::group_marked_e2ee(ids, &conv.thread_id))
-            {
-                Some(
-                    "Máy chủ đánh dấu nhóm này là mã hóa đầu cuối. Máy này chưa mã hóa nội dung tin gửi đi.",
-                )
-            } else if self.e2ee_failed {
-                Some("Chưa đọc được danh sách nhóm mã hóa đầu cuối.")
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let member_preview: Vec<String> = if is_group {
             self.profiles
                 .map
@@ -305,26 +538,6 @@ impl ShellView {
         } else {
             Vec::new()
         };
-        let files: Vec<_> = msgs
-            .iter()
-            .rev()
-            .filter(|m| m.kind == MsgKind::File)
-            .take(3)
-            .cloned()
-            .collect();
-        let links: Vec<_> = msgs
-            .iter()
-            .rev()
-            .filter_map(|m| crate::media::first_link(&m.text).map(|u| (u, m.time.clone())))
-            .take(3)
-            .collect();
-        let cloud_photos = self.cloud_photos(&conv.thread_id);
-        let cloud_files = self.cloud_files(&conv.thread_id);
-        let cloud_links = self.cloud_links(&conv.thread_id);
-        let use_cloud_photos = !cloud_photos.is_empty();
-        let use_cloud_files = !cloud_files.is_empty();
-        let use_cloud_links = !cloud_links.is_empty();
-        let store_thread = conv.thread_id.clone();
         let muted_on = self.muted.contains(&id);
         let pinned_on = self.pinned.contains(&id);
         let action = |this: &Self,
@@ -437,8 +650,15 @@ impl ShellView {
         let gap = || div().h(px(8.)).flex_none().bg(rgb(subtle));
         let cloud =
             crate::shell::is_my_documents(&conv.name, &conv.thread_id, self.send2me_id.as_deref());
-        let avatar = match self.avatar_of(&conv.thread_id) {
-            Some(i) => div()
+        let own = self.shown_photo(&conv.thread_id);
+        let faces = if is_group && own.is_none() && !cloud {
+            self.group_collage_faces(&conv.thread_id)
+        } else {
+            Vec::new()
+        };
+        let paint = crate::sidebar::avatar_paint(is_group, own.is_some(), cloud, faces.len());
+        let avatar = match paint {
+            crate::sidebar::AvatarPaint::Photo => div()
                 .size(px(56.))
                 .rounded(px(28.))
                 .overflow_hidden()
@@ -448,14 +668,14 @@ impl ShellView {
                     "--layer-background",
                     "#ffffff",
                 )))
-                .child(
+                .children(own.map(|i| {
                     img(i)
                         .size_full()
                         .rounded(px(28.))
-                        .object_fit(gpui::ObjectFit::Cover),
-                )
+                        .object_fit(gpui::ObjectFit::Cover)
+                }))
                 .into_any_element(),
-            None if cloud => div()
+            crate::sidebar::AvatarPaint::Cloud => div()
                 .size(px(56.))
                 .rounded(px(28.))
                 .bg(rgb(token_rgb("--B55", "#0068ff")))
@@ -465,18 +685,22 @@ impl ShellView {
                 .text_color(rgb(0xffffff))
                 .child(fonts::icon_el(ic::DOCS_ON, "☁", 38.))
                 .into_any_element(),
-            None => div()
-                .size(px(56.))
-                .rounded(px(28.))
-                .bg(rgb(token_rgb("--B55", "#0068ff")))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(0xffffff))
-                .text_size(px(22.))
-                .font_family(FAMILY_SEMIBOLD)
-                .child(conv.name.chars().next().unwrap_or('?').to_string())
-                .into_any_element(),
+            crate::sidebar::AvatarPaint::Collage => {
+                crate::sidebar::group_collage(&faces, 56.).into_any_element()
+            }
+            crate::sidebar::AvatarPaint::GroupMark => {
+                crate::sidebar::group_mark(56.).into_any_element()
+            }
+            crate::sidebar::AvatarPaint::Letter => crate::sidebar::letter_disc(
+                &crate::sidebar::avatar_initials(&conv.name),
+                if is_group {
+                    0x0068ff
+                } else {
+                    crate::sidebar::avatar_color(&conv.thread_id)
+                },
+                56.,
+            )
+            .into_any_element(),
         };
         let leave_armed = self.leave_armed == Some(id);
         corners
@@ -694,6 +918,13 @@ impl ShellView {
                                     })),
                             )
                         })
+                        .when_some(
+                            self.info_join
+                                .get(&id)
+                                .cloned()
+                                .filter(|url| !url.is_empty()),
+                            |row, url| row.child(self.join_link_row(url, cx)),
+                        )
                         .when(pending_n > 0, |row| {
                             row.child(
                                 div()
@@ -774,240 +1005,34 @@ impl ShellView {
                             ))
                             .child(gap())
                     })
-                    .child(section(crate::color::str_vi(
-                        "STR_MENU_PHOTO_VIDEO",
-                        "Ảnh/Video",
-                    )))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap(px(4.))
-                            .px(px(16.))
-                            .pb(px(12.))
-                            .when(!use_cloud_photos && photos.is_empty(), |el| {
-                                el.child(
-                                    div().text_size(px(13.)).text_color(rgb(muted)).child(
-                                        "Chưa có Ảnh/Video được chia sẻ trong hội thoại này",
-                                    ),
-                                )
-                            })
-                            .when(!use_cloud_photos, |el| {
-                                el.children(photos.into_iter().map(|m| {
-                                    let open = m.clone();
-                                    let thumb = self.media_bitmaps.get(&m.id).cloned();
-                                    let cell = photo_cell;
-                                    div()
-                                        .id(("info-photo", m.id))
-                                        .size(px(cell))
-                                        .rounded(px(4.))
-                                        .overflow_hidden()
-                                        .bg(rgb(subtle))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, window, cx| {
-                                                this.open_viewer(open.clone(), window, cx);
-                                                cx.notify();
-                                            },
-                                        ))
-                                        .when_some(thumb.clone(), |el, t| {
-                                            el.child(
-                                                img(t)
-                                                    .size(px(cell))
-                                                    .object_fit(gpui::ObjectFit::Cover),
-                                            )
-                                        })
-                                        .when(thumb.is_none(), |el| {
-                                            el.flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .text_color(rgb(muted))
-                                                .child(fonts::icon_el(fonts::ic::TB_PHOTO, "", 24.))
-                                        })
-                                }))
-                            })
-                            .when(use_cloud_photos, |el| {
-                                el.children(cloud_photos.into_iter().enumerate().map(
-                                    |(i, item)| {
-                                        let thumb = self.store_thumb(&item.id);
-                                        let open = item.clone();
-                                        let thread = store_thread.clone();
-                                        let cell = photo_cell;
-                                        div()
-                                            .id(("info-cloud-photo", i as u64))
-                                            .size(px(cell))
-                                            .rounded(px(4.))
-                                            .overflow_hidden()
-                                            .bg(rgb(subtle))
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(
-                                                move |this, _: &ClickEvent, window, cx| {
-                                                    this.open_store_item(
-                                                        &open, id, &thread, window, cx,
-                                                    );
-                                                    cx.notify();
-                                                },
-                                            ))
-                                            .when_some(thumb, |el, t| {
-                                                el.child(
-                                                    img(t)
-                                                        .size(px(cell))
-                                                        .object_fit(gpui::ObjectFit::Cover),
-                                                )
-                                            })
-                                            .when(self.store_thumb(&item.id).is_none(), |el| {
-                                                el.flex()
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .text_color(rgb(muted))
-                                                    .child(fonts::icon_el(
-                                                        fonts::ic::TB_PHOTO,
-                                                        "",
-                                                        24.,
-                                                    ))
-                                            })
-                                    },
-                                ))
-                            }),
-                    )
-                    .child(gap())
-                    .child(section(crate::color::str_vi("STR_FILE", "File")))
-                    .when(!use_cloud_files && files.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .px(px(16.))
-                                .pb(px(12.))
-                                .text_size(px(13.))
-                                .text_color(rgb(muted))
-                                .child("Chưa có File được chia sẻ trong hội thoại này"),
-                        )
-                    })
-                    .when(!use_cloud_files, |el| {
-                        el.children(files.into_iter().map(|m| {
-                            let size = if m.file_size > 0 {
-                                format!(" · {}", crate::media::format_file_size(m.file_size))
-                            } else {
-                                String::new()
-                            };
-                            line(
-                                format!("info-file-{}", m.id),
-                                g::FILE,
-                                format!("{}{size}", m.file_name),
-                                None,
-                                false,
-                                cx,
-                            )
-                        }))
-                    })
-                    .when(use_cloud_files, |el| {
-                        el.children(cloud_files.into_iter().enumerate().map(|(i, item)| {
-                            let size = if item.file_size > 0 {
-                                format!(" · {}", crate::media::format_file_size(item.file_size))
-                            } else {
-                                String::new()
-                            };
-                            let open = item.clone();
-                            let thread = store_thread.clone();
-                            let label = format!("{}{size}", item.title);
-                            div()
-                                .id(("info-cloud-file", i as u64))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(12.))
-                                .flex_none()
-                                .px(px(16.))
-                                .h(px(48.))
-                                .cursor_pointer()
-                                .text_size(px(15.))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.open_store_item(&open, id, &thread, window, cx);
-                                    cx.notify();
-                                }))
-                                .child(fonts::icon_el(g::FILE, "•", 20.))
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(label))
-                        }))
-                    })
-                    .child(gap())
-                    .child(section(crate::color::str_vi("STR_LINK", "Link")))
-                    .when(!use_cloud_links && links.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .px(px(16.))
-                                .pb(px(12.))
-                                .text_size(px(13.))
-                                .text_color(rgb(muted))
-                                .child("Chưa có Link được chia sẻ trong hội thoại này"),
-                        )
-                    })
-                    .when(!use_cloud_links, |el| {
-                        el.children(links.into_iter().enumerate().map(|(i, (url, _))| {
-                            let open = url.clone();
-                            div()
-                                .id(("info-link", i as u64))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(12.))
-                                .flex_none()
-                                .px(px(16.))
-                                .h(px(44.))
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .text_color(rgb(token_rgb("--B55", "#0068ff")))
-                                .on_click(
-                                    cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&open)),
-                                )
-                                .child(fonts::icon_el(g::LINK, "🔗", 20.))
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(url))
-                        }))
-                    })
-                    .when(use_cloud_links, |el| {
-                        el.children(cloud_links.into_iter().enumerate().map(|(i, item)| {
-                            let open = item.clone();
-                            let thread = store_thread.clone();
-                            let label = if item.title.is_empty() {
-                                item.url.clone()
-                            } else {
-                                item.title.clone()
-                            };
-                            div()
-                                .id(("info-cloud-link", i as u64))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(12.))
-                                .flex_none()
-                                .px(px(16.))
-                                .h(px(44.))
-                                .cursor_pointer()
-                                .text_size(px(13.))
-                                .text_color(rgb(token_rgb("--B55", "#0068ff")))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                    this.open_store_item(&open, id, &thread, window, cx);
-                                    cx.notify();
-                                }))
-                                .child(fonts::icon_el(g::LINK, "🔗", 20.))
-                                .child(div().flex_1().min_w(px(0.)).truncate().child(label))
-                        }))
-                    })
-                    .child(gap())
-                    .when_some(e2ee_line, |el, text| {
-                        el.child(
-                            div()
-                                .px(px(16.))
-                                .pb(px(10.))
-                                .text_size(px(13.))
-                                .line_height(px(18.))
-                                .text_color(rgb(muted))
-                                .child(crate::i18n::t(text)),
-                        )
-                    })
+                    .child(self.shared_media_block(&conv, cx))
                     .child(section(crate::color::str_vi(
                         "STR_SETTINGS_PRIVACY_2",
                         "Thiết lập bảo mật",
                     )))
+                    .when(is_group, |el| {
+                        el.child(self.info_stack_row(
+                            "info-vanish",
+                            g::CLOCK,
+                            crate::color::str_vi("STR_VANISH_MSGS", "Tin nhắn tự xóa"),
+                            crate::color::str_vi("STR_NEVER", "Không bao giờ"),
+                            id,
+                            InfoAct::Manage,
+                            cx,
+                        ))
+                        .child(self.info_stack_row(
+                            "info-block-share",
+                            g::SHARE,
+                            crate::color::str_vi("STR_BLOCK_SHARING_STATUS_TITLE", "Chặn chia sẻ"),
+                            crate::color::str_vi(
+                                "STR_BLOCK_SHARING_STATUS_DESC",
+                                "Bảo vệ nội dung trò chuyện",
+                            ),
+                            id,
+                            InfoAct::Manage,
+                            cx,
+                        ))
+                    })
                     .child({
                         let hidden_on = self.hidden.contains(&id);
                         let hide_label = crate::color::str_vi(
@@ -1612,6 +1637,809 @@ impl ShellView {
         .detach();
     }
 
+    /// One `/api/group/link/detail` while the info column is open. An empty
+    /// string is stored on failure so the row stays hidden and is not retried.
+    pub(crate) fn drain_info_join(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.info_open || !self.has_session {
+            return;
+        }
+        let Some(conv) = self
+            .selected_conv()
+            .filter(|c| c.is_group && c.live && !c.thread_id.is_empty())
+        else {
+            return;
+        };
+        let id = conv.id;
+        if self.info_join.contains_key(&id) || self.info_join_busy.contains(&id) {
+            return;
+        }
+        if !crate::data::live_allowed(&conv.thread_id) {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let grid = conv.thread_id.clone();
+        self.info_join_busy.insert(id);
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.get_group_link_detail(&grid)
+                            .await
+                            .map(|v| crate::account::group_link_from(&v))
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.info_join_busy.remove(&id);
+                let url = match res {
+                    Ok(link) if link.enabled => link.url,
+                    _ => String::new(),
+                };
+                view.info_join.insert(id, url);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn copy_join_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(url.to_owned()));
+        self.set_note("Đã sao chép link nhóm");
+    }
+
+    fn share_join_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        let url = url.to_owned();
+        self.composer.update(cx, |input, cx| {
+            let cur = input.text();
+            let next = if cur.trim().is_empty() {
+                url.clone()
+            } else {
+                format!("{cur}\n{url}")
+            };
+            input.set_text(next, cx);
+        });
+        self.set_note("Đã chèn link vào ô soạn — chưa gửi");
+    }
+
+    fn join_link_row(&self, url: String, cx: &mut Context<Self>) -> impl IntoElement {
+        let shown = short_join_url(&url);
+        let copy_url = url.clone();
+        let share_url = url;
+        let row_url = copy_url.clone();
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let blue = token_rgb("--text-information", "#005ae0");
+        let title = crate::color::str_vi("STR_MENU_LINK_JOIN_GROUP", "Link tham gia nhóm")
+            .trim()
+            .to_owned();
+        div()
+            .id("info-join-link")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.))
+            .flex_none()
+            .px(px(16.))
+            .py(px(8.))
+            .min_h(px(56.))
+            .cursor_pointer()
+            .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.copy_join_link(&row_url, cx);
+            }))
+            .child(fonts::icon_el(g::LINK, "🔗", 20.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .text_color(rgb(ink))
+                            .truncate()
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(blue))
+                            .truncate()
+                            .child(shown),
+                    ),
+            )
+            .child(self.info_icon_btn("info-join-copy", g::COPY, cx, move |this, cx| {
+                this.copy_join_link(&copy_url, cx);
+            }))
+            .child(self.info_icon_btn(
+                "info-join-share",
+                g::SHARE,
+                cx,
+                move |this, cx| {
+                    this.share_join_link(&share_url, cx);
+                },
+            ))
+    }
+
+    fn info_icon_btn(
+        &self,
+        id: &'static str,
+        glyph: char,
+        cx: &mut Context<Self>,
+        click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex_none()
+            .size(px(32.))
+            .rounded(px(16.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                click(this, cx);
+            }))
+            .child(fonts::icon_el(glyph, "•", 18.))
+    }
+
+    fn info_stack_row(
+        &self,
+        key: &'static str,
+        code: char,
+        title: &'static str,
+        sub: &'static str,
+        id: u64,
+        act: InfoAct,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        div()
+            .id(key)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.))
+            .flex_none()
+            .px(px(16.))
+            .py(px(8.))
+            .min_h(px(56.))
+            .cursor_pointer()
+            .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.info_action(id, act, cx);
+                cx.notify();
+            }))
+            .child(fonts::icon_el(code, "•", 20.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .text_size(px(15.))
+                            .text_color(rgb(ink))
+                            .truncate()
+                            .child(title.trim().to_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(muted))
+                            .truncate()
+                            .child(sub.trim().to_owned()),
+                    ),
+            )
+    }
+
+    fn view_all_btn(&self, conv: u64, kind: u8, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id(("info-view-all", u64::from(kind)))
+            .mx(px(16.))
+            .mb(px(12.))
+            .h(px(32.))
+            .flex_none()
+            .rounded(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(token_rgb("--layer-background-subtle", "#ebecf0")))
+            .cursor_pointer()
+            .hover(|st| st.bg(rgb(token_rgb("--button-secondary-neutral-hover", "#d6d9de"))))
+            .text_size(px(14.))
+            .font_family(FAMILY_SEMIBOLD)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.info_shelf = Some((conv, kind));
+                cx.notify();
+            }))
+            .child(
+                crate::color::str_vi("STR_VIEW_ALL", "Xem tất cả")
+                    .trim()
+                    .to_owned(),
+            )
+    }
+
+    /// Ảnh/Video, File and Link, including "Xem tất cả" when the section has rows.
+    fn shared_media_block(&self, conv: &ChatConv, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = conv.id;
+        let thread = conv.thread_id.clone();
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
+        let msgs = self.messages_of(id);
+        let local_photos: Vec<_> = msgs
+            .iter()
+            .rev()
+            .filter(|m| {
+                matches!(
+                    m.kind,
+                    crate::media::MsgKind::Photo
+                        | crate::media::MsgKind::Doodle
+                        | crate::media::MsgKind::Gif
+                        | crate::media::MsgKind::Video
+                )
+            })
+            .cloned()
+            .collect();
+        let local_files: Vec<_> = msgs
+            .iter()
+            .rev()
+            .filter(|m| m.kind == crate::media::MsgKind::File)
+            .cloned()
+            .collect();
+        let local_links: Vec<(String, String, i64)> = msgs
+            .iter()
+            .rev()
+            .filter_map(|m| {
+                let url = if !m.href.is_empty() {
+                    m.href.clone()
+                } else {
+                    crate::media::first_link(&m.text)?
+                };
+                Some((url.clone(), link_row_title(&m.text, &m.file_name, &url), m.at_ms))
+            })
+            .collect();
+        let cloud_photos = self.cloud_photos(&thread);
+        let cloud_files = self.cloud_files(&thread);
+        let cloud_links = self.cloud_links(&thread);
+        let photo_count = if cloud_photos.is_empty() {
+            local_photos.len()
+        } else {
+            cloud_photos.len()
+        };
+        let file_count = if cloud_files.is_empty() {
+            local_files.len()
+        } else {
+            cloud_files.len()
+        };
+        let link_count = if cloud_links.is_empty() {
+            local_links.len()
+        } else {
+            cloud_links.len()
+        };
+        let cell = ((INFO_PANEL_W - 32.0 - 4.0 * 3.0) / 4.0).floor();
+        let mut grid = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(4.))
+            .px(px(16.))
+            .pb(px(8.))
+            .w_full();
+        if photo_count == 0 {
+            grid = grid.child(info_empty(
+                "Chưa có Ảnh/Video được chia sẻ trong hội thoại này",
+                muted,
+            ));
+        } else if cloud_photos.is_empty() {
+            grid = grid.children(local_photos.into_iter().take(8).map(|m| {
+                let open = m.clone();
+                let thumb = self.media_bitmaps.get(&m.id).cloned();
+                square_photo(
+                    ("info-photo", m.id),
+                    cell,
+                    thumb,
+                    subtle,
+                    muted,
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_viewer(open.clone(), window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        } else {
+            let thread_open = thread.clone();
+            grid = grid.children(cloud_photos.into_iter().enumerate().map(|(i, item)| {
+                let thumb = self.store_thumb(&item.id);
+                let open = item.clone();
+                let thread_open = thread_open.clone();
+                square_photo(
+                    ("info-cloud-photo", i as u64),
+                    cell,
+                    thumb,
+                    subtle,
+                    muted,
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_store_item(&open, id, &thread_open, window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        }
+        let mut files = div().flex().flex_col().w_full();
+        if file_count == 0 {
+            files = files.child(info_empty(
+                "Chưa có File được chia sẻ trong hội thoại này",
+                muted,
+            ));
+        } else if cloud_files.is_empty() {
+            files = files.children(local_files.into_iter().take(3).enumerate().map(|(i, m)| {
+                let name = file_row_name(&m.file_name, &m.text);
+                let open = m.media_url.clone();
+                dated_row(
+                    ("info-file", i as u64),
+                    file_mark(&name),
+                    name,
+                    if m.file_size > 0 {
+                        crate::media::format_file_size(m.file_size)
+                    } else {
+                        String::new()
+                    },
+                    true,
+                    shelf_ymd(m.at_ms),
+                    cx,
+                    move |_, _, _, cx| {
+                        if open.starts_with("http") {
+                            cx.open_url(&open);
+                        }
+                    },
+                )
+            }));
+        } else {
+            let thread_open = thread.clone();
+            files = files.children(cloud_files.into_iter().enumerate().map(|(i, item)| {
+                let name = if item.title.is_empty() {
+                    crate::color::str_vi("STR_FILE", "File").to_owned()
+                } else {
+                    item.title.clone()
+                };
+                let open = item.clone();
+                let thread_open = thread_open.clone();
+                dated_row(
+                    ("info-cloud-file", i as u64),
+                    file_mark(&name),
+                    name,
+                    if item.file_size > 0 {
+                        crate::media::format_file_size(item.file_size)
+                    } else {
+                        String::new()
+                    },
+                    true,
+                    shelf_ymd(item.sent_ms),
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_store_item(&open, id, &thread_open, window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        }
+        let mut links = div().flex().flex_col().w_full();
+        if link_count == 0 {
+            links = links.child(info_empty(
+                "Chưa có Link được chia sẻ trong hội thoại này",
+                muted,
+            ));
+        } else if cloud_links.is_empty() {
+            links = links.children(local_links.into_iter().take(3).enumerate().map(
+                |(i, (url, title, at))| {
+                    let open = url.clone();
+                    let host = link_host_label(&url);
+                    dated_row(
+                        ("info-link", i as u64),
+                        link_mark(),
+                        title,
+                        host,
+                        false,
+                        shelf_ymd(at),
+                        cx,
+                        move |_, _, _, cx| cx.open_url(&open),
+                    )
+                },
+            ));
+        } else {
+            let thread_open = thread.clone();
+            links = links.children(cloud_links.into_iter().enumerate().map(|(i, item)| {
+                let host = link_host_label(&item.url);
+                let title = if item.title.trim().is_empty() || item.title == item.url {
+                    short_join_url(&item.url)
+                } else {
+                    item.title.clone()
+                };
+                let open = item.clone();
+                let thread_open = thread_open.clone();
+                dated_row(
+                    ("info-cloud-link", i as u64),
+                    link_mark(),
+                    title,
+                    host,
+                    false,
+                    shelf_ymd(item.sent_ms),
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_store_item(&open, id, &thread_open, window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .child(info_section_head(crate::color::str_vi(
+                "STR_MENU_PHOTO_VIDEO",
+                "Ảnh/Video",
+            )))
+            .child(grid)
+            .when(photo_count > 0, |el| el.child(self.view_all_btn(id, 0, cx)))
+            .child(div().h(px(8.)).flex_none().bg(rgb(subtle)))
+            .child(info_section_head(crate::color::str_vi("STR_FILE", "File")))
+            .child(files)
+            .when(file_count > 0, |el| el.child(self.view_all_btn(id, 1, cx)))
+            .child(div().h(px(8.)).flex_none().bg(rgb(subtle)))
+            .child(info_section_head(crate::color::str_vi(
+                "STR_LINK",
+                "Link",
+            )))
+            .child(links)
+            .when(link_count > 0, |el| el.child(self.view_all_btn(id, 2, cx)))
+            .child(div().h(px(8.)).flex_none().bg(rgb(subtle)))
+    }
+
+    /// Full photo, file or link list already fetched for this conversation.
+    fn media_shelf_panel(
+        &self,
+        conv: &ChatConv,
+        kind: u8,
+        corners: CsdCorners,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
+        let id = conv.id;
+        let thread = conv.thread_id.clone();
+        let title = match kind {
+            1 => crate::color::str_vi("STR_FILE", "File"),
+            2 => crate::color::str_vi("STR_LINK", "Link"),
+            _ => crate::color::str_vi("STR_MENU_PHOTO_VIDEO", "Ảnh/Video"),
+        };
+        let body = if kind == 1 {
+            self.shelf_file_list(id, &thread, muted, cx)
+        } else if kind == 2 {
+            self.shelf_link_list(id, &thread, muted, cx)
+        } else {
+            self.shelf_photo_grid(id, &thread, subtle, muted, cx)
+        };
+        corners
+            .apply(
+                div()
+                    .id("conversation-info")
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .w(px(INFO_PANEL_W))
+                    .h_full()
+                    .bg(rgb(paper))
+                    .border_l_1()
+                    .border_color(crate::color::border_subtle())
+                    .text_color(rgb(ink)),
+                false,
+                false,
+                false,
+                true,
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .h(px(zalo_design::CHAT_HEADER_H))
+                    .px(px(12.))
+                    .border_b_1()
+                    .border_color(crate::color::border_subtle())
+                    .child(
+                        div()
+                            .id("info-shelf-back")
+                            .size(px(32.))
+                            .rounded(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.info_shelf = None;
+                                cx.notify();
+                            }))
+                            .child(fonts::icon_el('\u{EA8E}', "‹", 20.)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_center()
+                            .mr(px(32.))
+                            .text_size(px(18.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .child(title.trim().to_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("info-shelf-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .pt(px(12.))
+                    .pb(px(16.))
+                    .child(body),
+            )
+    }
+
+    fn shelf_photo_grid(
+        &self,
+        id: u64,
+        thread: &str,
+        subtle: u32,
+        muted: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let cloud = self.cloud_images_all(thread);
+        let cell = ((INFO_PANEL_W - 32.0 - 4.0 * 3.0) / 4.0).floor();
+        let mut grid = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap(px(4.))
+            .px(px(16.))
+            .w_full();
+        if cloud.is_empty() {
+            let local: Vec<_> = self
+                .messages_of(id)
+                .iter()
+                .rev()
+                .filter(|m| {
+                    matches!(
+                        m.kind,
+                        crate::media::MsgKind::Photo
+                            | crate::media::MsgKind::Doodle
+                            | crate::media::MsgKind::Gif
+                            | crate::media::MsgKind::Video
+                    )
+                })
+                .cloned()
+                .collect();
+            if local.is_empty() {
+                grid = grid.child(info_empty(
+                    "Chưa có Ảnh/Video được chia sẻ trong hội thoại này",
+                    muted,
+                ));
+            } else {
+                grid = grid.children(local.into_iter().enumerate().map(|(i, m)| {
+                    let open = m.clone();
+                    let thumb = self.media_bitmaps.get(&m.id).cloned();
+                    square_photo(
+                        ("shelf-photo", i as u64),
+                        cell,
+                        thumb,
+                        subtle,
+                        muted,
+                        cx,
+                        move |this, _, window, cx| {
+                            this.open_viewer(open.clone(), window, cx);
+                            cx.notify();
+                        },
+                    )
+                }));
+            }
+        } else {
+            let thread_open = thread.to_owned();
+            grid = grid.children(cloud.into_iter().enumerate().map(|(i, item)| {
+                let thumb = self.store_thumb(&item.id);
+                let open = item.clone();
+                let thread_open = thread_open.clone();
+                square_photo(
+                    ("shelf-cloud-photo", i as u64),
+                    cell,
+                    thumb,
+                    subtle,
+                    muted,
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_store_item(&open, id, &thread_open, window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        }
+        grid.into_any_element()
+    }
+
+    fn shelf_file_list(
+        &self,
+        id: u64,
+        thread: &str,
+        muted: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let cloud = self.cloud_files_all(thread);
+        let mut col = div().flex().flex_col().w_full();
+        if cloud.is_empty() {
+            let local: Vec<_> = self
+                .messages_of(id)
+                .iter()
+                .rev()
+                .filter(|m| m.kind == crate::media::MsgKind::File)
+                .cloned()
+                .collect();
+            if local.is_empty() {
+                col = col.child(info_empty(
+                    "Chưa có File được chia sẻ trong hội thoại này",
+                    muted,
+                ));
+            } else {
+                col = col.children(local.into_iter().enumerate().map(|(i, m)| {
+                    let name = file_row_name(&m.file_name, &m.text);
+                    let open = m.media_url.clone();
+                    dated_row(
+                        ("shelf-file", i as u64),
+                        file_mark(&name),
+                        name,
+                        if m.file_size > 0 {
+                            crate::media::format_file_size(m.file_size)
+                        } else {
+                            String::new()
+                        },
+                        true,
+                        shelf_ymd(m.at_ms),
+                        cx,
+                        move |_, _, _, cx| {
+                            if open.starts_with("http") {
+                                cx.open_url(&open);
+                            }
+                        },
+                    )
+                }));
+            }
+        } else {
+            let thread_open = thread.to_owned();
+            col = col.children(cloud.into_iter().enumerate().map(|(i, item)| {
+                let name = if item.title.is_empty() {
+                    crate::color::str_vi("STR_FILE", "File").to_owned()
+                } else {
+                    item.title.clone()
+                };
+                let open = item.clone();
+                let thread_open = thread_open.clone();
+                dated_row(
+                    ("shelf-cloud-file", i as u64),
+                    file_mark(&name),
+                    name,
+                    if item.file_size > 0 {
+                        crate::media::format_file_size(item.file_size)
+                    } else {
+                        String::new()
+                    },
+                    true,
+                    shelf_ymd(item.sent_ms),
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_store_item(&open, id, &thread_open, window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        }
+        col.into_any_element()
+    }
+
+    fn shelf_link_list(
+        &self,
+        id: u64,
+        thread: &str,
+        muted: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let cloud = self.cloud_links_all(thread);
+        let mut col = div().flex().flex_col().w_full();
+        if cloud.is_empty() {
+            let local: Vec<(String, String, i64)> = self
+                .messages_of(id)
+                .iter()
+                .rev()
+                .filter_map(|m| {
+                    let url = if !m.href.is_empty() {
+                        m.href.clone()
+                    } else {
+                        crate::media::first_link(&m.text)?
+                    };
+                    Some((
+                        url.clone(),
+                        link_row_title(&m.text, &m.file_name, &url),
+                        m.at_ms,
+                    ))
+                })
+                .collect();
+            if local.is_empty() {
+                col = col.child(info_empty(
+                    "Chưa có Link được chia sẻ trong hội thoại này",
+                    muted,
+                ));
+            } else {
+                col = col.children(local.into_iter().enumerate().map(|(i, (url, title, at))| {
+                    let open = url.clone();
+                    dated_row(
+                        ("shelf-link", i as u64),
+                        link_mark(),
+                        title,
+                        link_host_label(&url),
+                        false,
+                        shelf_ymd(at),
+                        cx,
+                        move |_, _, _, cx| cx.open_url(&open),
+                    )
+                }));
+            }
+        } else {
+            let thread_open = thread.to_owned();
+            col = col.children(cloud.into_iter().enumerate().map(|(i, item)| {
+                let host = link_host_label(&item.url);
+                let title = if item.title.trim().is_empty() || item.title == item.url {
+                    short_join_url(&item.url)
+                } else {
+                    item.title.clone()
+                };
+                let open = item.clone();
+                let thread_open = thread_open.clone();
+                dated_row(
+                    ("shelf-cloud-link", i as u64),
+                    link_mark(),
+                    title,
+                    host,
+                    false,
+                    shelf_ymd(item.sent_ms),
+                    cx,
+                    move |this, _, window, cx| {
+                        this.open_store_item(&open, id, &thread_open, window, cx);
+                        cx.notify();
+                    },
+                )
+            }));
+        }
+        col.into_any_element()
+    }
+
     /// `#conversation-info` "Members": back, "Add Members", list with roles.
     fn members_panel(
         &self,
@@ -1937,5 +2765,31 @@ mod tests {
         let member: std::collections::HashSet<String> = ["3".into()].into_iter().collect();
         assert!(!may_list_group_pending(&member, "1", &["2".into()]));
         assert!(!may_list_group_pending(&member, "", &[]));
+    }
+
+    #[test]
+    fn join_and_link_labels_drop_scheme() {
+        assert_eq!(
+            short_join_url("https://zalo.me/g/qpbstn093"),
+            "zalo.me/g/qpbstn093"
+        );
+        assert_eq!(short_join_url("http://zalo.me/g/abc/"), "zalo.me/g/abc");
+        assert_eq!(
+            link_host_label("https://www.github.com/duw/tool"),
+            "github.com"
+        );
+        assert_eq!(link_host_label("https://t.co/abc"), "t.co");
+        assert_eq!(
+            link_host_label("https://tokenized.play.google.com/ea"),
+            "tokenized.play.google.com"
+        );
+        assert_eq!(
+            link_row_title("https://github.com/a", "", "https://github.com/a"),
+            "github.com/a"
+        );
+        assert_eq!(
+            file_row_name("", "[File] BAO-CAO.md"),
+            "BAO-CAO.md"
+        );
     }
 }

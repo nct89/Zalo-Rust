@@ -135,6 +135,132 @@ impl XdgDirs {
     }
 }
 
+/// Cross-platform application directories for Linux (XDG), Windows (`APPDATA` /
+/// `LOCALAPPDATA`), and macOS (`~/Library/Application Support` / `Caches`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppPaths {
+    home: PathBuf,
+    config_dir: PathBuf,
+    data_dir: PathBuf,
+    cache_dir: PathBuf,
+    downloads_dir: PathBuf,
+}
+
+impl AppPaths {
+    /// Resolves standard per-user directories for `app_name` (e.g. `"zalo-rust"`)
+    /// from the current OS environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] when the user's home directory cannot be resolved.
+    pub fn from_env(app_name: &str) -> Result<Self, PathError> {
+        #[cfg(target_os = "windows")]
+        {
+            Self::from_windows_lookup(app_name, env_var)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Self::from_macos_lookup(app_name, env_var)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            let xdg = XdgDirs::from_env()?;
+            Ok(Self {
+                config_dir: xdg.config_home().join(app_name),
+                data_dir: xdg.data_home().join(app_name),
+                cache_dir: xdg.cache_home().join(app_name),
+                downloads_dir: xdg.downloads_dir(),
+                home: xdg.home().to_path_buf(),
+            })
+        }
+    }
+
+    /// Resolves Windows directory layout from `lookup` (`USERPROFILE`, `APPDATA`, `LOCALAPPDATA`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] when neither `USERPROFILE` nor `HOME` is set to an absolute path.
+    pub fn from_windows_lookup(
+        app_name: &str,
+        lookup: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, PathError> {
+        let home = lookup("USERPROFILE")
+            .filter(|v| !v.is_empty())
+            .or_else(|| lookup("HOME").filter(|v| !v.is_empty()))
+            .map(PathBuf::from)
+            .ok_or(PathError::MissingHome)?;
+        if !home.is_absolute() {
+            return Err(PathError::RelativeHome(home));
+        }
+        let roaming = absolute_dir(lookup("APPDATA"))
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+        let local = absolute_dir(lookup("LOCALAPPDATA"))
+            .unwrap_or_else(|| home.join("AppData").join("Local"));
+        let app_dir = roaming.join(app_name);
+        Ok(Self {
+            config_dir: app_dir.clone(),
+            data_dir: app_dir,
+            cache_dir: local.join(app_name).join("Cache"),
+            downloads_dir: home.join("Downloads"),
+            home,
+        })
+    }
+
+    /// Resolves macOS directory layout from `lookup` (`HOME`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PathError`] when `HOME` is missing or relative.
+    pub fn from_macos_lookup(
+        app_name: &str,
+        lookup: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, PathError> {
+        let home = lookup("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .ok_or(PathError::MissingHome)?;
+        if !home.is_absolute() {
+            return Err(PathError::RelativeHome(home));
+        }
+        let support = home
+            .join("Library")
+            .join("Application Support")
+            .join(app_name);
+        Ok(Self {
+            config_dir: support.clone(),
+            data_dir: support,
+            cache_dir: home.join("Library").join("Caches").join(app_name),
+            downloads_dir: home.join("Downloads"),
+            home,
+        })
+    }
+
+    /// The user's home directory.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// Directory for configuration files, `session.json`, and `store.db`.
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
+    }
+
+    /// Directory for persistent app data (OCR models, WASM, extracted backups).
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Directory for media/thumbnail/profile caches.
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// The user's Downloads folder.
+    pub fn downloads_dir(&self) -> &Path {
+        &self.downloads_dir
+    }
+}
+
 fn env_var(key: &str) -> Option<OsString> {
     env::var_os(key)
 }
@@ -297,5 +423,43 @@ mod tests {
         );
         assert_eq!(dirs.user_dir("XDG_DOCUMENTS_DIR"), None);
         assert_eq!(dirs.user_dir("XDG_VIDEOS_DIR"), None);
+    }
+
+    #[test]
+    fn app_paths_resolve_macos_layout() {
+        let paths = AppPaths::from_macos_lookup("zalo-rust", |key| match key {
+            "HOME" => Some(OsString::from("/Users/ana")),
+            _ => None,
+        })
+        .expect("macos paths");
+        assert_eq!(
+            paths.config_dir(),
+            Path::new("/Users/ana/Library/Application Support/zalo-rust")
+        );
+        assert_eq!(
+            paths.cache_dir(),
+            Path::new("/Users/ana/Library/Caches/zalo-rust")
+        );
+        assert_eq!(paths.downloads_dir(), Path::new("/Users/ana/Downloads"));
+    }
+
+    #[test]
+    fn app_paths_resolve_windows_layout() {
+        let paths = AppPaths::from_windows_lookup("zalo-rust", |key| match key {
+            "USERPROFILE" => Some(OsString::from("/Users/ana")),
+            "APPDATA" => Some(OsString::from("/Users/ana/AppData/Roaming")),
+            "LOCALAPPDATA" => Some(OsString::from("/Users/ana/AppData/Local")),
+            _ => None,
+        })
+        .expect("windows paths");
+        assert_eq!(
+            paths.config_dir(),
+            Path::new("/Users/ana/AppData/Roaming/zalo-rust")
+        );
+        assert_eq!(
+            paths.cache_dir(),
+            Path::new("/Users/ana/AppData/Local/zalo-rust/Cache")
+        );
+        assert_eq!(paths.downloads_dir(), Path::new("/Users/ana/Downloads"));
     }
 }

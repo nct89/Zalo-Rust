@@ -12,7 +12,6 @@ zalo-core = { path = "core/zalo-core" }
 zalo-protocol = { path = "core/zalo-protocol" }
 zalo-client = { path = "core/zalo-client" }
 zalo-storage = { path = "core/zalo-storage" }
-zalo-sync2 = { path = "core/zalo-sync2" }
 zalo-design = { path = "core/zalo-design" }
 zcall-core = { path = "core/zcall-core" }
 zimage = { path = "core/zimage" }

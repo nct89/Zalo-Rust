@@ -34,12 +34,20 @@ const CARD_RADIUS: f32 = 4.0;
 pub struct NoticeContent {
     /// Conversation name, or the sample title.
     pub title: String,
-    /// Message line. Already clipped.
+    /// Message line. Newlines already turned into spaces.
     pub body: String,
     /// Letter drawn when no avatar bitmap is cached.
     pub initial: String,
     /// Cached avatar, when the shell already decoded one.
     pub image: Option<Arc<RenderImage>>,
+    /// Thread whose photo should replace the letter while this popup is open.
+    pub thread_key: String,
+}
+
+/// Electron `znotification` replaces CR/LF with a space before the card clips.
+#[must_use]
+pub fn notice_line(text: &str) -> String {
+    text.replace(['\r', '\n'], " ")
 }
 
 struct Target {
@@ -249,6 +257,31 @@ pub fn present(
     }
 }
 
+/// Put a decoded avatar on the open popup when it is still this thread and
+/// still showing the letter. Does not restart the dismiss timer.
+pub fn patch_avatar(cx: &mut App, thread_key: &str, image: Arc<RenderImage>) -> bool {
+    let Some(handle) = open_slot().lock().ok().and_then(|guard| *guard) else {
+        return false;
+    };
+    if handle.read(cx).is_err() {
+        if let Ok(mut guard) = open_slot().lock() {
+            *guard = None;
+        }
+        return false;
+    }
+    let key = thread_key.to_owned();
+    handle
+        .update(cx, |view, _, cx| {
+            if view.expired || view.content.thread_key != key || view.content.image.is_some() {
+                return false;
+            }
+            view.content.image = Some(image);
+            cx.notify();
+            true
+        })
+        .unwrap_or(false)
+}
+
 /// Move an open popup when the settings corner changes. No window is created.
 pub fn move_if_open(cx: &mut App, scale: f32, corner: &str, saved_x: f32, saved_y: f32) {
     let Some(handle) = open_slot().lock().ok().and_then(|guard| *guard) else {
@@ -402,6 +435,7 @@ impl Render for NoticeView {
         div()
             .id("znotice")
             .size_full()
+            .overflow_hidden()
             .bg(gpui::transparent_black())
             .child(
                 div()
@@ -416,6 +450,7 @@ impl Render for NoticeView {
                     .border_1()
                     .border_color(edge)
                     .shadow_md()
+                    .overflow_hidden()
                     .occlude()
                     .cursor(gpui::CursorStyle::OpenHand)
                     .on_mouse_down(
@@ -438,17 +473,23 @@ impl Render for NoticeView {
                             .flex_row()
                             .items_center()
                             .size_full()
+                            .overflow_hidden()
                             .child(avatar_el(initial, image))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
+                                    .max_w(px(248.))
                                     .mr(px(22.))
+                                    .overflow_hidden()
                                     .flex()
                                     .flex_col()
                                     .child(
                                         div()
                                             .id("ztitle")
+                                            .w_full()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
                                             .truncate()
                                             .text_size(px(16.))
                                             .line_height(px(21.))
@@ -459,7 +500,10 @@ impl Render for NoticeView {
                                     .child(
                                         div()
                                             .id("zbody")
+                                            .w_full()
                                             .mt(px(6.))
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
                                             .truncate()
                                             .text_size(px(14.))
                                             .line_height(px(19.))
@@ -547,5 +591,11 @@ mod tests {
         assert!(cx <= x + w - super::NOTICE_W);
         assert!(cy >= y);
         assert_eq!(screen_origin("nope", 0.0, 0.0, x, y, w, h), (right, top));
+    }
+
+    #[test]
+    fn notice_body_is_one_line() {
+        assert_eq!(super::notice_line("a\r\nb\nc"), "a  b c");
+        assert!(!super::notice_line("dòng\ndài").contains('\n'));
     }
 }

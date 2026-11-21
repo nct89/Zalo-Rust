@@ -1194,7 +1194,7 @@ mod tests {
                     "data": data_text,
                 }
             }, {
-                "content": {"act_type": "transfer_sync2", "act": "upload_batch", "data": {}}
+                "content": {"act_type": "ignored", "act": "not_a_call", "data": {}}
             }]
         });
         let voip = voip_controls_from_event(&event);

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use futures::channel::mpsc::UnboundedSender;
 use serde_json::Value;
-use zalo_client::{run_listener_with, Device, Frame, ListenerEvent, StoredSession, ZaloApi};
+use zalo_client::{run_listener_with, Device, ListenerEvent, StoredSession, ZaloApi};
 use zalo_storage::{LocalStore, MessageRecord, ThreadKind, ThreadRecord, UserRecord};
 
 use crate::media::{MsgKind, PollChoice};
@@ -39,10 +39,6 @@ pub enum RtEvent {
     Pinned(Vec<String>),
     /// Synced archived conversation ids from `/api/archivedchat/list`.
     Archived(Vec<String>),
-    /// Sync v2 frames (`cmd 590` reply or `cmd 601` push control).
-    SyncSignal(u16, Value),
-    /// PC → phone backup replies (`cmd 632` metadata, `cmd 634` configs).
-    BackupReply(u16, Value),
 }
 
 /// One parsed reaction update from `610/611/612/613`.
@@ -133,19 +129,31 @@ pub struct Incoming {
     pub poll_options: Vec<PollChoice>,
     /// `1` when the row came from `/api/message/fetchImportant`.
     pub urgency: u8,
+    /// Album id when this photo is one cell of a multi-photo send. `0` otherwise.
+    pub group_layout_id: i64,
 }
 
 static FILES: std::sync::OnceLock<(
     std::sync::Mutex<std::collections::HashMap<String, String>>,
     std::sync::Condvar,
 )> = std::sync::OnceLock::new();
+static ACTIVE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LISTENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SYNC_OUT: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Frame>>> =
-    std::sync::Mutex::new(None);
+/// Invalidates the active realtime generation so any winding-down worker stops
+/// publishing events or status.
+pub(crate) fn invalidate_generation(new_gen: u64) {
+    ACTIVE_GEN.store(new_gen, std::sync::atomic::Ordering::SeqCst);
+    LISTENING.store(false, std::sync::atomic::Ordering::SeqCst);
+}
 
-/// Outgoing socket channel for `sync-v2` requests (`cmd 590/591/592`), if connected.
-pub(crate) fn sync_outgoing() -> Option<tokio::sync::mpsc::UnboundedSender<Frame>> {
-    SYNC_OUT.lock().ok().and_then(|g| g.clone())
+fn is_active_gen(gen: u64) -> bool {
+    ACTIVE_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen
+}
+
+fn set_listening_for(gen: u64, on: bool) {
+    if is_active_gen(gen) {
+        LISTENING.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn files() -> &'static (
@@ -183,8 +191,14 @@ pub fn wait_file_url(id: &str, timeout: Duration) -> Option<String> {
     }
 }
 
-/// Start the listener thread. It stops when the receiver is dropped.
-pub fn start(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
+/// Start the listener thread with a generational shutdown channel.
+pub fn start_with_shutdown(
+    dir: PathBuf,
+    tx: UnboundedSender<RtEvent>,
+    gen: u64,
+    stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    ACTIVE_GEN.store(gen, std::sync::atomic::Ordering::SeqCst);
     let _ = std::thread::Builder::new()
         .name("zalo-gpui-realtime".into())
         .spawn(move || {
@@ -195,28 +209,87 @@ pub fn start(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
                 let _ = tx.unbounded_send(RtEvent::Offline("tokio".into()));
                 return;
             };
-            rt.block_on(run(&dir, &tx));
+            rt.block_on(run(&dir, &tx, gen, stop_rx));
+            set_listening_for(gen, false);
         });
 }
 
-async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
+/// Start the listener thread. It stops when the receiver is dropped.
+pub fn start(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
+    let gen = ACTIVE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    start_with_shutdown(dir, tx, gen, stop_rx);
+}
+
+async fn wait_stopped(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *stop_rx.borrow() {
+        return;
+    }
+    while stop_rx.changed().await.is_ok() {
+        if *stop_rx.borrow() {
+            return;
+        }
+    }
+}
+
+fn is_missing_session_err(err: &zalo_client::SessionError) -> bool {
+    matches!(err, zalo_client::SessionError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
+}
+
+async fn run(
+    dir: &Path,
+    tx: &UnboundedSender<RtEvent>,
+    gen: u64,
+    mut stop_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let store_path = dir.join("store.db");
     let mut synced = false;
+    let mut refresh_wait = Duration::from_secs(2);
     loop {
-        if tx.is_closed() {
+        if tx.is_closed() || *stop_rx.borrow() || !is_active_gen(gen) {
             return;
         }
         let mut wait = Duration::from_secs(5);
         let (api, server_info, self_uin) = loop {
-            if tx.is_closed() {
+            if tx.is_closed() || *stop_rx.borrow() || !is_active_gen(gen) {
                 return;
             }
-            let attempt: Result<_, String> = async {
-                let device = Device::load_or_create(dir).map_err(|e| e.to_string())?;
-                let session = StoredSession::load(dir).map_err(|e| e.to_string())?;
-                let mut api =
-                    ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
-                let info = api.get_login_info().await.map_err(|e| e.to_string())?;
+            let attempt = async {
+                let device = Device::load_or_create(dir).map_err(|e| (e.to_string(), false))?;
+                let mut session = match StoredSession::load(dir) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let missing = is_missing_session_err(&err);
+                        return Err((err.to_string(), missing));
+                    }
+                };
+                let mut api = ZaloApi::from_session(device, &session)
+                    .map_err(|e| (e.to_string(), false))?;
+                let info = api
+                    .get_login_info()
+                    .await
+                    .map_err(|e| (e.to_string(), false))?;
+                // Persist refreshed cookies and keys back to session.json so
+                // `bridge::spawn_live` does not keep loading stale cookies.
+                let fresh_cookies = api.cookie_headers();
+                if !fresh_cookies.is_empty() {
+                    session.cookie_headers = fresh_cookies;
+                    if let Some(sek) = zalo_client::session::extract_zpw_sek(&session.cookie_headers) {
+                        session.zpw_sek = Some(sek);
+                    }
+                }
+                session.apply_login_info(
+                    info.uin.clone(),
+                    info.zpw_enk.clone(),
+                    info.phone_number.clone().or(session.phone_number.clone()),
+                    info.display_name.clone().or(session.display_name.clone()),
+                );
+                if let Some(uid) = info.send2me_id.clone().filter(|s| !s.is_empty()) {
+                    session.send2me_id = Some(uid);
+                }
+                if is_active_gen(gen) && dir.join("session.json").is_file() {
+                    let _ = session.save(dir);
+                }
                 crate::bridge::remember_login_info(
                     dir,
                     session.zpw_sek().as_deref().unwrap_or(""),
@@ -229,21 +302,33 @@ async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| info.uin.clone());
                 Ok((api, server, self_uid))
-            }
-            .await;
-            match attempt {
+            };
+            let outcome = tokio::select! {
+                _ = wait_stopped(&mut stop_rx) => return,
+                res = attempt => res,
+            };
+            match outcome {
                 Ok(ready) => break ready,
-                Err(err) => {
-                    let fatal = crate::login_flow::is_session_error(&err);
+                Err((err, missing_session)) => {
+                    if !is_active_gen(gen) || *stop_rx.borrow() {
+                        return;
+                    }
+                    let fatal = missing_session || crate::login_flow::is_session_error(&err);
                     let _ = tx.unbounded_send(RtEvent::Offline(err));
                     if fatal {
                         return;
                     }
-                    tokio::time::sleep(wait).await;
+                    tokio::select! {
+                        _ = wait_stopped(&mut stop_rx) => return,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
                     wait = (wait * 2).min(Duration::from_secs(60));
                 }
             }
         };
+        if !is_active_gen(gen) || *stop_rx.borrow() {
+            return;
+        }
         let (since_user, since_group) = LocalStore::open(&store_path)
             .ok()
             .and_then(|s| s.newest_global_ids().ok())
@@ -262,23 +347,22 @@ async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
                 tx.clone(),
             ));
         }
-        let (sync_tx, sync_rx) = tokio::sync::mpsc::unbounded_channel::<Frame>();
-        if let Ok(mut slot) = SYNC_OUT.lock() {
-            *slot = Some(sync_tx);
-        }
         let tx2 = tx.clone();
         let store_path_cb = store_path.clone();
-        let result = run_listener_with(config, Some(sync_rx), move |event| {
-            if tx2.is_closed() {
+        let reached_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached_ready_cb = std::sync::Arc::clone(&reached_ready);
+        let listen_fut = run_listener_with(config, None, move |event| {
+            if tx2.is_closed() || !is_active_gen(gen) {
                 return false;
             }
             let out = match event {
                 ListenerEvent::Ready => {
-                    LISTENING.store(true, std::sync::atomic::Ordering::Relaxed);
+                    reached_ready_cb.store(true, std::sync::atomic::Ordering::Relaxed);
+                    set_listening_for(gen, true);
                     RtEvent::Online
                 }
                 ListenerEvent::Disconnected(why) => {
-                    LISTENING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    set_listening_for(gen, false);
                     RtEvent::Offline(why)
                 }
                 ListenerEvent::Replaced => RtEvent::Replaced,
@@ -299,7 +383,8 @@ async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
                     RtEvent::Typing(filtered)
                 }
                 ListenerEvent::Event { cmd, sub_cmd, data }
-                    if cmd == zalo_client::listener::CMD_PUSH_CTRL =>
+                    if cmd == zalo_client::listener::CMD_PUSH_CTRL
+                        || cmd == zalo_client::listener::CMD_PULL_CTRL =>
                 {
                     if crate::call::call_log_enabled() {
                         eprintln!(
@@ -310,29 +395,16 @@ async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
                     for (id, url) in zalo_client::listener::file_done_from_event(&data) {
                         file_done(id, url);
                     }
-                    if crate::phone_sync::is_running()
-                        && tx2
-                            .unbounded_send(RtEvent::SyncSignal(cmd, data.clone()))
-                            .is_err()
-                    {
-                        return false;
+                    // 603 is the catch-up of 601. Call confirmations ride on it.
+                    // Replaying an old call from that catch-up would ring again.
+                    if cmd != zalo_client::listener::CMD_PUSH_CTRL {
+                        return true;
                     }
                     let voip = zalo_client::voip_controls_from_event(&data);
                     if voip.is_empty() {
                         return true;
                     }
                     RtEvent::Voip(voip)
-                }
-                ListenerEvent::Event { cmd, data, .. } if crate::backup_msg::wants(cmd) => {
-                    RtEvent::BackupReply(cmd, data)
-                }
-                ListenerEvent::Event { cmd, data, .. }
-                    if cmd == zalo_sync2::request::CMD_REQUEST_SYNC =>
-                {
-                    if !crate::phone_sync::is_running() {
-                        return true;
-                    }
-                    RtEvent::SyncSignal(cmd, data)
                 }
                 ListenerEvent::Event { cmd, data, .. }
                     if matches!(
@@ -380,18 +452,33 @@ async fn run(dir: &Path, tx: &UnboundedSender<RtEvent>) {
                 _ => return true,
             };
             tx2.unbounded_send(out).is_ok()
-        })
-        .await;
-        if let Ok(mut slot) = SYNC_OUT.lock() {
-            *slot = None;
+        });
+        let result = tokio::select! {
+            _ = wait_stopped(&mut stop_rx) => {
+                set_listening_for(gen, false);
+                return;
+            }
+            res = listen_fut => res,
+        };
+        set_listening_for(gen, false);
+        if !is_active_gen(gen) || *stop_rx.borrow() {
+            return;
+        }
+        if reached_ready.load(std::sync::atomic::Ordering::Relaxed) {
+            refresh_wait = Duration::from_secs(2);
         }
         match result {
             Ok(()) => return,
             Err(zalo_client::listener::ListenerError::RefreshNeeded) => {
                 eprintln!(
-                    "zalo-gpui realtime: consecutive WebSocket drops before Ready; refreshing login info and endpoints"
+                    "zalo-gpui realtime: consecutive WebSocket drops before Ready; refreshing login info and endpoints in {}s",
+                    refresh_wait.as_secs()
                 );
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::select! {
+                    _ = wait_stopped(&mut stop_rx) => return,
+                    _ = tokio::time::sleep(refresh_wait) => {}
+                }
+                refresh_wait = (refresh_wait * 2).min(Duration::from_secs(60));
             }
             Err(err) => {
                 let _ = tx.unbounded_send(RtEvent::Offline(err.to_string()));
@@ -535,6 +622,36 @@ fn json_i64(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
 
+/// Electron `isGroupPhotoItem`: `is_group_layout` and `total_item_in_group > 1`.
+fn photo_group_layout(params: &Value) -> i64 {
+    let flag = params
+        .get("is_group_layout")
+        .or_else(|| params.get("isGroupLayout"));
+    let on = match flag {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        Some(Value::String(s)) => s == "1" || s.eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    if !on {
+        return 0;
+    }
+    let total = params
+        .get("total_item_in_group")
+        .or_else(|| params.get("totalItemInGroup"))
+        .and_then(json_i64)
+        .unwrap_or(0);
+    if total <= 1 {
+        return 0;
+    }
+    params
+        .get("group_layout_id")
+        .or_else(|| params.get("groupLayoutId"))
+        .and_then(json_i64)
+        .filter(|id| *id != 0)
+        .unwrap_or(0)
+}
+
 fn json_f64(v: &Value) -> Option<f64> {
     v.as_f64()
         .or_else(|| v.as_i64().map(|n| n as f64))
@@ -612,7 +729,13 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
             (!id_to.is_empty() && id_to != "0" && (self_uin.is_empty() || id_to != self_uin))
                 .then_some(id_to.as_str())
         })?;
-        let clean = raw.strip_prefix("g_").unwrap_or(raw);
+        let clean = raw
+            .strip_prefix("g_")
+            .or_else(|| {
+                raw.strip_prefix('g')
+                    .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+            })
+            .unwrap_or(raw);
         if clean.is_empty() {
             return None;
         }
@@ -676,6 +799,7 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
             m.width = params.get("width").and_then(json_i64).unwrap_or(0).max(0) as u32;
             m.height = params.get("height").and_then(json_i64).unwrap_or(0).max(0) as u32;
             m.text = field("title").unwrap_or_else(|| "[Hình ảnh]".into());
+            m.group_layout_id = photo_group_layout(&params);
         }
         "chat.gif" => {
             // The still `thumb` is often a JPEG. The moving picture is `href`.
@@ -1077,10 +1201,16 @@ pub(crate) fn store_all(path: &Path, list: &mut [Incoming]) {
                 } else {
                     "photo"
                 };
-                Some(serde_json::json!({
-                    "kind": kind, "thumb": m.media_url, "hd": m.media_url,
-                    "width": m.width, "height": m.height, "local": null
-                }))
+                {
+                    let mut obj = serde_json::json!({
+                        "kind": kind, "thumb": m.media_url, "hd": m.media_url,
+                        "width": m.width, "height": m.height, "local": null
+                    });
+                    if m.group_layout_id != 0 {
+                        obj["group_layout_id"] = serde_json::json!(m.group_layout_id);
+                    }
+                    Some(obj)
+                }
             } else if m.kind == MsgKind::Sticker && !m.media_url.is_empty() {
                 Some(serde_json::json!({
                     "kind": "sticker", "thumb": m.media_url, "hd": m.media_url,

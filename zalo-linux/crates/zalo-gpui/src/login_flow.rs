@@ -6,15 +6,32 @@
 //! [`LoginEvent`]s through an unbounded channel the GPUI view drains.
 
 use futures::channel::mpsc::UnboundedSender;
-use zalo_client::{ClientError, Device, StoredSession, ZaloApi};
+use zalo_client::{
+    confirm_zpw_sek, ClientError, Device, QrScanOutcome, StoredSession, ZaloApi,
+};
+
+/// Payload rendered as a QR code in [`LoginEvent::Qr`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QrPrompt {
+    /// QR text/URL payload (`qr_cnt` / `ntk`), empty if only `base64_png` was returned.
+    pub url: String,
+    /// Optional server-rendered base64 PNG (`base64_qr`).
+    pub base64_png: Option<String>,
+    /// Validity in seconds.
+    pub timeout_seconds: u64,
+    /// True when the server issued a second security-verification QR (`error_code == -20`).
+    pub security_step: bool,
+    /// Optional server notice explaining the security verification step.
+    pub message: Option<String>,
+}
 
 /// Progress of one login attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoginEvent {
     /// Human-readable step.
     Status(String),
-    /// URL to encode in the QR and its validity.
-    Qr(String, u64),
+    /// QR code to display (initial or `-20` security verification renewal).
+    Qr(QrPrompt),
     /// Phone scanned; waiting for "Confirm" on the phone.
     Scanned(Option<String>),
     /// QR timed out (show the reload overlay).
@@ -43,10 +60,10 @@ pub fn start(tx: UnboundedSender<LoginEvent>) {
 
 /// `Ok(true)` logged in, `Ok(false)` QR expired.
 fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
-    let dir = zalo_core::XdgDirs::from_env()
+    let dir = zalo_core::AppPaths::from_env("zalo-rust")
         .map_err(|e| e.to_string())?
-        .config_home()
-        .join("zalo-rust");
+        .config_dir()
+        .to_path_buf();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -61,31 +78,83 @@ fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
             .await
             .map_err(|e| format!("getServerInfo: {e}"))?;
         send(LoginEvent::Status("Đang lấy mã QR…".into()));
-        let ticket = api.request_qr().await.map_err(|e| format!("reqqr: {e}"))?;
-        send(LoginEvent::Qr(
-            ticket.qr_url.clone(),
-            ticket.timeout_seconds,
-        ));
-        match api.wait_for_scan(&ticket).await {
-            Ok(v) => {
-                let name = v
-                    .pointer("/data/display_name")
-                    .or_else(|| v.pointer("/data/displayName"))
-                    .and_then(|x| x.as_str())
-                    .map(str::to_owned);
-                send(LoginEvent::Scanned(name));
+        let mut ticket = api.request_qr().await.map_err(|e| format!("reqqr: {e}"))?;
+        send(LoginEvent::Qr(QrPrompt {
+            url: ticket.qr_url.clone(),
+            base64_png: ticket.base64_qr.clone(),
+            timeout_seconds: ticket.timeout_seconds,
+            security_step: false,
+            message: None,
+        }));
+        let mut renewals = 0u8;
+        loop {
+            match api.wait_for_scan_step(&ticket).await {
+                Ok(QrScanOutcome::Scanned(v)) => {
+                    let name = v
+                        .pointer("/data/display_name")
+                        .or_else(|| v.pointer("/data/displayName"))
+                        .and_then(|x| x.as_str())
+                        .map(str::to_owned);
+                    send(LoginEvent::Scanned(name));
+                    break;
+                }
+                Ok(QrScanOutcome::RenewQr {
+                    ticket: next_ticket,
+                    message,
+                }) => {
+                    renewals = renewals.saturating_add(1);
+                    eprintln!("zalo-gpui login: -20 security QR renewal #{renewals}");
+                    if renewals > 4 {
+                        return Err("Xác nhận bảo mật thất bại quá nhiều lần. Hãy thử tải lại mã QR.".into());
+                    }
+                    ticket = next_ticket;
+                    let note = if message.trim().is_empty() {
+                        None
+                    } else {
+                        Some(message)
+                    };
+                    send(LoginEvent::Qr(QrPrompt {
+                        url: ticket.qr_url.clone(),
+                        base64_png: ticket.base64_qr.clone(),
+                        timeout_seconds: ticket.timeout_seconds,
+                        security_step: true,
+                        message: note,
+                    }));
+                }
+                Err(ClientError::Timeout(_)) => {
+                    eprintln!("zalo-gpui login: wait_for_scan timeout");
+                    return Ok(false);
+                }
+                Err(ClientError::Zalo { code: 18010, .. }) => {
+                    eprintln!("zalo-gpui login: wait_for_scan rejected (18010)");
+                    return Err("Bạn đã từ chối đăng nhập trên điện thoại.".into());
+                }
+                Err(e) => {
+                    eprintln!("zalo-gpui login: wait_for_scan error: {e}");
+                    return Err(format!("wait_for_scan: {e}"));
+                }
             }
-            Err(ClientError::Timeout(_)) => return Ok(false),
-            Err(e) => return Err(format!("wait_for_scan: {e}")),
         }
-        match api.wait_for_confirm(&ticket).await {
-            Ok(_) => {}
-            Err(ClientError::Timeout(_)) => return Ok(false),
-            Err(e) => return Err(format!("wait_for_confirm: {e}")),
-        }
+        let confirm_val = match api.wait_for_confirm(&ticket).await {
+            Ok(v) => v,
+            Err(ClientError::Timeout(_)) => {
+                eprintln!("zalo-gpui login: wait_for_confirm timeout");
+                return Ok(false);
+            }
+            Err(ClientError::Zalo { code: 18010, .. }) => {
+                eprintln!("zalo-gpui login: wait_for_confirm rejected (18010)");
+                return Err("Bạn đã từ chối đăng nhập trên điện thoại.".into());
+            }
+            Err(e) => {
+                eprintln!("zalo-gpui login: wait_for_confirm error: {e}");
+                return Err(format!("wait_for_confirm: {e}"));
+            }
+        };
         send(LoginEvent::Status("Đang lưu phiên đăng nhập…".into()));
-        let session = StoredSession::from_cookie_headers(api.cookie_headers());
-        session.save(&dir).map_err(|e| e.to_string())?;
+        let mut session = StoredSession::from_cookie_headers(api.cookie_headers());
+        if let Some(sek) = confirm_zpw_sek(&confirm_val) {
+            session.ensure_zpw_sek(&sek);
+        }
         let device = Device::load_or_create(&dir).map_err(|e| e.to_string())?;
         let mut api = ZaloApi::from_session(device, &session).map_err(|e| e.to_string())?;
         send(LoginEvent::Status("Đang lấy thông tin tài khoản…".into()));
@@ -93,35 +162,61 @@ fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
             .get_login_info()
             .await
             .map_err(|e| format!("getLoginInfo: {e}"))?;
-        let me = api.get_me().await.ok();
-        let name = info.display_name.clone().or_else(|| {
-            me.as_ref()
-                .and_then(|v| crate::profiles::find_str(v, &["displayName", "zaloName"]))
-        });
-        let me_uid = me
-            .as_ref()
-            .map(|v| crate::account::me_from_value(v).uid)
-            .filter(|uid| !uid.is_empty());
-        let mut session = session;
+        // The account id is profile/me userId. dkey and send2me_id are not.
+        // Saving before this returns would keep the previous account on screen.
+        let me = api
+            .get_me()
+            .await
+            .map_err(|e| format!("profile/me: {e}"))?;
+        let account = crate::account::me_from_value(&me);
+        let user_id = account.uid.trim().to_owned();
+        if user_id.is_empty() {
+            return Err(
+                "Máy chủ không trả userId của tài khoản vừa quét. Phiên chưa được lưu.".into(),
+            );
+        }
+        let name = if account.display_name.trim().is_empty() {
+            info.display_name.clone()
+        } else {
+            Some(account.display_name.clone())
+        };
         session.apply_login_info(
             info.uin.clone(),
             info.zpw_enk.clone(),
             info.phone_number.clone(),
             name,
         );
-        if let Some(uid) = info.send2me_id.clone().or(me_uid) {
-            session.send2me_id = Some(uid);
+        session.send2me_id = info.send2me_id.clone();
+        session.user_id = Some(user_id.clone());
+        let dest = crate::data::account_dir(&dir, &user_id);
+        std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+        crate::data::share_device(&dir, &dest).map_err(|e| e.to_string())?;
+        let prev = crate::data::read_current_user(&dir);
+        let switched_account = prev.as_deref() != Some(user_id.as_str());
+        if switched_account {
+            crate::data::migrate_legacy_store(&dir, &dest, &user_id);
         }
-        session.save(&dir).map_err(|e| e.to_string())?;
+        crate::bridge::clear_login_cache();
+        session.save(&dest).map_err(|e| e.to_string())?;
+        crate::data::write_current_user(&dir, &user_id);
+        crate::data::write_last_account_uid(&dest, &user_id);
+        // App prefs stay on the machine dir. The shell reads them from there.
         Ok(true)
     })
 }
 
-/// True when an API error means the saved session is no longer valid
-/// (102 session timeout, 600 missing / wrong `zpw_sek`).
+/// True when an API error means this PC session is dead.
+///
+/// Electron logs out on 102 (session timeout), 600 (`ERR_KICK_OUT`), and
+/// polling `-69`. A body that cannot be decrypted without `zpw_sek` is the
+/// same dead session. Close codes 3000 and 3003 are not this check: 3000 is
+/// the socket duplicate command, and 3003 is retried.
 #[must_use]
 pub fn is_session_error(err: &str) -> bool {
-    err.contains("returned 102") || err.contains("returned 600") || err.contains("zpw_sek")
+    err.contains("returned 102")
+        || err.contains("returned 600")
+        || err.contains("returned -69")
+        || err.contains("zpw_sek")
 }
 
 #[cfg(test)]
@@ -134,8 +229,10 @@ mod tests {
             "login_info: Zalo returned 102: The session key …"
         ));
         assert!(is_session_error(
-            "friends: Zalo returned 600: zpw_sek bị thiếu"
+            "friends: Zalo returned 600: phiên đã kết thúc"
         ));
+        assert!(is_session_error("poll: Zalo returned -69: logout"));
         assert!(!is_session_error("timeout"));
+        assert!(!is_session_error("close 3003"));
     }
 }

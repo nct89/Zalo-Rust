@@ -70,7 +70,7 @@ pub const REACT_LIKE: i64 = 3;
 pub const REACT_LIKE_ICON: &str = "/-strong";
 
 /// Message being quoted (`sendQuoteMessage` / `sendGroupQuoteMessage`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct QuoteTarget {
     /// Sender of the quoted message (`qmsgOwner` / `fromUid`).
     pub from_uid: String,
@@ -697,6 +697,8 @@ pub struct MediaItem {
     pub width: u32,
     /// `height` of a photo or video.
     pub height: u32,
+    /// `sendDttm` in milliseconds. `0` when the preview omitted it.
+    pub sent_ms: i64,
 }
 
 /// One page of `/api/mediastore/list` or `/api/media/oneone/list`.
@@ -859,6 +861,21 @@ fn map_item(value: &Value) -> Option<MediaItem> {
         file_size: json_u64(value, "file_size"),
         width: json_u32(value, "width"),
         height: json_u32(value, "height"),
+        sent_ms: {
+            // Electron `_convertSendDttm` reads `created_time` and stores it as `sendDttm`.
+            let mut n = json_i64(value, "created_time");
+            if n == 0 {
+                n = json_i64(value, "sendDttm");
+            }
+            if n == 0 {
+                n = json_i64(value, "send_dttm");
+            }
+            if n > 0 && n < 1_000_000_000_000 {
+                n * 1000
+            } else {
+                n
+            }
+        },
     })
 }
 
@@ -1767,13 +1784,14 @@ mod tests {
         let preview = media_preview_from(&json!({
             "data": [
                 {"id": "p", "type": "media", "sub_type": 1, "src_url": "https://cdn.example/p.jpg"},
-                {"id": "f", "type": "file", "title": "c.zip", "src_url": "https://cdn.example/c.zip"},
+                {"id": "f", "type": "file", "title": "c.zip", "src_url": "https://cdn.example/c.zip", "created_time": "1731283200"},
                 {"id": "l", "type": "link", "title": "Tin", "src_url": "https://example.com"},
                 {"id": "x", "type": "noise"}
             ]
         }));
         assert_eq!(preview.images.len(), 1);
         assert_eq!(preview.files[0].title, "c.zip");
+        assert_eq!(preview.files[0].sent_ms, 1_731_283_200_000);
         assert_eq!(preview.links[0].url, "https://example.com");
         assert_eq!(MEDIA_ERR_GONE, 212);
     }

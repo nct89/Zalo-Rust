@@ -30,6 +30,10 @@ pub struct StoredSession {
     /// Logged-in user's own profile / My Cloud ID (`send2me_id`), if available.
     #[serde(default)]
     pub send2me_id: Option<String>,
+    /// Zalo `userId` from `/api/social/profile/me`. This is the account id.
+    /// `dkey` and `send2me_id` are not account ids.
+    #[serde(default)]
+    pub user_id: Option<String>,
     /// UNIX seconds when the file was written.
     pub saved_at: u64,
 }
@@ -81,6 +85,7 @@ impl StoredSession {
             phone_number: None,
             display_name: None,
             send2me_id: None,
+            user_id: None,
             saved_at: unix_now(),
         }
     }
@@ -106,6 +111,27 @@ impl StoredSession {
         self.zpw_sek
             .clone()
             .or_else(|| extract_zpw_sek(&self.cookie_headers))
+    }
+
+    /// Ensures `zpw_sek` is recorded both in the dedicated field and in cookie headers
+    /// (some `chk_wait_cfirm` responses return `zpw_sek` in JSON in addition to `Set-Cookie`).
+    pub fn ensure_zpw_sek(&mut self, sek: &str) {
+        let sek = sek.trim();
+        if sek.is_empty() {
+            return;
+        }
+        self.zpw_sek = Some(sek.to_owned());
+        if extract_zpw_sek(&self.cookie_headers).is_none() {
+            let entry = self
+                .cookie_headers
+                .entry("https://wpa.zaloapp.com/".to_owned())
+                .or_default();
+            if entry.is_empty() {
+                *entry = format!("zpw_sek={sek}");
+            } else {
+                entry.push_str(&format!("; zpw_sek={sek}"));
+            }
+        }
     }
 }
 

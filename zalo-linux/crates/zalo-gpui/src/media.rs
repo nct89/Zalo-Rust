@@ -128,6 +128,8 @@ pub struct MediaMeta {
     pub poll_closed: bool,
     /// Choices already known (the message or a later detail fetch).
     pub poll_options: Vec<PollChoice>,
+    /// Stored `group_layout_id` for one cell of a multi-photo send. `0` if none.
+    pub group_layout_id: i64,
 }
 
 /// FNV-1a of a photo URL — same as `zalo-gui` `url_key`.
@@ -288,6 +290,10 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
     meta.width = num("width") as u32;
     meta.height = num("height") as u32;
     meta.size = num("size");
+    meta.group_layout_id = value
+        .get("group_layout_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     if meta.kind == MsgKind::File {
         meta.title = text("name");
     }
@@ -1142,6 +1148,7 @@ pub fn file_ext_color(name: &str) -> u32 {
         "PPT" | "PPTX" => 0xe8_8c_28,
         "ZIP" | "RAR" | "7Z" | "DEB" | "APK" => 0x78_5a_c8,
         "MD" => 0x00_5a_e0,
+        "PNG" | "JPG" | "JPEG" | "GIF" | "WEBP" | "BMP" | "HEIC" => 0x15_a8_5f,
         _ => 0x5a_69_81,
     }
 }

@@ -8,9 +8,9 @@
 #![allow(unsafe_code)]
 
 mod account;
+mod audio_play;
 mod autoreply;
 mod background;
-mod backup_msg;
 mod board;
 mod bridge;
 mod call;
@@ -38,7 +38,7 @@ mod login_flow;
 mod media;
 mod media_store;
 mod notice;
-mod phone_sync;
+mod pc_export;
 mod photo_window;
 mod plugins;
 mod prefs;
@@ -114,14 +114,15 @@ pub fn replace_shell_with_login(cx: &mut App) {
     cx.defer(close_all_shell_windows);
 }
 
-/// Closes all open [`ShellView`] windows (main and solo) and activates the login window.
+/// Closes all open non-login windows (main shell, solo chat, photo viewer,
+/// call/incoming windows, notices, screenshot overlays) and activates the login window.
 pub fn close_all_shell_windows(cx: &mut App) {
-    let shells: Vec<_> = cx
+    let to_close: Vec<_> = cx
         .windows()
         .into_iter()
-        .filter_map(|w| w.downcast::<ShellView>())
+        .filter(|w| w.downcast::<LoginView>().is_none())
         .collect();
-    for handle in shells {
+    for handle in to_close {
         let _ = handle.update(cx, |_, window, _| {
             window.remove_window();
         });
@@ -294,7 +295,7 @@ pub fn start_hidden(cx: &mut App) -> bool {
     if !zalo_shell::wait_for_tray_ready(std::time::Duration::from_millis(750)) {
         return false;
     }
-    match data::config_dir() {
+    match data::active_data_dir() {
         Some(dir) => {
             background::ensure_started(dir);
             true
@@ -311,11 +312,11 @@ pub fn on_last_window_closed(cx: &mut App) {
     if zalo_shell::tray_active() {
         background::tell_tray_once();
     } else {
-        let dir = data::config_dir().filter(|d| d.is_dir());
-        let p = prefs::Prefs::load(dir.clone());
+        let prefs_dir = data::config_dir().filter(|d| d.is_dir());
+        let p = prefs::Prefs::load(prefs_dir);
         if !p.bool("rememberLogin", true) {
-            if let Some(d) = dir {
-                let _ = std::fs::remove_file(d.join("session.json"));
+            if let Some(d) = data::active_data_dir() {
+                data::detach_account(&d);
             }
         }
         zalo_shell::stop_instance_listener(zalo_shell::GPUI_APP_ID);

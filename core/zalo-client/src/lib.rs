@@ -17,8 +17,9 @@ pub mod status;
 pub mod voicecall;
 
 pub use api::{
-    archived_ids_from, ClientError, ConversationLabel, FileUpload, FriendAnswer, GifRef,
-    GroupMember, LoginInfo, PhotoUpload, QrTicket, StickerPack, StickerRef, ZaloApi,
+    archived_ids_from, confirm_zpw_sek, ClientError, ConversationLabel,
+    FileUpload, FriendAnswer, GifRef, GroupMember, LoginInfo, PhotoUpload, QrScanOutcome,
+    QrTicket, StickerPack, StickerRef, ZaloApi,
 };
 pub use device::{Device, DeviceError};
 pub use features::{

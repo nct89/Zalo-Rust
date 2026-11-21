@@ -20,8 +20,9 @@ use crate::video::{VideoAssembler, VideoFrame};
 use crate::zrtp::{
     build_end_call_packet, build_group_init_zrtp_packet, build_group_vid_qual_config,
     build_group_vid_qual_req, build_init_zrtp_packet, build_ping_packet, build_req_forward_packet,
-    build_zavi_ping_packet, req_forward_status, unwrap_packet, wrap_media_packet, Command,
-    GroupInitLayout, MsgType, ParsedPacket, VidQualEntry, VidQualLayer,
+    build_share_init_zrtp_packet, build_share_zavi_ping_packet, build_zavi_ping_packet,
+    req_forward_status, unwrap_packet, wrap_media_packet, Command, GroupInitLayout, MsgType,
+    ParsedPacket, VidQualEntry, VidQualLayer,
 };
 use rand::Rng;
 use serde_json::Value;
@@ -298,6 +299,40 @@ pub struct MediaSession {
     group_sfu: SfuLayer,
     /// Paced video packets waiting to drain in `VIDEO_BURST` batches.
     v_out: VecDeque<(Vec<u8>, Server, &'static str)>,
+    /// Separate UDP sender for group `ShareScreenPeer` (`uid = shareScreenId`).
+    share_send_hook: Option<SendHook>,
+    /// Server token issued to the group `ShareScreenPeer` on its own `InitZRTP`.
+    share_token: u32,
+    /// Number of group share `InitZRTP` attempts sent so far.
+    share_init_tries: u8,
+    /// Timestamp (ms) of the last group share `InitZRTP` attempt.
+    share_last_init_ms: u64,
+    /// Timestamp (ms) of the last group share `ZaviPing` + `VidQualConfig`.
+    share_last_ping_ms: u64,
+    /// Timestamp (ms) when `share_token` was granted.
+    share_start_ms: u64,
+    /// RTP sequence number for group `ShareScreenPeer`.
+    share_seq: u16,
+    /// SRTP rollover counter for group `ShareScreenPeer`.
+    share_roc: u32,
+    /// Transport-CC sequence for group `ShareScreenPeer`.
+    share_tw_seq: u16,
+    /// SFU layer sequence for group `ShareScreenPeer`.
+    share_layer_seq: u16,
+    /// Control sequence for group `ShareScreenPeer` `VidQualConfig`.
+    share_ctl_seq: u32,
+    /// RTP timestamp base for group `ShareScreenPeer`.
+    share_ts_base: u32,
+    /// Whether the share peer has transmitted its first keyframe.
+    share_key_sent: bool,
+    /// Encoded share width/height announced in share `VidQualConfig`.
+    share_dims: (u16, u16),
+    /// Whether share `VidQualConfig` has been logged once.
+    share_cfg_logged: bool,
+    /// Paced UDP packets queued for the group `ShareScreenPeer` socket.
+    share_out: VecDeque<(Vec<u8>, Server)>,
+    /// Pending keyframe request for the group screen-share encoder (token grant or RTCP PLI).
+    share_key_requested: bool,
 }
 
 impl Default for MediaSession {
@@ -428,6 +463,23 @@ impl MediaSession {
                 long: false,
             },
             v_out: VecDeque::new(),
+            share_send_hook: None,
+            share_token: 0,
+            share_init_tries: 0,
+            share_last_init_ms: 0,
+            share_last_ping_ms: 0,
+            share_start_ms: 0,
+            share_seq: 0,
+            share_roc: 0,
+            share_tw_seq: 1,
+            share_layer_seq: 0,
+            share_ctl_seq: 0,
+            share_ts_base: 0,
+            share_key_sent: false,
+            share_dims: (1280, 720),
+            share_cfg_logged: false,
+            share_out: VecDeque::new(),
+            share_key_requested: false,
         }
     }
 
@@ -447,6 +499,19 @@ impl MediaSession {
         F: FnMut(&[u8], &Server, &str) + Send + 'static,
     {
         self.send_hook = Box::new(send_hook);
+    }
+
+    /// Sets the dedicated UDP sender for the group `ShareScreenPeer` socket.
+    pub fn set_share_send<F>(&mut self, send_hook: F)
+    where
+        F: FnMut(&[u8], &Server, &str) + Send + 'static,
+    {
+        self.share_send_hook = Some(Box::new(send_hook));
+    }
+
+    /// Clears the dedicated group `ShareScreenPeer` UDP sender.
+    pub fn clear_share_send(&mut self) {
+        self.share_send_hook = None;
     }
 
     /// Sets the callback that receives decrypted audio frames.
@@ -632,14 +697,238 @@ impl MediaSession {
     }
 
     /// Starts the screen-sharing stream with SSRC `share_id`.
+    ///
+    /// For group calls (`ShareScreenPeer`), resets per-share sequence state and
+    /// immediately sends `build_share_init_zrtp_packet` over the share socket to
+    /// obtain an independent `share_token`.
     pub fn start_share(&mut self, share_id: u32) {
+        if self.group && self.share_on && self.share_id == share_id && share_id > 0 {
+            return;
+        }
+        if self.group && self.share_on {
+            self.stop_share();
+        }
         self.share_id = share_id;
         self.share_on = share_id > 0;
+        self.share_token = 0;
+        self.share_init_tries = 0;
+        self.share_last_init_ms = 0;
+        self.share_last_ping_ms = 0;
+        self.share_start_ms = 0;
+        self.share_seq = rand::thread_rng().gen_range(0..0x8000);
+        self.share_roc = 0;
+        self.share_tw_seq = 1;
+        self.share_layer_seq = 0;
+        self.share_ctl_seq = 0;
+        self.share_ts_base = rand::thread_rng().gen_range(0..0x7fff_ffff);
+        self.share_key_sent = false;
+        self.share_cfg_logged = false;
+        self.share_out.clear();
+        self.share_key_requested = false;
+        if self.group && self.share_on && self.active {
+            self.send_share_init_zrtp();
+        }
     }
 
-    /// Stops the screen-sharing stream.
+    /// Stops the screen-sharing stream and sends `EndCall` for the group share peer.
     pub fn stop_share(&mut self) {
+        let was_group_active = self.group && self.share_on;
+        let uid = self.share_id;
+        let token = self.share_token;
         self.share_on = false;
+        self.share_token = 0;
+        self.share_out.clear();
+        self.share_key_requested = false;
+        if was_group_active && token != 0 {
+            if let Some(server) = self.active_server.clone() {
+                let pkt = build_end_call_packet(uid, token, self.call_id);
+                self.send_share(&pkt, &server, "share EndCall");
+                self.note(format!("media: share peer {uid} stopped"));
+            }
+        }
+    }
+
+    /// Updates the encoded share resolution announced in group share `VidQualConfig`.
+    pub fn set_share_dimensions(&mut self, width: u16, height: u16) {
+        if width == 0 || height == 0 || self.share_dims == (width, height) {
+            return;
+        }
+        self.share_dims = (width, height);
+        if self.group && self.share_on && self.share_token != 0 {
+            self.send_share_vid_qual_config();
+        }
+    }
+
+    /// Consumes a pending keyframe request for the group screen-share encoder.
+    pub fn take_share_key_frame_request(&mut self) -> bool {
+        std::mem::take(&mut self.share_key_requested)
+    }
+
+    /// Consumes one datagram arriving on the group `ShareScreenPeer` UDP socket.
+    pub fn receive_share_packet(&mut self, packet: &[u8]) {
+        if !self.group || !self.share_on || packet.is_empty() {
+            return;
+        }
+        // RTCP PLI/FIR targeting our share SSRC (`MsgType::VIDEO_FEC`, 5-byte prefix).
+        if packet[0] == MsgType::VIDEO_FEC && packet.len() > 5 {
+            let buf = &packet[5..];
+            let mut o = 0;
+            while o + 12 <= buf.len() {
+                if (buf[o] >> 6) != 2 {
+                    break;
+                }
+                let len = (usize::from(u16::from_be_bytes([buf[o + 2], buf[o + 3]])) + 1) * 4;
+                if len == 0 || o + len > buf.len() {
+                    break;
+                }
+                let fmt = buf[o] & 0x1f;
+                if buf[o + 1] == 206 && (fmt == 1 || (fmt == 4 && o + 16 <= buf.len())) {
+                    let target = if fmt == 1 {
+                        u32::from_be_bytes([buf[o + 8], buf[o + 9], buf[o + 10], buf[o + 11]])
+                    } else {
+                        u32::from_be_bytes([buf[o + 12], buf[o + 13], buf[o + 14], buf[o + 15]])
+                    };
+                    if target == self.share_id {
+                        self.share_key_requested = true;
+                        self.note("media: share peer PLI/FIR key frame request");
+                    }
+                }
+                o += len;
+            }
+            return;
+        }
+        let Some(parsed) = unwrap_packet(packet) else {
+            return;
+        };
+        if parsed.msg_type == MsgType::SERVER_REPLY
+            && (parsed.cmd == Some(Command::INIT_CALL_CALLEE)
+                || parsed.cmd == Some(Command::INIT_CALL_CALLER))
+        {
+            if self.share_token != 0 {
+                return;
+            }
+            let res = parsed.res.unwrap_or(1);
+            let token = parsed.server_token.unwrap_or(0);
+            if res != 0 || token == 0 {
+                self.note(format!(
+                    "media: share peer {} InitZRTP refused (res={res})",
+                    self.share_id
+                ));
+                return;
+            }
+            let now = now_ms();
+            self.share_token = token;
+            self.share_start_ms = now;
+            self.share_last_ping_ms = now;
+            self.share_key_requested = true;
+            self.note(format!(
+                "media: share peer {} accepted (token {token})",
+                self.share_id
+            ));
+            self.send_share_zavi_ping();
+            self.send_share_vid_qual_config();
+        }
+    }
+
+    /// Periodic maintenance for group `ShareScreenPeer`: retries `InitZRTP` until
+    /// `share_token` is granted, sends `ZaviPing` + `VidQualConfig` every 5 s, and
+    /// drains paced screen-share packets.
+    pub fn tick_share(&mut self) {
+        if !self.group || !self.share_on || !self.active {
+            return;
+        }
+        let now = now_ms();
+        if self.share_token == 0 {
+            if self.share_init_tries < 4 && now.saturating_sub(self.share_last_init_ms) >= 400 {
+                self.send_share_init_zrtp();
+            }
+            return;
+        }
+        if now.saturating_sub(self.share_last_ping_ms) >= 5_000 {
+            self.share_last_ping_ms = now;
+            self.send_share_zavi_ping();
+            self.send_share_vid_qual_config();
+        }
+        self.drain_share_queue(12);
+    }
+
+    fn send_share_init_zrtp(&mut self) {
+        let Some(server) = self.active_server.clone() else {
+            return;
+        };
+        let pkt = build_share_init_zrtp_packet(self.share_id, self.sess_id.as_bytes());
+        self.share_init_tries = self.share_init_tries.saturating_add(1);
+        self.share_last_init_ms = now_ms();
+        self.send_share(&pkt, &server, "share InitZRTP");
+    }
+
+    fn send_share_zavi_ping(&mut self) {
+        let Some(server) = self.active_server.clone() else {
+            return;
+        };
+        if self.share_token == 0 {
+            return;
+        }
+        let pkt = build_share_zavi_ping_packet(
+            self.share_id,
+            self.share_token,
+            self.sess_id.as_bytes(),
+        );
+        self.send_share(&pkt, &server, "share ZaviPing");
+    }
+
+    fn send_share_vid_qual_config(&mut self) {
+        let Some(server) = self.active_server.clone() else {
+            return;
+        };
+        if self.share_token == 0 {
+            return;
+        }
+        let (w, h) = self.share_dims;
+        if w == 0 || h == 0 {
+            return;
+        }
+        let kbps = self
+            .params
+            .get("config")
+            .and_then(|c| c.get("maxShrScreenBr"))
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1_500);
+        let layer = VidQualLayer {
+            id: 0,
+            a: kbps,
+            b: w,
+            c: h,
+        };
+        let seq = self.share_ctl_seq;
+        self.share_ctl_seq = self.share_ctl_seq.wrapping_add(1);
+        let pkt = build_group_vid_qual_config(self.share_id, self.share_token, seq, &[layer]);
+        self.send_share(&pkt, &server, "share VidQualConfig");
+        if !self.share_cfg_logged {
+            self.share_cfg_logged = true;
+            self.note(format!(
+                "media: share VidQualConfig {w}x{h} {kbps} kbps"
+            ));
+        }
+    }
+
+    fn drain_share_queue(&mut self, max_packets: usize) {
+        for _ in 0..max_packets {
+            let Some((pkt, server)) = self.share_out.pop_front() else {
+                break;
+            };
+            self.send_share(&pkt, &server, "share video");
+        }
+    }
+
+    fn send_share(&mut self, packet: &[u8], server: &Server, what: &str) {
+        if let Some(hook) = self.share_send_hook.as_mut() {
+            hook(packet, server, what);
+        } else {
+            (self.send_hook)(packet, server, what);
+        }
     }
 
     /// Sends one H.264 Annex-B access unit.
@@ -654,6 +943,10 @@ impl MediaSession {
         }
         if screen {
             if !self.share_on || self.share_id == 0 {
+                return;
+            }
+            if self.group {
+                self.send_group_share_frame(key, annex_b, now);
                 return;
             }
         } else {
@@ -794,6 +1087,80 @@ impl MediaSession {
         if pace {
             self.drain_video_queue(VIDEO_BURST);
         }
+    }
+
+    /// Sends one H.264 Annex-B frame via the dedicated group `ShareScreenPeer`
+    /// (`share_token`, independent RTP/TWCC/SFU sequence numbers, paced bursts).
+    fn send_group_share_frame(&mut self, key: bool, annex_b: &[u8], now: u64) {
+        if self.share_token == 0 {
+            return;
+        }
+        if !key && !self.share_key_sent {
+            self.share_key_requested = true;
+            return;
+        }
+        if key {
+            self.share_key_sent = true;
+        }
+        let Some(server) = self.active_server.clone() else {
+            return;
+        };
+        let elapsed = now.saturating_sub(self.share_start_ms);
+        let ts = self
+            .share_ts_base
+            .wrapping_add(elapsed.saturating_mul(90) as u32);
+        let pt = if key {
+            crate::video::KEY_PT
+        } else {
+            crate::video::DELTA_PT
+        };
+        let chunks = crate::video::packetize_frame(annex_b, crate::video::MAX_CHUNK);
+        let last = chunks.len().saturating_sub(1);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let marker = index == last;
+            self.share_layer_seq = self.share_layer_seq.wrapping_add(1);
+            let header = crate::rtp::build_group_video_rtp_header(
+                self.share_seq,
+                ts,
+                self.share_id,
+                self.share_tw_seq,
+                marker,
+                pt,
+                self.group_sfu,
+                self.share_layer_seq,
+                now,
+                now,
+            );
+            let rtp = if self.plain_media {
+                let mut raw = header;
+                raw.extend_from_slice(chunk);
+                raw
+            } else {
+                let Some(keys) = self.srtp_context.clone() else {
+                    return;
+                };
+                match self.protect_uplink(
+                    &header,
+                    chunk,
+                    &keys,
+                    self.share_seq,
+                    self.share_id,
+                    self.share_roc,
+                    false,
+                ) {
+                    Ok(packet) => packet,
+                    Err(_) => return,
+                }
+            };
+            let packet = wrap_media_packet(MsgType::VIDEO_RTP, self.share_token, &rtp);
+            self.share_out.push_back((packet, server.clone()));
+            self.share_seq = self.share_seq.wrapping_add(1);
+            if self.share_seq == 0 {
+                self.share_roc = self.share_roc.wrapping_add(1);
+            }
+            self.share_tw_seq = self.share_tw_seq.wrapping_add(1);
+        }
+        self.drain_share_queue(12);
     }
 
     /// Returns P2P NAT hole-punching packets due at `now_ms`.
@@ -1373,25 +1740,26 @@ impl MediaSession {
 
     /// Sends a Ping to the active server.
     ///
-    /// While ringing in a 1-1 call (before `start()` picks `active_server`),
-    /// pings every relay server that answered `InitZRTP` so NAT bindings and
-    /// server sessions stay alive when the callee answers after a long ring.
+    /// While ringing in a 1-1 call (`!self.active`, even after `handle_init_reply`
+    /// tentatively populated `active_server`), pings every relay server that
+    /// answered `InitZRTP` so NAT bindings and server sessions stay alive when
+    /// the callee answers after a long ring and picks any candidate relay in `402`.
     /// A group call sends `ZaviPing` instead, then asks the SFU for each watched
     /// member and announces our one layer.
     pub fn send_ping(&mut self) {
-        let Some(server) = self.active_server.clone() else {
-            if !self.group && !self.replies.is_empty() {
-                let targets: Vec<(Server, u32)> = self
-                    .replies
-                    .iter()
-                    .map(|r| (r.server.clone(), r.token))
-                    .collect();
-                for (target, token) in targets {
-                    let packet =
-                        build_ping_packet(self.local_uid, token, self.sess_id.as_bytes());
-                    self.send(&packet, &target, "Ping");
-                }
+        if !self.active && !self.group && !self.replies.is_empty() {
+            let targets: Vec<(Server, u32)> = self
+                .replies
+                .iter()
+                .map(|r| (r.server.clone(), r.token))
+                .collect();
+            for (target, token) in targets {
+                let packet = build_ping_packet(self.local_uid, token, self.sess_id.as_bytes());
+                self.send(&packet, &target, "Ping");
             }
+            return;
+        }
+        let Some(server) = self.active_server.clone() else {
             return;
         };
         if self.group {
@@ -1531,6 +1899,7 @@ impl MediaSession {
 
     /// Stops media and ends the call on the active server.
     pub fn stop(&mut self) {
+        self.stop_share();
         self.active = false;
         self.v_out.clear();
         if let Some(server) = self.active_server.clone() {
@@ -3508,26 +3877,37 @@ mod tests {
                 {"rtpaddr": "192.0.2.11:5001"}
             ]
         }));
-        session.replies.push(Reply {
-            server: Server {
-                host: "192.0.2.10".into(),
-                port: 5000,
-            },
-            token: 111,
-            rtt_ms: 20,
+        let s1 = Server {
+            host: "192.0.2.10".into(),
+            port: 5000,
+        };
+        let s2 = Server {
+            host: "192.0.2.11".into(),
+            port: 5001,
+        };
+        // Drive through real `handle_init_reply` so `active_server` is tentatively populated
+        // just like in production prepare(), while `session.active` is still false (ringing).
+        let reply1 = ParsedPacket {
+            msg_type: MsgType::SERVER_REPLY,
+            res: Some(0),
+            server_token: Some(111),
             public_addr: None,
-        });
-        session.replies.push(Reply {
-            server: Server {
-                host: "192.0.2.11".into(),
-                port: 5001,
-            },
-            token: 222,
-            rtt_ms: 40,
+            ..Default::default()
+        };
+        let reply2 = ParsedPacket {
+            msg_type: MsgType::SERVER_REPLY,
+            res: Some(0),
+            server_token: Some(222),
             public_addr: None,
-        });
+            ..Default::default()
+        };
+        session.handle_init_reply(&reply1, &s1);
+        session.handle_init_reply(&reply2, &s2);
+        assert!(session.active_server.is_some());
+        assert!(!session.active);
 
-        // While ringing (active_server is None), send_ping must keep all replied relays alive.
+        // While ringing (!active), send_ping must keep ALL replied relays alive even though
+        // handle_init_reply already populated a tentative active_server.
         session.send_ping();
         {
             let pkts = sent.lock().unwrap();
@@ -3540,14 +3920,118 @@ mod tests {
             assert_eq!(unwrap_packet(&pkts[1].0).unwrap().token, Some(222));
         }
 
-        // Once start() chooses the active server, send_ping targets only that server.
+        // Once start() activates the call (callee picked s2 in 402), send_ping targets only s2.
         sent.lock().unwrap().clear();
-        session.start("caller", Some("192.0.2.10:5000"));
+        session.start("caller", Some("192.0.2.11:5001"));
         sent.lock().unwrap().clear();
         session.send_ping();
         let pkts = sent.lock().unwrap();
         assert_eq!(pkts.len(), 1);
-        assert_eq!(pkts[0].1.host, "192.0.2.10");
+        assert_eq!(pkts[0].1.host, "192.0.2.11");
         assert_eq!(pkts[0].2, "Ping");
+        assert_eq!(unwrap_packet(&pkts[0].0).unwrap().token, Some(222));
+    }
+
+    #[test]
+    fn group_share_peer_uses_dedicated_socket_token_and_lifecycle() {
+        let main_sent = Arc::new(Mutex::new(Vec::<(Vec<u8>, String)>::new()));
+        let share_sent = Arc::new(Mutex::new(Vec::<(Vec<u8>, String)>::new()));
+        let main_rec = Arc::clone(&main_sent);
+        let share_rec = Arc::clone(&share_sent);
+
+        let mut session = MediaSession::new();
+        session.send_udp = true;
+        session.set_send(move |pkt, _srv, what| {
+            main_rec.lock().unwrap().push((pkt.to_vec(), what.to_owned()));
+        });
+        session.set_share_send(move |pkt, _srv, what| {
+            share_rec.lock().unwrap().push((pkt.to_vec(), what.to_owned()));
+        });
+        session.on_negotiated(&serde_json::json!({
+            "group": true,
+            "callId": 77,
+            "role": "caller",
+            "localUid": 100,
+            "sessId": "group-share-session-123456789012345",
+            "servers": [{"rtpaddr": "192.0.2.20:5000"}],
+            "config": {"maxShrScreenBr": 1200}
+        }));
+        let srv = Server {
+            host: "192.0.2.20".into(),
+            port: 5000,
+        };
+        session.handle_init_reply(
+            &ParsedPacket {
+                msg_type: MsgType::SERVER_REPLY,
+                res: Some(0),
+                server_token: Some(1111),
+                ..Default::default()
+            },
+            &srv,
+        );
+        session.start("caller", Some("192.0.2.20:5000"));
+        main_sent.lock().unwrap().clear();
+        share_sent.lock().unwrap().clear();
+
+        // 1. start_share must send share InitZRTP on the dedicated share socket.
+        session.start_share(555_001);
+        {
+            let pkts = share_sent.lock().unwrap();
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0].1, "share InitZRTP");
+            let p = unwrap_packet(&pkts[0].0).expect("unwrap share init");
+            assert_eq!(p.uid, Some(555_001));
+            assert_eq!(p.cmd, Some(Command::INIT_CALL_CALLEE));
+            assert_eq!(p.sub_cmd, Some(0x04));
+            assert!(main_sent.lock().unwrap().is_empty());
+        }
+        share_sent.lock().unwrap().clear();
+
+        // 2. Receiving SERVER_REPLY on share socket latches share_token=9999,
+        // sends share ZaviPing + VidQualConfig, and requests an initial keyframe.
+        let mut reply = crate::zrtp::build_control_header(
+            MsgType::SERVER_REPLY,
+            crate::zrtp::MAGIC_BYTE,
+            0,
+            0,
+            555_001,
+            0,
+            Command::INIT_CALL_CALLEE,
+            0x04,
+        );
+        reply.extend_from_slice(&0_u32.to_le_bytes()); // res = 0
+        reply.extend_from_slice(&77_u32.to_le_bytes()); // call_id
+        reply.extend_from_slice(&9999_u32.to_le_bytes()); // server_token
+        session.receive_share_packet(&reply);
+        assert!(session.take_share_key_frame_request());
+        {
+            let pkts = share_sent.lock().unwrap();
+            assert_eq!(pkts.len(), 2);
+            assert_eq!(pkts[0].1, "share ZaviPing");
+            assert_eq!(pkts[1].1, "share VidQualConfig");
+            assert_eq!(unwrap_packet(&pkts[0].0).unwrap().token, Some(9999));
+        }
+        share_sent.lock().unwrap().clear();
+
+        // 3. Sending a screen keyframe wraps RTP with share_token (9999), NOT main token (1111).
+        let annex_b = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21];
+        session.send_video_frame(true, &annex_b, true, 1000);
+        {
+            let pkts = share_sent.lock().unwrap();
+            assert_eq!(pkts.len(), 1);
+            assert_eq!(pkts[0].1, "share video");
+            assert_eq!(pkts[0].0[0], MsgType::VIDEO_RTP);
+            let wire_token = u32::from_le_bytes(pkts[0].0[1..5].try_into().unwrap());
+            assert_eq!(wire_token, 9999);
+            assert!(main_sent.lock().unwrap().is_empty());
+        }
+        share_sent.lock().unwrap().clear();
+
+        // 4. stop_share sends EndCall with share_token on the share socket.
+        session.stop_share();
+        let pkts = share_sent.lock().unwrap();
+        assert_eq!(pkts.len(), 1);
+        assert_eq!(pkts[0].1, "share EndCall");
+        assert_eq!(unwrap_packet(&pkts[0].0).unwrap().token, Some(9999));
     }
 }

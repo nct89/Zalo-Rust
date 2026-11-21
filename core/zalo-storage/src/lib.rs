@@ -18,8 +18,10 @@ pub use crypto::{
     derive_aes256_key_zalo_v2,
 };
 pub use error::StorageError;
-pub use store::{LocalStore, MessageRecord, ThreadKind, ThreadRecord, UserRecord};
-pub use zalo_pc::{read_zalo_pc_friends, read_zalo_pc_oa, zalo_pc_index_db, PcFriend};
+pub use store::{LocalStore, MessageRecord, OutboxRecord, ThreadKind, ThreadRecord, UserRecord};
+pub use zalo_pc::{
+    read_zalo_pc_friends, read_zalo_pc_oa, zalo_pc_index_db, zalo_pc_index_db_default, PcFriend,
+};
 pub use zdb4::{decrypt_zdb4_v2, ExtractedFile};
 
 #[cfg(test)]
@@ -377,6 +379,52 @@ mod tests {
             body: "tin thu nghiem".to_owned(),
             sent_at: 1_700_000_000_200,
         }
+    }
+
+    #[test]
+    fn outbox_fifo_enqueue_bump_and_remove() {
+        let store = LocalStore::open_in_memory().unwrap();
+        let id1 = store
+            .enqueue_outbox(&OutboxRecord {
+                id: 0,
+                thread_id: "1001".into(),
+                is_group: false,
+                body: "first offline".into(),
+                urgency: 0,
+                client_id: 111,
+                quote_json: None,
+                created_at: 1_700_000_000_001,
+                attempts: 0,
+            })
+            .unwrap();
+        let id2 = store
+            .enqueue_outbox(&OutboxRecord {
+                id: 0,
+                thread_id: "g_2002".into(),
+                is_group: true,
+                body: "second offline".into(),
+                urgency: 1,
+                client_id: 222,
+                quote_json: Some("{\"msg_id\":9}".into()),
+                created_at: 1_700_000_000_002,
+                attempts: 0,
+            })
+            .unwrap();
+        assert!(id2 > id1);
+        store.bump_outbox_attempt(id1).unwrap();
+        let queued = store.list_outbox().unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].id, id1);
+        assert_eq!(queued[0].attempts, 1);
+        assert_eq!(queued[1].id, id2);
+        assert!(queued[1].is_group);
+        assert_eq!(queued[1].urgency, 1);
+        assert_eq!(queued[1].quote_json.as_deref(), Some("{\"msg_id\":9}"));
+
+        store.remove_outbox(id1).unwrap();
+        let remaining = store.list_outbox().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, id2);
     }
 
     fn temp_dir() -> PathBuf {

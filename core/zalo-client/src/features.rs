@@ -1176,74 +1176,6 @@ impl ZaloApi {
         Ok(rows)
     }
 
-    /// Old phone sync: snapshot lookup (`/api/message/get_crossdb`, cmd 12412).
-    ///
-    /// Sync 2 is the path the settings card runs. This method does not run by itself.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
-    pub async fn get_crossdb(&self, sync_session: &str) -> Result<Value, ClientError> {
-        let payload = crossdb_payload(&self.device.computer_name, sync_session);
-        self.get_encrypted(
-            &self.message_file_host(),
-            "/api/message/get_crossdb",
-            &payload,
-        )
-        .await
-    }
-
-    /// Old phone sync: ask the phone to push messages (`/api/message/pull_mobile_msg`, cmd 12000).
-    ///
-    /// A negative `from_seq_id` is rejected here and does not hit the network.
-    /// Electron adds 1 when the sequence is positive, and sends 0 otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] on a negative sequence, or on transport, Zalo or decryption errors.
-    pub async fn pull_mobile_msg(
-        &self,
-        public_key: &str,
-        from_seq_id: i64,
-        is_retry: i64,
-        min_seq_id: i64,
-        temp_key: &str,
-    ) -> Result<Value, ClientError> {
-        let from_seq_id = pull_mobile_from_seq(from_seq_id)
-            .map_err(|msg| ClientError::Unexpected(msg.to_owned()))?;
-        let payload = pull_mobile_payload(
-            &self.device.computer_name,
-            public_key,
-            from_seq_id,
-            is_retry,
-            min_seq_id,
-            temp_key,
-            &self.device.imei,
-        );
-        self.get_encrypted(
-            &self.message_file_host(),
-            "/api/message/pull_mobile_msg",
-            &payload,
-        )
-        .await
-    }
-
-    /// Old phone sync: stop a pull (`/api/message/cancel_pull_mobile_msg`, cmd 12700).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
-    pub async fn cancel_pull_mobile_msg(&self, public_key: &str) -> Result<Value, ClientError> {
-        let payload =
-            cancel_pull_payload(&self.device.computer_name, public_key, &self.device.imei);
-        self.get_encrypted(
-            &self.message_file_host(),
-            "/api/message/cancel_pull_mobile_msg",
-            &payload,
-        )
-        .await
-    }
-
     /// Owner upgrade of a group into a community (`/api/group/upgrade/community`, cmd 12180).
     ///
     /// # Errors
@@ -1311,6 +1243,188 @@ impl ZaloApi {
         )
         .await
     }
+
+    fn quick_message_base(&self) -> &str {
+        self.service_base("quick_message", "https://tt-quickmessage-wpa.chat.zalo.me")
+    }
+
+    /// Lists cloud-synced quick messages (`/api/quickmessage/list`, cmd 12025).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn list_quick_messages(
+        &self,
+        version: i64,
+        lang: i64,
+    ) -> Result<Value, ClientError> {
+        let payload = quick_message_list_payload(version, lang, &self.device.imei);
+        self.get_encrypted(self.quick_message_base(), "/api/quickmessage/list", &payload)
+            .await
+    }
+
+    /// Creates a cloud-synced text quick message (`/api/quickmessage/create`, cmd 12029).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn create_quick_message(
+        &self,
+        keyword: &str,
+        title: &str,
+    ) -> Result<Value, ClientError> {
+        let payload = quick_message_create_payload(keyword, title, &self.device.imei);
+        self.get_encrypted(
+            self.quick_message_base(),
+            "/api/quickmessage/create",
+            &payload,
+        )
+        .await
+    }
+
+    /// Updates a cloud-synced text quick message (`/api/quickmessage/update`, cmd 12026).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn update_quick_message(
+        &self,
+        item_id: i64,
+        keyword: &str,
+        title: &str,
+    ) -> Result<Value, ClientError> {
+        let payload = quick_message_update_payload(item_id, keyword, title);
+        self.get_encrypted(
+            self.quick_message_base(),
+            "/api/quickmessage/update",
+            &payload,
+        )
+        .await
+    }
+
+    /// Deletes cloud-synced quick messages by server item id (`/api/quickmessage/delete`, cmd 12032).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn delete_quick_messages(&self, item_ids: &[i64]) -> Result<Value, ClientError> {
+        let payload = quick_message_delete_payload(item_ids);
+        self.get_encrypted(
+            self.quick_message_base(),
+            "/api/quickmessage/delete",
+            &payload,
+        )
+        .await
+    }
+}
+
+/// One cloud-synced quick message entry from `/api/quickmessage/list`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickMessageItem {
+    /// Server-assigned item id (required for update/delete).
+    pub id: i64,
+    /// Shortcut keyword without leading `/`.
+    pub keyword: String,
+    /// Body text (`message.title`).
+    pub text: String,
+    /// `0` for plain text, `1` when media is attached.
+    pub item_type: i64,
+}
+
+/// Parsed response of `/api/quickmessage/list`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuickMessageList {
+    /// Server version number for incremental fetches.
+    pub version: i64,
+    /// Valid text/media quick-message entries.
+    pub items: Vec<QuickMessageItem>,
+}
+
+/// Encrypted payload for `/api/quickmessage/list` (cmd 12025).
+#[must_use]
+pub fn quick_message_list_payload(version: i64, lang: i64, imei: &str) -> Value {
+    json!({
+        "version": version,
+        "lang": lang,
+        "imei": imei,
+    })
+}
+
+/// Encrypted payload for `/api/quickmessage/create` (cmd 12029, text-only).
+#[must_use]
+pub fn quick_message_create_payload(keyword: &str, title: &str, imei: &str) -> Value {
+    json!({
+        "keyword": keyword.trim().trim_start_matches('/'),
+        "message": {
+            "title": title.trim(),
+            "params": "",
+        },
+        "type": 0,
+        "imei": imei,
+    })
+}
+
+/// Encrypted payload for `/api/quickmessage/update` (cmd 12026, text-only).
+#[must_use]
+pub fn quick_message_update_payload(item_id: i64, keyword: &str, title: &str) -> Value {
+    json!({
+        "itemId": item_id,
+        "keyword": keyword.trim().trim_start_matches('/'),
+        "message": {
+            "title": title.trim(),
+            "params": "",
+        },
+        "type": 0,
+    })
+}
+
+/// Encrypted payload for `/api/quickmessage/delete` (cmd 12032).
+#[must_use]
+pub fn quick_message_delete_payload(item_ids: &[i64]) -> Value {
+    json!({
+        "itemIds": item_ids,
+    })
+}
+
+/// Parses a `/api/quickmessage/list` reply into [`QuickMessageList`].
+#[must_use]
+pub fn quick_messages_from(value: &Value) -> QuickMessageList {
+    let root = value.get("data").filter(|v| !v.is_null()).unwrap_or(value);
+    let version = json_i64(root, "version").unwrap_or(0);
+    let items = root
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let id = json_i64(item, "id")?;
+                    let keyword = item
+                        .get("keyword")
+                        .and_then(Value::as_str)?
+                        .trim()
+                        .trim_start_matches('/')
+                        .to_owned();
+                    let text = item
+                        .get("message")
+                        .and_then(|m| m.get("title").and_then(Value::as_str).or_else(|| m.as_str()))
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+                    if keyword.is_empty() || text.is_empty() {
+                        return None;
+                    }
+                    let item_type = json_i64(item, "type").unwrap_or(0);
+                    Some(QuickMessageItem {
+                        id,
+                        keyword,
+                        text,
+                        item_type,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    QuickMessageList { version, items }
 }
 
 /// `getAllCatalog` body. Limit and `last_product_id` match `compact3530.js`.
@@ -1409,59 +1523,6 @@ pub fn e2ee_group_ids(value: &Value) -> Vec<String> {
 pub fn group_marked_e2ee(ids: &[String], thread_id: &str) -> bool {
     let bare = bare_group_id(thread_id);
     !bare.is_empty() && ids.iter().any(|id| id == &bare)
-}
-
-/// `getCrossDB` body.
-#[must_use]
-pub fn crossdb_payload(pc_name: &str, sync_session: &str) -> Value {
-    json!({
-        "pc_name": pc_name,
-        "sync_session": sync_session,
-    })
-}
-
-/// Electron `pullMobileMsg`: negative is an error, a positive sequence is incremented, else 0.
-#[must_use]
-pub fn pull_mobile_from_seq(from_seq_id: i64) -> Result<i64, &'static str> {
-    if from_seq_id < 0 {
-        Err("from_seq_id negative")
-    } else if from_seq_id > 0 {
-        Ok(from_seq_id.saturating_add(1))
-    } else {
-        Ok(0)
-    }
-}
-
-/// `pullMobileMsg` body.
-#[must_use]
-pub fn pull_mobile_payload(
-    pc_name: &str,
-    public_key: &str,
-    from_seq_id: i64,
-    is_retry: i64,
-    min_seq_id: i64,
-    temp_key: &str,
-    imei: &str,
-) -> Value {
-    json!({
-        "pc_name": pc_name,
-        "public_key": public_key,
-        "from_seq_id": from_seq_id,
-        "is_retry": is_retry,
-        "min_seq_id": min_seq_id,
-        "temp_key": temp_key,
-        "imei": imei,
-    })
-}
-
-/// `cancelTransferMessage` body.
-#[must_use]
-pub fn cancel_pull_payload(pc_name: &str, public_key: &str, imei: &str) -> Value {
-    json!({
-        "pc_name": pc_name,
-        "public_key": public_key,
-        "imei": imei,
-    })
 }
 
 /// `upgradeGroupToCommunity` body. `grId` is the group id without `g_`.
@@ -1682,7 +1743,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_sync_community_and_e2ee_payloads_match_bundle() {
+    fn catalog_community_and_e2ee_payloads_match_bundle() {
         let page = catalog_list_payload(0, 0);
         assert_eq!(page["version_list_catalog"], 0);
         assert_eq!(page["limit"], 20);
@@ -1710,20 +1771,6 @@ mod tests {
         assert!(group_marked_e2ee(&ids, "g34"));
         assert!(!group_marked_e2ee(&ids, "g_99"));
 
-        assert_eq!(pull_mobile_from_seq(-1), Err("from_seq_id negative"));
-        assert_eq!(pull_mobile_from_seq(0), Ok(0));
-        assert_eq!(pull_mobile_from_seq(7), Ok(8));
-        let pull = pull_mobile_payload("pc", "pk", 8, 0, 1, "tk", "imei");
-        assert_eq!(pull["from_seq_id"], 8);
-        assert_eq!(pull["public_key"], "pk");
-        assert_eq!(pull["temp_key"], "tk");
-        assert_eq!(pull["imei"], "imei");
-        let cross = crossdb_payload("pc", "sess");
-        assert_eq!(cross["pc_name"], "pc");
-        assert_eq!(cross["sync_session"], "sess");
-        let cancel = cancel_pull_payload("pc", "pk", "imei");
-        assert_eq!(cancel.as_object().unwrap().len(), 3);
-
         let up = community_upgrade_payload("42", "vi");
         assert_eq!(up["grId"], "42");
         assert_eq!(up["language"], "vi");
@@ -1743,5 +1790,45 @@ mod tests {
         ]});
         assert_eq!(autodelete_ttl_ms(&listed, "g_12"), Some(86_400_000));
         assert_eq!(autodelete_ttl_ms(&listed, "77"), None);
+    }
+
+    #[test]
+    fn quick_message_payloads_and_parser_match_bundle() {
+        let list = quick_message_list_payload(3, 0, "imei-1");
+        assert_eq!(list["version"], 3);
+        assert_eq!(list["lang"], 0);
+        assert_eq!(list["imei"], "imei-1");
+
+        let create = quick_message_create_payload("/xinchao", "  Xin chao ban  ", "imei-1");
+        assert_eq!(create["keyword"], "xinchao");
+        assert_eq!(create["message"]["title"], "Xin chao ban");
+        assert_eq!(create["message"]["params"], "");
+        assert_eq!(create["type"], 0);
+        assert_eq!(create["imei"], "imei-1");
+
+        let update = quick_message_update_payload(42, "camon", "Cam on!");
+        assert_eq!(update["itemId"], 42);
+        assert_eq!(update["keyword"], "camon");
+        assert_eq!(update["message"]["title"], "Cam on!");
+        assert_eq!(update["type"], 0);
+
+        let del = quick_message_delete_payload(&[42, 43]);
+        assert_eq!(del["itemIds"], json!([42, 43]));
+
+        let parsed = quick_messages_from(&json!({
+            "version": 7,
+            "items": [
+                {"id": 10, "keyword": "hi", "message": {"title": "Xin chao", "params": ""}, "type": 0},
+                {"id": "11", "keyword": "/bye", "message": {"title": "Tam biet"}, "type": 0},
+                {"id": 12, "keyword": "", "message": {"title": "skip"}}
+            ]
+        }));
+        assert_eq!(parsed.version, 7);
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(parsed.items[0].id, 10);
+        assert_eq!(parsed.items[0].keyword, "hi");
+        assert_eq!(parsed.items[0].text, "Xin chao");
+        assert_eq!(parsed.items[1].id, 11);
+        assert_eq!(parsed.items[1].keyword, "bye");
     }
 }

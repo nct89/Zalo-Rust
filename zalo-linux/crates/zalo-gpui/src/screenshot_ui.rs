@@ -205,24 +205,12 @@ fn temp_shot_path() -> PathBuf {
 
 fn saved_shot_path() -> PathBuf {
     let base = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .map(|h| h.join("Pictures"))
         .filter(|p| p.is_dir() || std::fs::create_dir_all(p).is_ok())
         .unwrap_or_else(std::env::temp_dir);
-    let stamp = std::process::Command::new("date")
-        .arg("+%d%m%Y_%H%M%S")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            let secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            format!("{secs}")
-        });
+    let stamp = crate::calendar::local_stamp_dmy_hms();
     base.join(format!("ZaloScreenshot_{stamp}.png"))
 }
 
