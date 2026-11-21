@@ -113,12 +113,20 @@ pub fn search_dirs() -> Vec<PathBuf> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        let data = std::env::var_os("XDG_DATA_HOME")
+        if let Some(data) = std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
-        if let Some(data) = data {
+        {
             dirs.push(data.join("zalo-rust").join("ocr"));
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            let home_ocr = PathBuf::from(home)
+                .join(".local/share")
+                .join("zalo-rust")
+                .join("ocr");
+            if !dirs.contains(&home_ocr) {
+                dirs.push(home_ocr);
+            }
         }
     }
     if let Some(exe_dir) = std::env::current_exe()

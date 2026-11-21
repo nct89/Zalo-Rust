@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, relative, size, App, Bounds, Context,
+    actions, div, fill, point, prelude::*, px, relative, size, App, Bounds, Context,
     CursorStyle, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter,
     FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style,
@@ -259,9 +259,10 @@ impl LineInput {
         }
     }
 
-    /// Context-menu "Select All".
+    /// Context-menu "Select All" or double-click select-all.
     pub fn select_everything(&mut self, cx: &mut Context<Self>) {
         self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
         cx.notify();
     }
 
@@ -296,6 +297,11 @@ impl LineInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if event.click_count >= 2 {
+            self.is_selecting = false;
+            self.select_everything(cx);
+            return;
+        }
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -309,13 +315,19 @@ impl LineInput {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
+        if !self.is_selecting {
+            return;
         }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.is_selecting = false;
+            return;
+        }
+        self.select_to(self.index_for_mouse_position(event.position), cx);
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.selection_reversed = false;
         cx.notify();
     }
 
@@ -670,7 +682,7 @@ impl Element for LineElement {
                             bounds.bottom(),
                         ),
                     ),
-                    hsla(0.62, 0.8, 0.6, 0.2),
+                    gpui::rgba(0x00_68_ff_55),
                 )),
                 None,
             )

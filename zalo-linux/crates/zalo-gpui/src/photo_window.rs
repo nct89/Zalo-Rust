@@ -7,7 +7,7 @@
 //! Clicking a photo or video in chat opens this window instead of covering
 //! the conversation or jumping straight to the system player.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,16 +22,15 @@ use gpui::{
     WindowOptions,
 };
 
-const HEADER_H: f32 = 44.0;
-const FOOTER_H: f32 = 64.0;
-const RAIL_W: f32 = 132.0;
-const CHEVRON_W: f32 = 40.0;
+const TITLEBAR_H: f32 = zalo_design::TITLEBAR_H;
+const SUBHEADER_H: f32 = 36.0;
+const FOOTER_H: f32 = 56.0;
+const RAIL_W: f32 = 112.0;
 const IC_SHARE: char = '\u{ED29}';
 const IC_DOWNLOAD: char = '\u{EAE1}';
 const IC_ROTATE_L: char = '\u{ED0E}';
 const IC_ZOOM_IN: char = '\u{EE16}';
 const IC_ZOOM_OUT: char = '\u{EE18}';
-const IC_ZOOM_FIT: char = '\u{EE17}';
 const IC_COPY: char = '\u{EAC5}';
 const IC_OCR: char = '\u{ED0F}';
 const IC_UP: char = '\u{EA91}';
@@ -39,8 +38,10 @@ const IC_DOWN: char = '\u{EA8B}';
 
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 6.0;
-const STAGE_BG: u32 = 0x3a3c3d;
-const BAR_BG: u32 = 0x2e3031;
+/// Electron `Zalo Photo` dark canvas (`#141414`), chrome bars (`#282828`), filmstrip (`#1e1e1e`).
+const STAGE_BG: u32 = 0x14_14_14;
+const BAR_BG: u32 = 0x28_28_28;
+const RAIL_BG: u32 = 0x1e_1e_1e;
 
 /// OS title of the live Electron photo window (`xdotool getwindowname` → `Zalo Photo`).
 #[must_use]
@@ -85,11 +86,13 @@ static SHARE_Q: Mutex<Vec<ChatMsg>> = Mutex::new(Vec::new());
 
 /// Open the gallery. `current_id` selects the photo that was clicked.
 /// `start_ocr` runs text recognition on that photo (context-menu "Scan Text").
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     cx: &mut App,
     conv_name: String,
     items: Vec<ChatMsg>,
     current_id: u64,
+    sender_avatars: HashMap<u64, Arc<RenderImage>>,
     download_dir: PathBuf,
     session_dir: Option<PathBuf>,
     start_ocr: bool,
@@ -99,7 +102,8 @@ pub(crate) fn open(
         return false;
     }
     let title = photo_window_title(&conv_name);
-    let bounds = Bounds::centered(None, size(px(1120.), px(720.)), cx);
+    let bounds = Bounds::centered(None, size(px(1140.), px(740.)), cx);
+    crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -119,6 +123,7 @@ pub(crate) fn open(
                     conv_name,
                     items,
                     current_id,
+                    sender_avatars,
                     download_dir,
                     session_dir,
                     start_ocr,
@@ -127,6 +132,21 @@ pub(crate) fn open(
             });
             let focus = view.focus_handle(cx);
             window.focus(&focus);
+            window.activate_window();
+            let weak = view.downgrade();
+            window
+                .spawn(cx, async move |cx| {
+                    for delay_ms in [50u64, 180] {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(delay_ms))
+                            .await;
+                        let _ = weak.update_in(cx, |_, window, cx| {
+                            window.refresh();
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
             view
         },
     )
@@ -138,6 +158,8 @@ struct PhotoView {
     conv_name: String,
     items: Vec<ChatMsg>,
     index: usize,
+    sender_avatars: HashMap<u64, Arc<RenderImage>>,
+    rail_open: bool,
     image: Option<Arc<RenderImage>>,
     zoom: f32,
     pan_x: f32,
@@ -145,13 +167,21 @@ struct PhotoView {
     turns: u8,
     drag: Option<(f32, f32, f32, f32)>,
     dragged: bool,
+    ocr_active: bool,
     ocr_busy: bool,
     ocr_result: Option<Result<String, String>>,
     /// Line boxes from the last successful scan, fractions of the image.
     ocr_boxes: Vec<crate::viewer::OcrBox>,
+    /// Selected OCR line box indices (Live-Text style directly on the photo).
+    ocr_selected: BTreeSet<usize>,
+    /// Active drag marquee `(x0, y0, x1, y1)` in image-local pixels.
+    ocr_drag: Option<(f32, f32, f32, f32)>,
+    /// Whether the user dismissed the Electron-style blue hint pill for this scan.
+    ocr_hint_dismissed: bool,
     ocr_installing: bool,
     ocr_install_status: Option<String>,
     note: Option<String>,
+    note_gen: u64,
     download_dir: PathBuf,
     session_dir: Option<PathBuf>,
     /// Drops a decode that finished for a photo the user already left.
@@ -173,11 +203,13 @@ struct VideoPump {
 }
 
 impl PhotoView {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cx: &mut Context<Self>,
         conv_name: String,
         items: Vec<ChatMsg>,
         current_id: u64,
+        sender_avatars: HashMap<u64, Arc<RenderImage>>,
         download_dir: PathBuf,
         session_dir: Option<PathBuf>,
         start_ocr: bool,
@@ -190,6 +222,8 @@ impl PhotoView {
             conv_name,
             items,
             index,
+            sender_avatars,
+            rail_open: true,
             image: None,
             zoom: 1.0,
             pan_x: 0.0,
@@ -197,12 +231,17 @@ impl PhotoView {
             turns: 0,
             drag: None,
             dragged: false,
+            ocr_active: false,
             ocr_busy: false,
             ocr_result: None,
             ocr_boxes: Vec::new(),
+            ocr_selected: BTreeSet::new(),
+            ocr_drag: None,
+            ocr_hint_dismissed: false,
             ocr_installing: false,
             ocr_install_status: None,
             note: None,
+            note_gen: 0,
             download_dir,
             session_dir,
             generation: 1,
@@ -219,6 +258,92 @@ impl PhotoView {
             this.start_ocr(cx);
         }
         this
+    }
+
+    fn show_note(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.note = Some(text.into());
+        self.note_gen = self.note_gen.wrapping_add(1);
+        let gen = self.note_gen;
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(std::time::Duration::from_millis(2400)).await;
+            let _ = this.update(cx, |view, cx| {
+                if view.note_gen == gen {
+                    view.note = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn reset_ocr(&mut self) {
+        self.ocr_active = false;
+        self.ocr_busy = false;
+        self.ocr_result = None;
+        self.ocr_boxes.clear();
+        self.ocr_selected.clear();
+        self.ocr_drag = None;
+        self.ocr_hint_dismissed = false;
+    }
+
+    fn finish_ocr_drag(
+        &mut self,
+        pos: gpui::Point<gpui::Pixels>,
+        modifiers: gpui::Modifiers,
+        window: &Window,
+        img_left: f32,
+        img_top: f32,
+        dw: f32,
+        dh: f32,
+    ) -> bool {
+        let Some((sx, sy, _, _)) = self.ocr_drag.take() else {
+            return false;
+        };
+        let (cx_pos, cy_pos) = crate::window_frame::window_to_chrome(window, pos);
+        let lx = (cx_pos - img_left).clamp(0.0, dw);
+        let ly = (cy_pos - (TITLEBAR_H + SUBHEADER_H + img_top)).clamp(0.0, dh);
+        if (lx - sx).abs() + (ly - sy).abs() <= 4.0 {
+            if let Some(hit) = crate::viewer::ocr_box_at(&self.ocr_boxes, lx, ly, dw, dh) {
+                if modifiers.control || modifiers.shift {
+                    if !self.ocr_selected.remove(&hit) {
+                        self.ocr_selected.insert(hit);
+                    }
+                } else if self.ocr_selected.len() == 1 && self.ocr_selected.contains(&hit) {
+                    self.ocr_selected.clear();
+                } else {
+                    self.ocr_selected.clear();
+                    self.ocr_selected.insert(hit);
+                }
+            } else {
+                self.ocr_selected.clear();
+            }
+        }
+        true
+    }
+
+    fn copy_ocr_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.ocr_boxes.is_empty() {
+            return false;
+        }
+        let text = crate::viewer::ocr_selected_text(&self.ocr_boxes, &self.ocr_selected);
+        if text.is_empty() {
+            return false;
+        }
+        crate::clip::copy_text(cx, text);
+        let count = if self.ocr_selected.is_empty() {
+            self.ocr_boxes.len()
+        } else {
+            self.ocr_selected.len()
+        };
+        self.show_note(
+            if count > 1 {
+                format!("Đã sao chép {count} dòng văn bản")
+            } else {
+                "Đã sao chép văn bản".to_owned()
+            },
+            cx,
+        );
+        true
     }
 
     fn current(&self) -> &ChatMsg {
@@ -274,9 +399,7 @@ impl PhotoView {
         self.pan_y = 0.0;
         self.turns = 0;
         self.image = None;
-        self.ocr_result = None;
-        self.ocr_boxes.clear();
-        self.ocr_busy = false;
+        self.reset_ocr();
         self.generation = self.generation.wrapping_add(1);
         self.reload(cx);
     }
@@ -300,8 +423,7 @@ impl PhotoView {
         self.pan_x = 0.0;
         self.pan_y = 0.0;
         self.image = None;
-        self.ocr_result = None;
-        self.ocr_boxes.clear();
+        self.reset_ocr();
         self.generation = self.generation.wrapping_add(1);
         self.reload(cx);
     }
@@ -334,20 +456,32 @@ impl PhotoView {
         if self.ocr_busy {
             return;
         }
-        // Original `OCR_TOGGLE`: a finished scan shows or hides the overlay.
-        // Copy stays on the "Copy Text" control, not on the scan itself.
-        if self.ocr_result.is_some() {
+        // Electron `OCR_TOGGLE`: toggle the Live-Text overlay instantaneously
+        // when this photo was already scanned; otherwise scan on demand.
+        if !self.ocr_boxes.is_empty() {
+            self.ocr_active = !self.ocr_active;
+            if !self.ocr_active {
+                self.ocr_selected.clear();
+                self.ocr_drag = None;
+            }
+            return;
+        }
+        if matches!(self.ocr_result, Some(Err(_))) {
             self.ocr_result = None;
-            self.ocr_boxes.clear();
+            self.ocr_active = false;
             return;
         }
         let msg = self.current().clone();
         if !matches!(msg.kind, MsgKind::Photo | MsgKind::Doodle | MsgKind::Gif) {
             return;
         }
+        self.ocr_active = true;
         self.ocr_busy = true;
         self.ocr_result = None;
         self.ocr_boxes.clear();
+        self.ocr_selected.clear();
+        self.ocr_drag = None;
+        self.ocr_hint_dismissed = false;
         let turns = self.turns % 4;
         let id = msg.id;
         let path = msg.media_path.clone().filter(|p| p.is_file());
@@ -381,11 +515,12 @@ impl PhotoView {
                     view.ocr_busy = false;
                     match res {
                         Ok(scan) => {
-                            view.note = Some("Đã quét chữ trên ảnh".to_owned());
+                            view.ocr_active = true;
                             view.ocr_boxes = scan.boxes;
                             view.ocr_result = Some(Ok(scan.text));
                         }
                         Err(err) => {
+                            view.ocr_active = false;
                             view.ocr_boxes.clear();
                             view.ocr_result = Some(Err(err));
                         }
@@ -481,35 +616,35 @@ impl PhotoView {
         .detach();
     }
 
-    fn share_current(&mut self, _cx: &mut Context<Self>) {
+    fn share_current(&mut self, cx: &mut Context<Self>) {
         if self.current().kind == MsgKind::Video {
-            self.note = Some("Chia sẻ video từ khung chat".to_owned());
+            self.show_note("Chia sẻ video từ khung chat", cx);
             return;
         }
         push_share(self.current().clone());
-        self.note = Some("Đã mở hộp chuyển tiếp ở cửa sổ chính".to_owned());
+        self.show_note("Đã mở hộp chuyển tiếp ở cửa sổ chính", cx);
     }
 
     fn copy_current(&mut self, cx: &mut Context<Self>) {
         let msg = self.current().clone();
         if msg.kind == MsgKind::Video {
-            self.note = Some("Video không copy được như ảnh".to_owned());
+            self.show_note("Video không copy được như ảnh", cx);
             return;
         }
         match copy_photo_bytes(&msg) {
             Ok((format, bytes)) => {
                 crate::clip::copy_image(cx, format, bytes);
-                self.note = Some("Đã copy hình ảnh".to_owned());
+                self.show_note("Đã copy hình ảnh", cx);
             }
-            Err(err) => self.note = Some(err),
+            Err(err) => self.show_note(err, cx),
         }
     }
 
-    fn save_current(&mut self) {
+    fn save_current(&mut self, cx: &mut Context<Self>) {
         let msg = self.current().clone();
         match save_photo_file(&msg, &self.download_dir) {
-            Ok(dest) => self.note = Some(format!("Đã lưu {dest}")),
-            Err(err) => self.note = Some(err),
+            Ok(dest) => self.show_note(format!("Đã lưu {dest}"), cx),
+            Err(err) => self.show_note(err, cx),
         }
     }
 
@@ -690,10 +825,35 @@ impl PhotoView {
         true
     }
 
+    fn stage_size(&self, window: &Window) -> (f32, f32) {
+        let vp = window.viewport_size();
+        let csd = if crate::window_frame::CsdCorners::from_window(window).any_pad() {
+            zalo_design::WINDOW_SHADOW * 2.0
+        } else {
+            0.0
+        };
+        let rail = if self.rail_open { RAIL_W } else { 0.0 };
+        (
+            (f32::from(vp.width) - csd - rail).max(200.0),
+            (f32::from(vp.height) - csd - TITLEBAR_H - SUBHEADER_H - FOOTER_H).max(80.0),
+        )
+    }
+
     fn on_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         match key {
             "escape" => {
-                window.remove_window();
+                if !self.ocr_selected.is_empty() {
+                    self.ocr_selected.clear();
+                    self.ocr_drag = None;
+                } else if self.ocr_active || matches!(self.ocr_result, Some(Err(_))) {
+                    self.ocr_active = false;
+                    self.ocr_drag = None;
+                    if matches!(self.ocr_result, Some(Err(_))) {
+                        self.ocr_result = None;
+                    }
+                } else {
+                    window.remove_window();
+                }
                 return true;
             }
             "left" | "up" => self.step(-1, cx),
@@ -709,7 +869,7 @@ impl PhotoView {
             "=" | "+" | "equal" => self.set_zoom(self.zoom * 1.25),
             "0" => self.set_zoom(1.0),
             "1" => {
-                let (sw, sh) = stage_size(window);
+                let (sw, sh) = self.stage_size(window);
                 let fit = self.fit(sw, sh);
                 self.set_zoom((1.0 / fit).clamp(ZOOM_MIN, ZOOM_MAX));
             }
@@ -728,12 +888,13 @@ impl Focusable for PhotoView {
 
 impl Render for PhotoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (stage_w, stage_h) = stage_size(window);
+        let (stage_w, stage_h) = self.stage_size(window);
         let fit = self.fit(stage_w, stage_h);
         let zoom = self.zoom;
         let (pw, ph) = self.pixels();
         let (dw, dh) = ((pw * fit * zoom).max(1.0), (ph * fit * zoom).max(1.0));
         let percent = (fit * zoom * 100.0).round().clamp(1.0, 9999.0);
+        let zoomed = (zoom - 1.0).abs() > 0.03;
         let idx = self.index;
         let has_prev = idx > 0;
         let has_next = idx + 1 < self.items.len();
@@ -752,14 +913,19 @@ impl Render for PhotoView {
         }
         let img_left = (stage_w - dw) * 0.5 + pan_x;
         let img_top = (stage_h - dh) * 0.5 + pan_y;
-        let can_pan = !is_video && (dw > stage_w + 1.0 || dh > stage_h + 1.0);
-        let dragging = self.drag.is_some();
         let ocr_busy = self.ocr_busy;
         let ocr_result = self.ocr_result.clone();
         let ocr_boxes = self.ocr_boxes.clone();
+        let ocr_live = self.ocr_active && !ocr_boxes.is_empty() && !is_video;
+        let ocr_selected = self.ocr_selected.clone();
+        let ocr_drag = self.ocr_drag;
+        let ocr_hint_dismissed = self.ocr_hint_dismissed;
         let ocr_installing = self.ocr_installing;
         let ocr_install_status = self.ocr_install_status.clone();
         let can_ocr = matches!(msg.kind, MsgKind::Photo | MsgKind::Doodle | MsgKind::Gif);
+        let can_pan = !is_video && !ocr_live && (dw > stage_w + 1.0 || dh > stage_h + 1.0);
+        let dragging = self.drag.is_some();
+        let rail_open = self.rail_open;
         let caption =
             (!crate::media::hide_marker_text(msg.kind, &msg.text)).then(|| msg.text.clone());
         let note = self.note.clone();
@@ -775,32 +941,54 @@ impl Render for PhotoView {
         } else {
             msg.sender.clone()
         };
+        let sender_avatar = self.sender_avatars.get(&msg.id).cloned();
         let initial = sender.chars().next().unwrap_or('?').to_string();
-        let when = if msg.at_ms > 0 {
-            crate::data::day_label(msg.at_ms, crate::data::now_ms())
+        let now = crate::data::now_ms();
+        let day_tag = filmstrip_day(msg.at_ms, now);
+        let when = if !msg.time.trim().is_empty() && !day_tag.is_empty() && !msg.time.contains(&day_tag) {
+            format!("{} {day_tag}", msg.time.trim())
+        } else if msg.at_ms > 0 {
+            crate::data::day_label(msg.at_ms, now)
         } else {
             msg.time.clone()
         };
-        self.pin_film();
+        if rail_open {
+            self.pin_film();
+        }
 
-        let icon_btn = |id: &'static str, code: char, label: &'static str| {
+        let icon_btn = |id: &'static str, code: char, label: &'static str, active: bool| {
             div()
                 .id(id)
-                .size(px(32.))
+                .size(px(34.))
                 .flex()
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .rounded(px(4.))
+                .rounded(px(6.))
                 .cursor_pointer()
-                .text_color(rgb(0xffffff))
-                .hover(|st| st.bg(hsla(0., 0., 1., 0.12)))
+                .text_color(if active {
+                    rgb(0x4d_a3_ff)
+                } else {
+                    gpui::rgba(0xff_ff_ff_e0)
+                })
+                .when(active, |el| {
+                    el.bg(hsla(0., 0., 1., 0.16))
+                        .border_1()
+                        .border_color(gpui::rgba(0x4d_a3_ff_66))
+                })
+                .hover(|st| st.bg(hsla(0., 0., 1., 0.14)))
                 .tooltip(move |_, cx| crate::widgets::tip(label, cx))
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(crate::fonts::icon_el(code, "•", 18.))
         };
+        let bar_divider = || {
+            div()
+                .w(px(1.))
+                .h(px(18.))
+                .mx(px(4.))
+                .bg(hsla(0., 0., 1., 0.16))
+        };
 
-        let now = crate::data::now_ms();
         let metas: Vec<(u64, i64, bool)> = self
             .items
             .iter()
@@ -809,90 +997,109 @@ impl Render for PhotoView {
         let thumbs = self.thumbs.clone();
         let mut prev_day = String::new();
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
-        for (i, (id, at_ms, video)) in metas.into_iter().enumerate() {
-            let day = filmstrip_day(at_ms, now);
-            let show_day = !day.is_empty() && day != prev_day;
-            if show_day {
-                prev_day = day.clone();
-            }
-            let thumb = thumbs.get(i).cloned().flatten();
-            let selected = i == idx;
-            let label = day;
-            rows.push(
-                div()
-                    .id(("zalo-photo-thumb", id))
-                    .w(px(RAIL_W))
-                    .flex()
-                    .flex_col()
-                    .px(px(10.))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        if this.index != i {
-                            let delta = i as isize - this.index as isize;
-                            this.step(delta, cx);
-                        }
-                        cx.notify();
-                    }))
-                    .when(show_day, |el| {
-                        el.child(
-                            div()
-                                .pt(px(8.))
-                                .pb(px(4.))
-                                .text_size(px(12.))
-                                .text_color(hsla(0., 0., 1., 0.72))
-                                .child(label.clone()),
-                        )
-                    })
-                    .child({
-                        let mut cell = div()
-                            .mb(px(6.))
-                            .w(px(108.))
-                            .h(px(72.))
-                            .rounded(px(4.))
-                            .overflow_hidden()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(0x1a1c1d))
-                            .border_2()
-                            .border_color(if selected {
-                                rgb(0xffffff).into()
-                            } else {
-                                hsla(0., 0., 1., 0.)
-                            });
-                        cell = match thumb {
-                            Some(t) => cell.child(
-                                img(t)
-                                    .w(px(108.))
-                                    .h(px(72.))
-                                    .object_fit(gpui::ObjectFit::Cover),
-                            ),
-                            None => cell.bg(rgb(0x5c6166)).child(
+        if rail_open {
+            for (i, (id, at_ms, video)) in metas.into_iter().enumerate() {
+                let day = filmstrip_day(at_ms, now);
+                let show_day = !day.is_empty() && day != prev_day;
+                if show_day {
+                    prev_day = day.clone();
+                }
+                let thumb = thumbs.get(i).cloned().flatten();
+                let selected = i == idx;
+                let label = day;
+                rows.push(
+                    div()
+                        .id(("zalo-photo-thumb", id))
+                        .w(px(RAIL_W))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .px(px(10.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if this.index != i {
+                                let delta = i as isize - this.index as isize;
+                                this.step(delta, cx);
+                            }
+                            cx.notify();
+                        }))
+                        .when(show_day, |el| {
+                            el.child(
                                 div()
+                                    .w_full()
+                                    .pt(px(10.))
+                                    .pb(px(6.))
                                     .flex()
-                                    .items_center()
                                     .justify_center()
-                                    .text_color(hsla(0., 0., 1., 0.92))
-                                    .child(if video {
-                                        "▶".to_owned()
-                                    } else {
-                                        String::new()
-                                    })
-                                    .when(!video, |el| {
-                                        el.child(crate::fonts::icon_el(
-                                            crate::fonts::ic::TB_PHOTO,
-                                            "▣",
-                                            18.,
-                                        ))
-                                    }),
-                            ),
-                        };
-                        cell
-                    })
-                    .into_any_element(),
-            );
+                                    .text_size(px(12.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(hsla(0., 0., 1., 0.78))
+                                    .child(label.clone()),
+                            )
+                        })
+                        .child({
+                            let mut cell = div()
+                                .mb(px(8.))
+                                .w(px(88.))
+                                .h(px(74.))
+                                .rounded(px(6.))
+                                .overflow_hidden()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(0x16_18_1a))
+                                .border_2()
+                                .border_color(if selected {
+                                    rgb(0xffffff).into()
+                                } else {
+                                    hsla(0., 0., 1., 0.)
+                                });
+                            cell = match thumb {
+                                Some(t) => cell.child(
+                                    img(t)
+                                        .w(px(88.))
+                                        .h(px(74.))
+                                        .object_fit(gpui::ObjectFit::Cover),
+                                ),
+                                None => cell.bg(rgb(0x3a_3d_40)).child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(hsla(0., 0., 1., 0.85))
+                                        .child(if video {
+                                            "▶".to_owned()
+                                        } else {
+                                            String::new()
+                                        })
+                                        .when(!video, |el| {
+                                            el.child(crate::fonts::icon_el(
+                                                crate::fonts::ic::TB_PHOTO,
+                                                "▣",
+                                                18.,
+                                            ))
+                                        }),
+                                ),
+                            };
+                            cell
+                        })
+                        .into_any_element(),
+                );
+            }
         }
+
+        let missing_ocr = matches!(
+            &ocr_result,
+            Some(Err(err)) if err == &crate::viewer::ocr_missing_message()
+        );
+        let ocr_err = match &ocr_result {
+            Some(Err(err)) if !missing_ocr => Some(err.clone()),
+            _ => None,
+        };
+        let selected_count = ocr_selected.len();
+        let show_blue_pill = ocr_live && (!ocr_selected.is_empty() || !ocr_hint_dismissed);
+        let show_status_pill = ocr_busy || ocr_installing || missing_ocr || ocr_err.is_some();
 
         let frame = crate::window_frame::CsdCorners::from_window(window);
         crate::window_frame::wrap_csd(
@@ -902,6 +1109,27 @@ impl Render for PhotoView {
                 .track_focus(&self.focus)
                 .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
                     let mods = &e.keystroke.modifiers;
+                    if mods.control && !mods.alt && !mods.platform && !mods.function {
+                        match e.keystroke.key.as_str() {
+                            "c" => {
+                                if this.ocr_active && !this.ocr_boxes.is_empty() {
+                                    this.copy_ocr_selection(cx);
+                                } else {
+                                    this.copy_current(cx);
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                                return;
+                            }
+                            "a" if this.ocr_active && !this.ocr_boxes.is_empty() => {
+                                this.ocr_selected = (0..this.ocr_boxes.len()).collect();
+                                cx.stop_propagation();
+                                cx.notify();
+                                return;
+                            }
+                            _ => return,
+                        }
+                    }
                     if mods.control || mods.alt || mods.platform || mods.function {
                         return;
                     }
@@ -918,60 +1146,27 @@ impl Render for PhotoView {
                 .when(frame.tr, |el| el.rounded_tr(frame.radius))
                 .when(frame.bl, |el| el.rounded_bl(frame.radius))
                 .when(frame.br, |el| el.rounded_br(frame.radius))
+                // 1. Electron-style `Zalo Photo` OS caption bar
+                .child(crate::titlebar::photo_titlebar(frame, window))
+                // 2. Dark sub-header with centered conversation title
                 .child(
                     div()
                         .id("zalo-photo-header")
-                        .relative()
                         .flex()
                         .flex_none()
-                        .h(px(HEADER_H))
+                        .h(px(SUBHEADER_H))
                         .items_center()
                         .justify_center()
-                        .px(px(140.))
+                        .px(px(24.))
                         .bg(rgb(BAR_BG))
-                        .when(frame.tl, |el| el.rounded_tl(frame.radius))
-                        .when(frame.tr, |el| el.rounded_tr(frame.radius))
-                        .text_size(px(15.))
+                        .border_b_1()
+                        .border_color(hsla(0., 0., 1., 0.06))
+                        .text_size(px(14.))
                         .font_family(FAMILY_SEMIBOLD)
                         .text_color(rgb(0xffffff))
-                        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                            window.start_window_move();
-                        })
-                        .on_click(|event, window, _| {
-                            if event.click_count() >= 2 {
-                                window.zoom_window();
-                            }
-                        })
-                        .child(div().truncate().child(header))
-                        .child(
-                            div()
-                                .absolute()
-                                .right_0()
-                                .top_0()
-                                .h_full()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .child(photo_caption_btn("zalo-photo-min", "−", false).on_click(
-                                    cx.listener(|_, _, window, cx| {
-                                        cx.stop_propagation();
-                                        window.minimize_window();
-                                    }),
-                                ))
-                                .child(photo_caption_btn("zalo-photo-max", "□", false).on_click(
-                                    cx.listener(|_, _, window, cx| {
-                                        cx.stop_propagation();
-                                        window.zoom_window();
-                                    }),
-                                ))
-                                .child(photo_caption_btn("zalo-photo-close", "×", true).on_click(
-                                    cx.listener(|_, _, window, cx| {
-                                        cx.stop_propagation();
-                                        window.remove_window();
-                                    }),
-                                )),
-                        ),
+                        .child(div().truncate().child(header)),
                 )
+                // 3. Stage + optional collapsible filmstrip
                 .child(
                     div()
                         .flex()
@@ -983,8 +1178,6 @@ impl Render for PhotoView {
                                 .id("zalo-photo-stage")
                                 .on_scroll_wheel(cx.listener(
                                     |this, e: &ScrollWheelEvent, _, cx| {
-                                        // The filmstrip is a sibling. A listener on the
-                                        // window root also saw that wheel and zoomed.
                                         cx.stop_propagation();
                                         let dy = f32::from(e.delta.pixel_delta(px(20.)).y);
                                         if dy == 0.0 {
@@ -1005,8 +1198,16 @@ impl Render for PhotoView {
                                 .when(!is_video, |el| {
                                     el.on_mouse_down(
                                         gpui::MouseButton::Left,
-                                        cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
                                             cx.stop_propagation();
+                                            if this.ocr_active && !this.ocr_boxes.is_empty() {
+                                                // Clicked dark stage outside image: clear text selection.
+                                                if !this.ocr_selected.is_empty() {
+                                                    this.ocr_selected.clear();
+                                                    cx.notify();
+                                                }
+                                                return;
+                                            }
                                             this.dragged = false;
                                             this.drag = Some((
                                                 f32::from(e.position.x),
@@ -1017,7 +1218,41 @@ impl Render for PhotoView {
                                         }),
                                     )
                                     .on_mouse_move(cx.listener(
-                                        |this, e: &gpui::MouseMoveEvent, window, cx| {
+                                        move |this, e: &gpui::MouseMoveEvent, window, cx| {
+                                            if e.pressed_button != Some(gpui::MouseButton::Left) {
+                                                let cleared = this.ocr_drag.take().is_some()
+                                                    | this.drag.take().is_some();
+                                                if cleared {
+                                                    cx.notify();
+                                                }
+                                                return;
+                                            }
+                                            if let Some((sx, sy, _, _)) = this.ocr_drag {
+                                                let (cx_pos, cy_pos) =
+                                                    crate::window_frame::window_to_chrome(
+                                                        window,
+                                                        e.position,
+                                                    );
+                                                let lx = (cx_pos - img_left).clamp(0.0, dw);
+                                                let ly = (cy_pos
+                                                    - (TITLEBAR_H + SUBHEADER_H + img_top))
+                                                    .clamp(0.0, dh);
+                                                this.ocr_drag = Some((sx, sy, lx, ly));
+                                                if (lx - sx).abs() + (ly - sy).abs() > 4.0 {
+                                                    this.ocr_selected =
+                                                        crate::viewer::ocr_boxes_in_rect(
+                                                            &this.ocr_boxes,
+                                                            sx,
+                                                            sy,
+                                                            lx,
+                                                            ly,
+                                                            dw,
+                                                            dh,
+                                                        );
+                                                }
+                                                cx.notify();
+                                                return;
+                                            }
                                             let Some((ox, oy, px0, py0)) = this.drag else {
                                                 return;
                                             };
@@ -1026,13 +1261,19 @@ impl Render for PhotoView {
                                             if dx.abs() + dy.abs() > 3.0 {
                                                 this.dragged = true;
                                             }
-                                            let (sw, sh) = stage_size(window);
+                                            let (sw, sh) = this.stage_size(window);
                                             let fit = this.fit(sw, sh);
                                             let (pw, ph) = this.pixels();
-                                            let dw = (pw * fit * this.zoom).max(1.0);
-                                            let dh = (ph * fit * this.zoom).max(1.0);
-                                            let (nx, ny) =
-                                                clamp_pan(px0 + dx, py0 + dy, dw, dh, sw, sh);
+                                            let cur_dw = (pw * fit * this.zoom).max(1.0);
+                                            let cur_dh = (ph * fit * this.zoom).max(1.0);
+                                            let (nx, ny) = clamp_pan(
+                                                px0 + dx,
+                                                py0 + dy,
+                                                cur_dw,
+                                                cur_dh,
+                                                sw,
+                                                sh,
+                                            );
                                             this.pan_x = nx;
                                             this.pan_y = ny;
                                             cx.notify();
@@ -1040,14 +1281,30 @@ impl Render for PhotoView {
                                     ))
                                     .on_mouse_up(
                                         gpui::MouseButton::Left,
-                                        cx.listener(|this, _: &gpui::MouseUpEvent, _, _| {
-                                            this.drag = None;
-                                        }),
+                                        cx.listener(
+                                            move |this, e: &gpui::MouseUpEvent, window, cx| {
+                                                if this.finish_ocr_drag(
+                                                    e.position,
+                                                    e.modifiers,
+                                                    window,
+                                                    img_left,
+                                                    img_top,
+                                                    dw,
+                                                    dh,
+                                                ) {
+                                                    cx.notify();
+                                                }
+                                                this.drag = None;
+                                            },
+                                        ),
                                     )
                                     .on_mouse_up_out(
                                         gpui::MouseButton::Left,
-                                        cx.listener(|this, _: &gpui::MouseUpEvent, _, _| {
+                                        cx.listener(|this, _: &gpui::MouseUpEvent, _, cx| {
                                             this.drag = None;
+                                            if this.ocr_drag.take().is_some() {
+                                                cx.notify();
+                                            }
                                         }),
                                     )
                                 })
@@ -1107,42 +1364,148 @@ impl Render for PhotoView {
                                             .absolute()
                                             .left(px(img_left))
                                             .top(px(img_top))
-                                            .on_click(cx.listener(
-                                                |this, e: &gpui::ClickEvent, window, cx| {
-                                                    cx.stop_propagation();
-                                                    let dragged = this.dragged;
-                                                    this.dragged = false;
-                                                    this.drag = None;
-                                                    if dragged {
-                                                        return;
-                                                    }
-                                                    if e.click_count() >= 2 {
-                                                        let (sw, sh) = stage_size(window);
-                                                        let fit = this.fit(sw, sh);
-                                                        let actual =
-                                                            (1.0 / fit).clamp(ZOOM_MIN, ZOOM_MAX);
-                                                        this.set_zoom(
-                                                            if (this.zoom - actual).abs() < 0.05 {
-                                                                1.0
-                                                            } else {
-                                                                actual
-                                                            },
-                                                        );
-                                                        cx.notify();
-                                                    }
-                                                },
-                                            ))
                                             .w(px(dw))
                                             .h(px(dh))
+                                            .when(ocr_live, |el| {
+                                                el.cursor(CursorStyle::IBeam)
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  e: &gpui::MouseDownEvent,
+                                                                  window,
+                                                                  cx| {
+                                                                cx.stop_propagation();
+                                                                if e.click_count >= 2 {
+                                                                    this.ocr_drag = None;
+                                                                    this.ocr_selected = (0..this
+                                                                        .ocr_boxes
+                                                                        .len())
+                                                                        .collect();
+                                                                    cx.notify();
+                                                                    return;
+                                                                }
+                                                                let (cx_pos, cy_pos) =
+                                                                    crate::window_frame::window_to_chrome(
+                                                                        window,
+                                                                        e.position,
+                                                                    );
+                                                                let lx =
+                                                                    (cx_pos - img_left).clamp(0.0, dw);
+                                                                let ly = (cy_pos
+                                                                    - (TITLEBAR_H
+                                                                        + SUBHEADER_H
+                                                                        + img_top))
+                                                                    .clamp(0.0, dh);
+                                                                this.ocr_drag =
+                                                                    Some((lx, ly, lx, ly));
+                                                            },
+                                                        ),
+                                                    )
+                                                    .on_mouse_up(
+                                                        gpui::MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  e: &gpui::MouseUpEvent,
+                                                                  window,
+                                                                  cx| {
+                                                                cx.stop_propagation();
+                                                                if this.finish_ocr_drag(
+                                                                    e.position,
+                                                                    e.modifiers,
+                                                                    window,
+                                                                    img_left,
+                                                                    img_top,
+                                                                    dw,
+                                                                    dh,
+                                                                ) {
+                                                                    cx.notify();
+                                                                }
+                                                            },
+                                                        ),
+                                                    )
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Right,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  e: &gpui::MouseDownEvent,
+                                                                  window,
+                                                                  cx| {
+                                                                cx.stop_propagation();
+                                                                this.ocr_drag = None;
+                                                                if this.ocr_selected.is_empty() {
+                                                                    let (cx_pos, cy_pos) =
+                                                                        crate::window_frame::window_to_chrome(
+                                                                            window,
+                                                                            e.position,
+                                                                        );
+                                                                    let lx = (cx_pos - img_left)
+                                                                        .clamp(0.0, dw);
+                                                                    let ly = (cy_pos
+                                                                        - (TITLEBAR_H
+                                                                            + SUBHEADER_H
+                                                                            + img_top))
+                                                                        .clamp(0.0, dh);
+                                                                    if let Some(hit) =
+                                                                        crate::viewer::ocr_box_at(
+                                                                            &this.ocr_boxes,
+                                                                            lx,
+                                                                            ly,
+                                                                            dw,
+                                                                            dh,
+                                                                        )
+                                                                    {
+                                                                        this.ocr_selected
+                                                                            .insert(hit);
+                                                                    }
+                                                                }
+                                                                this.copy_ocr_selection(cx);
+                                                                cx.notify();
+                                                            },
+                                                        ),
+                                                    )
+                                            })
+                                            .when(!ocr_live, |el| {
+                                                el.on_click(cx.listener(
+                                                    |this, e: &gpui::ClickEvent, window, cx| {
+                                                        cx.stop_propagation();
+                                                        let dragged = this.dragged;
+                                                        this.dragged = false;
+                                                        this.drag = None;
+                                                        if dragged {
+                                                            return;
+                                                        }
+                                                        if e.click_count() >= 2 {
+                                                            let (sw, sh) = this.stage_size(window);
+                                                            let fit = this.fit(sw, sh);
+                                                            let actual = (1.0 / fit)
+                                                                .clamp(ZOOM_MIN, ZOOM_MAX);
+                                                            this.set_zoom(
+                                                                if (this.zoom - actual).abs() < 0.05
+                                                                {
+                                                                    1.0
+                                                                } else {
+                                                                    actual
+                                                                },
+                                                            );
+                                                            cx.notify();
+                                                        }
+                                                    },
+                                                ))
+                                            })
                                             .child(
                                                 img(image)
                                                     .w(px(dw))
                                                     .h(px(dh))
                                                     .object_fit(gpui::ObjectFit::Contain),
                                             )
-                                            .when(!ocr_boxes.is_empty(), |el| {
+                                            .when(ocr_live, |el| {
                                                 el.child(crate::viewer::ocr_marks(
-                                                    &ocr_boxes, dw, dh,
+                                                    &ocr_boxes,
+                                                    &ocr_selected,
+                                                    ocr_drag,
+                                                    dw,
+                                                    dh,
                                                 ))
                                             })
                                             .into_any_element(),
@@ -1156,382 +1519,607 @@ impl Render for PhotoView {
                                             .into_any_element(),
                                     }
                                 })
-                                .when_some(caption.filter(|_| !is_video), |el, text| {
+                                // Floating prev/next circular buttons at right edge of stage
+                                .when(self.items.len() > 1, |el| {
                                     el.child(
                                         div()
                                             .absolute()
-                                            .bottom(px(8.))
-                                            .left(px(16.))
-                                            .right(px(16.))
-                                            .text_size(px(13.))
-                                            .text_color(hsla(0., 0., 1., 0.9))
-                                            .child(text),
+                                            .right(px(12.))
+                                            .top_0()
+                                            .bottom_0()
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap(px(10.))
+                                            .child(
+                                                div()
+                                                    .id("zalo-photo-up")
+                                                    .size(px(32.))
+                                                    .rounded(px(16.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .bg(hsla(0., 0., 0., 0.58))
+                                                    .border_1()
+                                                    .border_color(hsla(0., 0., 1., 0.1))
+                                                    .text_color(if has_prev {
+                                                        rgb(0xffffff)
+                                                    } else {
+                                                        rgb(0x6e_72_77)
+                                                    })
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .when(has_prev, |el| {
+                                                        el.cursor_pointer()
+                                                            .hover(|s| s.bg(hsla(0., 0., 0., 0.8)))
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.step(-1, cx);
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                    })
+                                                    .child(crate::fonts::icon_el(IC_UP, "⌃", 16.)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("zalo-photo-down")
+                                                    .size(px(32.))
+                                                    .rounded(px(16.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .bg(hsla(0., 0., 0., 0.58))
+                                                    .border_1()
+                                                    .border_color(hsla(0., 0., 1., 0.1))
+                                                    .text_color(if has_next {
+                                                        rgb(0xffffff)
+                                                    } else {
+                                                        rgb(0x6e_72_77)
+                                                    })
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .when(has_next, |el| {
+                                                        el.cursor_pointer()
+                                                            .hover(|s| s.bg(hsla(0., 0., 0., 0.8)))
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.step(1, cx);
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                    })
+                                                    .child(crate::fonts::icon_el(
+                                                        IC_DOWN, "⌄", 16.,
+                                                    )),
+                                            ),
                                     )
                                 })
+                                .when_some(
+                                    caption.filter(|_| !is_video && !show_blue_pill && !show_status_pill),
+                                    |el, text| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .bottom(px(10.))
+                                                .left(px(16.))
+                                                .right(px(56.))
+                                                .text_size(px(13.))
+                                                .text_color(hsla(0., 0., 1., 0.9))
+                                                .child(text),
+                                        )
+                                    },
+                                )
+                                // Floating Electron-style Zalo-Blue OCR callout / selection bar
+                                .when(show_blue_pill, |el| {
+                                    el.child(
+                                        div()
+                                            .id("photo-ocr-pill-wrap")
+                                            .absolute()
+                                            .left_0()
+                                            .right_0()
+                                            .bottom(px(12.))
+                                            .flex()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .id("photo-ocr-blue-pill")
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(10.))
+                                                    .px(px(14.))
+                                                    .py(px(8.))
+                                                    .rounded(px(8.))
+                                                    .bg(rgb(0x00_68_ff))
+                                                    .shadow_lg()
+                                                    .text_size(px(13.))
+                                                    .text_color(rgb(0xff_ff_ff))
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .when(selected_count > 0, |pill| {
+                                                        pill.child(
+                                                            div()
+                                                                .id("photo-ocr-copy-sel")
+                                                                .px(px(10.))
+                                                                .py(px(3.))
+                                                                .rounded(px(5.))
+                                                                .bg(hsla(0., 0., 1., 0.22))
+                                                                .hover(|s| {
+                                                                    s.bg(hsla(0., 0., 1., 0.34))
+                                                                })
+                                                                .cursor_pointer()
+                                                                .font_family(FAMILY_SEMIBOLD)
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.copy_ocr_selection(cx);
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child(if selected_count > 1 {
+                                                                    format!(
+                                                                        "Sao chép ({selected_count} dòng)"
+                                                                    )
+                                                                } else {
+                                                                    "Sao chép văn bản".to_owned()
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("photo-ocr-sel-all")
+                                                                .px(px(8.))
+                                                                .py(px(3.))
+                                                                .rounded(px(5.))
+                                                                .hover(|s| {
+                                                                    s.bg(hsla(0., 0., 1., 0.16))
+                                                                })
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.ocr_selected =
+                                                                            (0..this
+                                                                                .ocr_boxes
+                                                                                .len())
+                                                                                .collect();
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child("Chọn tất cả"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("photo-ocr-clear-sel")
+                                                                .size(px(22.))
+                                                                .rounded(px(11.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .hover(|s| {
+                                                                    s.bg(hsla(0., 0., 1., 0.18))
+                                                                })
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.ocr_selected.clear();
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child("✕"),
+                                                        )
+                                                    })
+                                                    .when(selected_count == 0, |pill| {
+                                                        pill.child(
+                                                            "Chọn và sao chép văn bản dễ dàng",
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("photo-ocr-copy-all")
+                                                                .px(px(8.))
+                                                                .py(px(2.))
+                                                                .rounded(px(4.))
+                                                                .bg(hsla(0., 0., 1., 0.18))
+                                                                .hover(|s| {
+                                                                    s.bg(hsla(0., 0., 1., 0.30))
+                                                                })
+                                                                .cursor_pointer()
+                                                                .text_size(px(12.))
+                                                                .font_family(FAMILY_SEMIBOLD)
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.copy_ocr_selection(cx);
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child("Chép hết"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("photo-ocr-dismiss-hint")
+                                                                .size(px(22.))
+                                                                .rounded(px(11.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .hover(|s| {
+                                                                    s.bg(hsla(0., 0., 1., 0.18))
+                                                                })
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.ocr_hint_dismissed =
+                                                                            true;
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child("✕"),
+                                                        )
+                                                    }),
+                                            ),
+                                    )
+                                })
+                                // Floating status/install/error pill (scanning, missing OCR runtime, error)
+                                .when(show_status_pill, |el| {
+                                    let status_text = if ocr_installing {
+                                        ocr_install_status.clone().unwrap_or_else(|| {
+                                            "Đang tải & cài đặt thư viện OCR...".to_owned()
+                                        })
+                                    } else if ocr_busy {
+                                        "Đang nhận diện văn bản trên ảnh…".to_owned()
+                                    } else if missing_ocr {
+                                        crate::viewer::ocr_missing_message()
+                                    } else {
+                                        ocr_err.clone().unwrap_or_default()
+                                    };
+                                    el.child(
+                                        div()
+                                            .id("photo-ocr-status-wrap")
+                                            .absolute()
+                                            .left_0()
+                                            .right_0()
+                                            .bottom(px(12.))
+                                            .flex()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(10.))
+                                                    .px(px(14.))
+                                                    .py(px(8.))
+                                                    .rounded(px(8.))
+                                                    .bg(rgb(0x23_25_28))
+                                                    .border_1()
+                                                    .border_color(hsla(0., 0., 1., 0.14))
+                                                    .shadow_lg()
+                                                    .text_size(px(12.5))
+                                                    .text_color(if ocr_err.is_some() {
+                                                        rgb(0xff_b4_b4)
+                                                    } else {
+                                                        rgb(0xff_ff_ff)
+                                                    })
+                                                    .on_mouse_down(
+                                                        gpui::MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .child(status_text)
+                                                    .when(missing_ocr && !ocr_installing, |bar| {
+                                                        bar.child(
+                                                            div()
+                                                                .id("photo-ocr-install")
+                                                                .px(px(10.))
+                                                                .py(px(4.))
+                                                                .rounded(px(5.))
+                                                                .bg(rgb(0x00_68_ff))
+                                                                .hover(|s| s.bg(rgb(0x00_5a_e0)))
+                                                                .cursor_pointer()
+                                                                .font_family(FAMILY_SEMIBOLD)
+                                                                .text_color(rgb(0xff_ff_ff))
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.start_ocr_install(cx);
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child("Tải & cài OCR (~18,6 MB)"),
+                                                        )
+                                                    })
+                                                    .when(!ocr_busy && !ocr_installing, |bar| {
+                                                        bar.child(
+                                                            div()
+                                                                .id("photo-ocr-err-close")
+                                                                .size(px(22.))
+                                                                .rounded(px(11.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .hover(|s| {
+                                                                    s.bg(hsla(0., 0., 1., 0.16))
+                                                                })
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener(
+                                                                    |this, _, _, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.ocr_result = None;
+                                                                        this.ocr_active = false;
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                                .child("✕"),
+                                                        )
+                                                    }),
+                                            ),
+                                    )
+                                })
+                                // Brief auto-dismissing toast at top-center of stage
                                 .when_some(note.clone(), |el, text| {
                                     el.child(
                                         div()
                                             .absolute()
-                                            .left(px(12.))
-                                            .right(px(12.))
-                                            .bottom(px(8.))
-                                            .px(px(10.))
-                                            .py(px(4.))
-                                            .rounded(px(4.))
-                                            .bg(hsla(0., 0., 0., 0.72))
-                                            .text_size(px(12.))
-                                            .text_color(rgb(0xffffff))
-                                            .child(text),
+                                            .left_0()
+                                            .right_0()
+                                            .top(px(14.))
+                                            .flex()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .px(px(14.))
+                                                    .py(px(6.))
+                                                    .rounded(px(16.))
+                                                    .bg(hsla(0., 0., 0., 0.78))
+                                                    .border_1()
+                                                    .border_color(hsla(0., 0., 1., 0.12))
+                                                    .shadow_md()
+                                                    .text_size(px(12.5))
+                                                    .text_color(rgb(0xffffff))
+                                                    .child(text),
+                                            ),
                                     )
                                 }),
                         )
-                        .child(
-                            div()
-                                .w(px(CHEVRON_W))
-                                .flex()
-                                .flex_none()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .gap(px(10.))
-                                .child(
-                                    div()
-                                        .id("zalo-photo-up")
-                                        .size(px(28.))
-                                        .rounded(px(14.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(hsla(0., 0., 0., 0.55))
-                                        .text_color(if has_prev {
-                                            rgb(0xffffff)
-                                        } else {
-                                            rgb(0x8a8e93)
-                                        })
-                                        .when(has_prev, |el| {
-                                            el.cursor_pointer().on_click(cx.listener(
-                                                |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.step(-1, cx);
-                                                    cx.notify();
-                                                },
-                                            ))
-                                        })
-                                        .child(crate::fonts::icon_el(IC_UP, "⌃", 16.)),
-                                )
-                                .child(
-                                    div()
-                                        .id("zalo-photo-down")
-                                        .size(px(28.))
-                                        .rounded(px(14.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .bg(hsla(0., 0., 0., 0.55))
-                                        .text_color(if has_next {
-                                            rgb(0xffffff)
-                                        } else {
-                                            rgb(0x8a8e93)
-                                        })
-                                        .when(has_next, |el| {
-                                            el.cursor_pointer().on_click(cx.listener(
-                                                |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.step(1, cx);
-                                                    cx.notify();
-                                                },
-                                            ))
-                                        })
-                                        .child(crate::fonts::icon_el(IC_DOWN, "⌄", 16.)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("zalo-photo-strip")
-                                .w(px(RAIL_W))
-                                .flex_none()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .bg(rgb(0x323436))
-                                .overflow_y_scroll()
-                                .track_scroll(&self.film_scroll)
-                                .children(rows),
-                        ),
-                )
-                .when(ocr_busy || ocr_installing || ocr_result.is_some(), |el| {
-                    let missing_ocr = matches!(
-                        &ocr_result,
-                        Some(Err(err)) if err == &crate::viewer::ocr_missing_message()
-                    );
-                    let copy_text = ocr_result.as_ref().and_then(|r| r.as_ref().ok()).cloned();
-                    let is_err = matches!(ocr_result, Some(Err(_)));
-                    let text = if ocr_installing {
-                        ocr_install_status
-                            .clone()
-                            .unwrap_or_else(|| "Đang tải & cài đặt thư viện OCR...".to_owned())
-                    } else if ocr_busy {
-                        "Đang quét chữ…".to_owned()
-                    } else {
-                        match &ocr_result {
-                            Some(Ok(t)) => t.clone(),
-                            Some(Err(t)) => t.clone(),
-                            None => String::new(),
-                        }
-                    };
-                    el.child(
-                        div()
-                            .id("photo-ocr-panel")
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .px(px(16.))
-                            .py(px(8.))
-                            .bg(rgb(0x232526))
-                            .border_t_1()
-                            .border_color(hsla(0., 0., 1., 0.12))
-                            .child(
+                        .when(rail_open, |el| {
+                            el.child(
                                 div()
+                                    .id("zalo-photo-strip")
+                                    .w(px(RAIL_W))
+                                    .flex_none()
+                                    .h_full()
                                     .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.))
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .font_family(FAMILY_SEMIBOLD)
-                                            .text_color(hsla(0., 0., 1., 0.8))
-                                            .child("Văn bản trong ảnh (OCR)"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .gap(px(8.))
-                                            .when(missing_ocr && !ocr_installing, |row| {
-                                                row.child(
-                                                    div()
-                                                        .id("photo-ocr-install")
-                                                        .px(px(10.))
-                                                        .py(px(3.))
-                                                        .rounded(px(4.))
-                                                        .bg(rgb(0x00_68_ff))
-                                                        .hover(|s| s.bg(rgb(0x00_5a_e0)))
-                                                        .cursor_pointer()
-                                                        .text_size(px(12.))
-                                                        .font_family(FAMILY_SEMIBOLD)
-                                                        .text_color(rgb(0xff_ff_ff))
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.start_ocr_install(cx);
-                                                            cx.notify();
-                                                        }))
-                                                        .child("Tải & cài OCR từ R2 (~18,6 MB)"),
-                                                )
-                                            })
-                                            .when_some(copy_text, |row, text| {
-                                                row.child(
-                                                    div()
-                                                        .id("photo-ocr-copy")
-                                                        .px(px(10.))
-                                                        .py(px(3.))
-                                                        .rounded(px(4.))
-                                                        .bg(hsla(0., 0., 1., 0.14))
-                                                        .hover(|s| s.bg(hsla(0., 0., 1., 0.24)))
-                                                        .cursor_pointer()
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(0xff_ff_ff))
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            cx.stop_propagation();
-                                                            crate::clip::copy_text(cx, text.clone());
-                                                            this.note = Some("Đã sao chép văn bản OCR".to_owned());
-                                                            cx.notify();
-                                                        }))
-                                                        .child("Chép chữ"),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .id("photo-ocr-hide")
-                                                    .px(px(8.))
-                                                    .py(px(3.))
-                                                    .rounded(px(4.))
-                                                    .bg(hsla(0., 0., 1., 0.1))
-                                                    .hover(|s| s.bg(hsla(0., 0., 1., 0.2)))
-                                                    .cursor_pointer()
-                                                    .text_size(px(12.))
-                                                    .text_color(hsla(0., 0., 1., 0.85))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.ocr_result = None;
-                                                        this.ocr_boxes.clear();
-                                                        cx.notify();
-                                                    }))
-                                                    .child("Ẩn"),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .id("photo-ocr-body")
-                                    .max_h(px(110.))
+                                    .flex_col()
+                                    .bg(rgb(RAIL_BG))
+                                    .border_l_1()
+                                    .border_color(hsla(0., 0., 1., 0.06))
                                     .overflow_y_scroll()
-                                    .text_size(px(13.))
-                                    .text_color(if is_err && !missing_ocr {
-                                        rgb(0xff_b4_b4)
-                                    } else {
-                                        rgb(0xff_ff_ff)
-                                    })
-                                    .child(text),
-                            ),
-                    )
-                })
+                                    .track_scroll(&self.film_scroll)
+                                    .children(rows),
+                            )
+                        }),
+                )
+                // 4. Electron-style 3-zone bottom bar
                 .child(
                     div()
                         .flex()
                         .flex_none()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.))
+                        .justify_between()
                         .h(px(FOOTER_H))
-                        .px(px(12.))
+                        .px(px(14.))
                         .bg(rgb(BAR_BG))
+                        .border_t_1()
+                        .border_color(hsla(0., 0., 1., 0.06))
                         .when(frame.bl, |el| el.rounded_bl(frame.radius))
                         .when(frame.br, |el| el.rounded_br(frame.radius))
+                        // Left: sender avatar + name + time
                         .child(
                             div()
-                                .size(px(36.))
-                                .flex_none()
-                                .rounded(px(18.))
-                                .bg(rgb(0x0068ff))
                                 .flex()
+                                .flex_row()
                                 .items_center()
-                                .justify_center()
-                                .text_color(rgb(0xffffff))
-                                .font_family(FAMILY_SEMIBOLD)
-                                .text_size(px(14.))
-                                .child(initial),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
+                                .gap(px(10.))
+                                .w(px(230.))
                                 .min_w(px(0.))
-                                .w(px(180.))
-                                .child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .font_family(FAMILY_SEMIBOLD)
+                                .child(match sender_avatar {
+                                    Some(av) => img(av)
+                                        .size(px(36.))
+                                        .flex_none()
+                                        .rounded(px(18.))
+                                        .object_fit(gpui::ObjectFit::Cover)
+                                        .into_any_element(),
+                                    None => div()
+                                        .size(px(36.))
+                                        .flex_none()
+                                        .rounded(px(18.))
+                                        .bg(rgb(0x0068ff))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
                                         .text_color(rgb(0xffffff))
-                                        .truncate()
-                                        .child(sender),
-                                )
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_size(px(14.))
+                                        .child(initial)
+                                        .into_any_element(),
+                                })
                                 .child(
                                     div()
-                                        .text_size(px(12.))
-                                        .text_color(hsla(0., 0., 1., 0.7))
-                                        .truncate()
-                                        .child(when),
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(0xffffff))
+                                                .truncate()
+                                                .child(sender),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.5))
+                                                .text_color(hsla(0., 0., 1., 0.65))
+                                                .truncate()
+                                                .child(when),
+                                        ),
                                 ),
                         )
-                        .child(div().flex_1())
-                        .child(icon_btn("zalo-photo-share", IC_SHARE, "Chia sẻ").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.share_current(cx);
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            icon_btn("zalo-photo-save", IC_DOWNLOAD, "Lưu về máy").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.save_current();
-                                    cx.notify();
-                                }),
-                            ),
-                        )
-                        .child(
-                            icon_btn("zalo-photo-rot-r", IC_ROTATE_L, "Xoay phải").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.rotate(1, cx);
-                                    cx.notify();
-                                }),
-                            ),
-                        )
-                        .child(icon_btn("zalo-photo-out", IC_ZOOM_OUT, "Thu nhỏ").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                let z = this.zoom;
-                                this.set_zoom(z / 1.25);
-                                cx.notify();
-                            }),
-                        ))
+                        // Center: Electron action groups `[Share Download] | [Rotate OCR] | [ZoomIn ZoomOut]`
                         .child(
                             div()
-                                .min_w(px(44.))
-                                .text_size(px(12.))
-                                .text_color(rgb(0xffffff))
-                                .child(format!("{percent:.0}%")),
-                        )
-                        .child(icon_btn("zalo-photo-in", IC_ZOOM_IN, "Phóng to").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                cx.stop_propagation();
-                                let z = this.zoom;
-                                this.set_zoom(z * 1.25);
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            icon_btn("zalo-photo-fit", IC_ZOOM_FIT, "Vừa khung").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.set_zoom(1.0);
-                                    cx.notify();
-                                }),
-                            ),
-                        )
-                        .child(
-                            icon_btn("zalo-photo-copy", IC_COPY, "Copy").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.copy_current(cx);
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                        .when(can_ocr, |el| {
-                            el.child(
-                                icon_btn(
-                                    "zalo-photo-ocr",
-                                    IC_OCR,
-                                    if ocr_busy {
-                                        "Đang quét…"
-                                    } else {
-                                        "Quét chữ"
-                                    },
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(
+                                    icon_btn("zalo-photo-share", IC_SHARE, "Chia sẻ", false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.share_current(cx);
+                                            cx.notify();
+                                        })),
                                 )
-                                .on_click(cx.listener(
-                                    |this, _, _, cx| {
+                                .child(
+                                    icon_btn("zalo-photo-save", IC_DOWNLOAD, "Lưu về máy", false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.save_current(cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(bar_divider())
+                                .child(
+                                    icon_btn("zalo-photo-rot-r", IC_ROTATE_L, "Xoay ảnh", false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.rotate(1, cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(can_ocr, |el| {
+                                    el.child(
+                                        icon_btn(
+                                            "zalo-photo-ocr",
+                                            IC_OCR,
+                                            if ocr_busy {
+                                                "Đang quét văn bản…"
+                                            } else if ocr_live {
+                                                "Tắt chọn văn bản trên ảnh"
+                                            } else {
+                                                "Chọn và sao chép văn bản (OCR)"
+                                            },
+                                            ocr_live || ocr_busy,
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.start_ocr(cx);
+                                            cx.notify();
+                                        })),
+                                    )
+                                })
+                                .child(bar_divider())
+                                .child(
+                                    icon_btn("zalo-photo-in", IC_ZOOM_IN, "Phóng to", false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let z = this.zoom;
+                                            this.set_zoom(z * 1.25);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    icon_btn("zalo-photo-out", IC_ZOOM_OUT, "Thu nhỏ", false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let z = this.zoom;
+                                            this.set_zoom(z / 1.25);
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(zoomed, |el| {
+                                    el.child(
+                                        div()
+                                            .id("zalo-photo-fit")
+                                            .ml(px(4.))
+                                            .px(px(8.))
+                                            .h(px(26.))
+                                            .rounded(px(5.))
+                                            .bg(hsla(0., 0., 1., 0.1))
+                                            .hover(|s| s.bg(hsla(0., 0., 1., 0.18)))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .text_color(rgb(0xffffff))
+                                            .tooltip(|_, cx| {
+                                                crate::widgets::tip("Khôi phục vừa khung", cx)
+                                            })
+                                            .on_mouse_down(
+                                                gpui::MouseButton::Left,
+                                                |_, _, cx| cx.stop_propagation(),
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_zoom(1.0);
+                                                cx.notify();
+                                            }))
+                                            .child(format!("{percent:.0}%")),
+                                    )
+                                }),
+                        )
+                        // Right: Copy image + Toggle filmstrip sidebar
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(4.))
+                                .w(px(230.))
+                                .child(
+                                    icon_btn("zalo-photo-copy", IC_COPY, "Sao chép ảnh", false)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.copy_current(cx);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    icon_btn(
+                                        "zalo-photo-toggle-rail",
+                                        crate::fonts::ic::HDR_RIGHT_BAR,
+                                        if rail_open {
+                                            "Ẩn danh sách ảnh"
+                                        } else {
+                                            "Hiện danh sách ảnh"
+                                        },
+                                        rail_open,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.start_ocr(cx);
+                                        this.rail_open = !this.rail_open;
                                         cx.notify();
-                                    },
-                                )),
-                            )
-                        }),
+                                    })),
+                                ),
+                        ),
                 ),
         )
     }
-}
-fn stage_size(window: &Window) -> (f32, f32) {
-    let vp = window.viewport_size();
-    (
-        (f32::from(vp.width) - RAIL_W - CHEVRON_W).max(200.0),
-        (f32::from(vp.height) - HEADER_H - FOOTER_H).max(80.0),
-    )
 }
 
 /// Filmstrip date: "Today", "Yesterday", or `dd/mm` in Vietnam time.
@@ -1554,26 +2142,6 @@ fn clamp_pan(pan_x: f32, pan_y: f32, dw: f32, dh: f32, stage_w: f32, stage_h: f3
     let max_x = ((dw - stage_w) * 0.5).max(0.0);
     let max_y = ((dh - stage_h) * 0.5).max(0.0);
     (pan_x.clamp(-max_x, max_x), pan_y.clamp(-max_y, max_y))
-}
-
-fn photo_caption_btn(
-    id: &'static str,
-    glyph: &'static str,
-    close: bool,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .w(px(46.))
-        .h(px(HEADER_H))
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(16.))
-        .text_color(rgb(0xffffff))
-        .cursor_pointer()
-        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .hover(move |style| style.bg(rgb(if close { 0xc31818 } else { 0x4a5054 })))
-        .child(glyph)
 }
 
 fn video_file(msg: &ChatMsg) -> Option<PathBuf> {

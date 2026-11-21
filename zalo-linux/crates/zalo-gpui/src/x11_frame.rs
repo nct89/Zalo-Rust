@@ -101,6 +101,70 @@ fn state() -> &'static Mutex<State> {
     })
 }
 
+/// Wait up to `timeout_ms` for all non-notice windows owned by this process
+/// to be unmapped/iconified by the X11 WM, then pause briefly for the compositor
+/// to repaint the desktop underneath before grabbing a screenshot without Zalo.
+pub fn wait_app_windows_hidden(timeout_ms: u64) {
+    if cfg!(test)
+        || std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("DISPLAY").is_none()
+    {
+        std::thread::sleep(Duration::from_millis(timeout_ms.min(250)));
+        return;
+    }
+    let Ok((conn, screen)) = x11rb::connect(None) else {
+        std::thread::sleep(Duration::from_millis(250));
+        return;
+    };
+    let Some(root) = conn.setup().roots.get(screen).map(|s| s.root) else {
+        return;
+    };
+    let intern = |name: &[u8]| -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+            .filter(|a| *a != 0)
+    };
+    let Some(wm_pid) = intern(b"_NET_WM_PID") else {
+        std::thread::sleep(Duration::from_millis(250));
+        return;
+    };
+    let wm_name = intern(b"_NET_WM_NAME").unwrap_or(0);
+    let utf8 = intern(b"UTF8_STRING").unwrap_or(0);
+    let pid = std::process::id();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        let mut any_visible = false;
+        for client in owned_clients(&conn, root, wm_pid, pid) {
+            let name = if wm_name != 0 && utf8 != 0 {
+                window_name(&conn, client, wm_name, utf8)
+            } else {
+                String::new()
+            };
+            if name.starts_with("Zalo Notice") {
+                continue;
+            }
+            if conn
+                .get_window_attributes(client)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .is_some_and(|a| a.map_state == MapState::VIEWABLE)
+            {
+                any_visible = true;
+                break;
+            }
+        }
+        if !any_visible || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Give xfwm4/compositor one short cycle to finish repainting the area behind Zalo.
+    std::thread::sleep(Duration::from_millis(120));
+}
+
 /// Reset the settle timer when a new window is about to open so `sync_window`
 /// never skips applying `_MOTIF_WM_HINTS` / `XShape` to reopened windows.
 pub fn reset_settle() {

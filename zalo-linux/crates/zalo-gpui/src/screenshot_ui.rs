@@ -18,7 +18,7 @@ use gpui::{
 };
 use x11rb::connection::Connection;
 use x11rb::protocol::randr::ConnectionExt as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, ImageFormat, MapState};
 use x11rb::rust_connection::RustConnection;
 
 use crate::fonts::FAMILY_SEMIBOLD;
@@ -48,6 +48,8 @@ pub(crate) struct CapturedMonitor {
     pub height: u32,
     /// Tightly packed BGRA `[B, G, R, 255]` (`width * height * 4` bytes).
     pub bgra: Vec<u8>,
+    /// Visible top-level windows in monitor-local pixels `(l, t, r, b)`, topmost first.
+    pub windows: Vec<(f32, f32, f32, f32)>,
 }
 
 /// Returns `true` when native X11 `GetImage` screenshot capture is available.
@@ -81,6 +83,7 @@ pub(crate) fn grab_active_monitor() -> Result<CapturedMonitor, String> {
         .map(|r| (r.root_x, r.root_y));
 
     let (mx, my, mw, mh) = pick_monitor_rect(&conn, root, sw, sh, pointer);
+    let windows = collect_visible_windows(&conn, root, mx, my, mw, mh);
 
     let reply = conn
         .get_image(ImageFormat::Z_PIXMAP, root, mx, my, mw, mh, !0)
@@ -117,7 +120,135 @@ pub(crate) fn grab_active_monitor() -> Result<CapturedMonitor, String> {
         width: u32::from(mw),
         height: u32::from(mh),
         bgra,
+        windows,
     })
+}
+
+/// Collect visible top-level window bounds in monitor-local coordinates (topmost first)
+/// so hovering a window in the screenshot overlay highlights it for 1-click capture.
+fn collect_visible_windows(
+    conn: &RustConnection,
+    root: u32,
+    mx: i16,
+    my: i16,
+    mw: u16,
+    mh: u16,
+) -> Vec<(f32, f32, f32, f32)> {
+    let intern = |name: &[u8]| -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+            .filter(|a| *a != 0)
+    };
+    let Some(stacking_atom) = intern(b"_NET_CLIENT_LIST_STACKING") else {
+        return Vec::new();
+    };
+    let wm_type_atom = intern(b"_NET_WM_WINDOW_TYPE").unwrap_or(0);
+    let type_desktop = intern(b"_NET_WM_WINDOW_TYPE_DESKTOP").unwrap_or(0);
+    let type_dock = intern(b"_NET_WM_WINDOW_TYPE_DOCK").unwrap_or(0);
+    let type_notif = intern(b"_NET_WM_WINDOW_TYPE_NOTIFICATION").unwrap_or(0);
+    let wm_state_atom = intern(b"_NET_WM_STATE").unwrap_or(0);
+    let state_hidden = intern(b"_NET_WM_STATE_HIDDEN").unwrap_or(0);
+    let frame_extents_atom = intern(b"_NET_FRAME_EXTENTS").unwrap_or(0);
+
+    let list: Vec<u32> = conn
+        .get_property(false, root, stacking_atom, AtomEnum::WINDOW, 0, 256)
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .and_then(|r| r.value32().map(|it| it.collect()))
+        .unwrap_or_default();
+
+    let mx_f = f32::from(mx);
+    let my_f = f32::from(my);
+    let mw_f = f32::from(mw);
+    let mh_f = f32::from(mh);
+    let mut out = Vec::new();
+
+    // `_NET_CLIENT_LIST_STACKING` is bottom-to-top; iterate in reverse so topmost wins.
+    for win in list.into_iter().rev() {
+        let Some(attrs) = conn
+            .get_window_attributes(win)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            continue;
+        };
+        if attrs.map_state != MapState::VIEWABLE {
+            continue;
+        }
+        if wm_state_atom != 0 && state_hidden != 0 {
+            let hidden = conn
+                .get_property(false, win, wm_state_atom, AtomEnum::ATOM, 0, 32)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .and_then(|r| r.value32().map(|mut it| it.any(|a| a == state_hidden)))
+                .unwrap_or(false);
+            if hidden {
+                continue;
+            }
+        }
+        if wm_type_atom != 0 {
+            let skip = conn
+                .get_property(false, win, wm_type_atom, AtomEnum::ATOM, 0, 16)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .and_then(|r| {
+                    r.value32().map(|mut it| {
+                        it.any(|a| {
+                            (type_desktop != 0 && a == type_desktop)
+                                || (type_dock != 0 && a == type_dock)
+                                || (type_notif != 0 && a == type_notif)
+                        })
+                    })
+                })
+                .unwrap_or(false);
+            if skip {
+                continue;
+            }
+        }
+        let Some(geo) = conn.get_geometry(win).ok().and_then(|c| c.reply().ok()) else {
+            continue;
+        };
+        let Some(tr) = conn
+            .translate_coordinates(win, root, 0, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            continue;
+        };
+        let (fl, fr, ft, fb) = if frame_extents_atom != 0 {
+            conn.get_property(false, win, frame_extents_atom, AtomEnum::CARDINAL, 0, 4)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .and_then(|r| r.value32().map(|it| it.collect::<Vec<_>>()))
+                .filter(|v| v.len() == 4)
+                .map(|v| (v[0] as f32, v[1] as f32, v[2] as f32, v[3] as f32))
+                .unwrap_or((0.0, 0.0, 0.0, 0.0))
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+        let l = (f32::from(tr.dst_x) - fl - mx_f).clamp(0.0, mw_f);
+        let t = (f32::from(tr.dst_y) - ft - my_f).clamp(0.0, mh_f);
+        let r = (f32::from(tr.dst_x) + f32::from(geo.width) + fr - mx_f).clamp(0.0, mw_f);
+        let b = (f32::from(tr.dst_y) + f32::from(geo.height) + fb - my_f).clamp(0.0, mh_f);
+        if r - l >= 48.0 && b - t >= 48.0 {
+            out.push((l, t, r, b));
+        }
+    }
+    out
+}
+
+fn window_at_point(
+    windows: &[(f32, f32, f32, f32)],
+    px_x: f32,
+    px_y: f32,
+) -> Option<(f32, f32, f32, f32)> {
+    windows
+        .iter()
+        .copied()
+        .find(|&(l, t, r, b)| px_x >= l && px_x <= r && px_y >= t && px_y <= b)
 }
 
 fn pick_monitor_rect(
@@ -231,6 +362,7 @@ pub(crate) fn open_screenshot_overlay(
     let callback = std::cell::RefCell::new(Some(Box::new(on_done)
         as Box<dyn FnOnce(ShotOutcome, &mut App)>));
 
+    crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Fullscreen(bounds)),
@@ -261,6 +393,7 @@ pub(crate) fn open_screenshot_overlay(
                     dragging: false,
                     start: None,
                     end: None,
+                    hover_win: None,
                     on_done: callback,
                 }
             });
@@ -280,6 +413,8 @@ struct ShotOverlayView {
     dragging: bool,
     start: Option<(f32, f32)>,
     end: Option<(f32, f32)>,
+    /// Auto-detected window under cursor (viewport coordinates `(l, t, r, b)`).
+    hover_win: Option<(f32, f32, f32, f32)>,
     on_done: std::cell::RefCell<Option<Box<dyn FnOnce(ShotOutcome, &mut App)>>>,
 }
 
@@ -376,6 +511,8 @@ impl Render for ShotOverlayView {
         let vp_w = f32::from(vp.width).max(1.0);
         let vp_h = f32::from(vp.height).max(1.0);
         let sel = self.selection_rect(vp_w, vp_h);
+        let active_rect = sel.or(self.hover_win);
+        let has_locked = sel.is_some();
         let scrim = hsla(0., 0., 0., 0.46);
 
         let mut root = div()
@@ -397,21 +534,76 @@ impl Render for ShotOverlayView {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.finish(ShotOutcome::Cancelled, window, cx);
+                    if this.start.is_some() || this.end.is_some() {
+                        this.dragging = false;
+                        this.start = None;
+                        this.end = None;
+                        cx.notify();
+                    } else {
+                        this.finish(ShotOutcome::Cancelled, window, cx);
+                    }
                 }),
             )
-            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
                 if this.dragging {
+                    if e.pressed_button != Some(MouseButton::Left) {
+                        this.dragging = false;
+                        cx.notify();
+                        return;
+                    }
                     this.end = Some((f32::from(e.position.x), f32::from(e.position.y)));
                     cx.notify();
+                    return;
+                }
+                let vp = window.viewport_size();
+                let vw = f32::from(vp.width).max(1.0);
+                let vh = f32::from(vp.height).max(1.0);
+                if this.selection_rect(vw, vh).is_none() {
+                    let sx = this.capture.width as f32 / vw;
+                    let sy = this.capture.height as f32 / vh;
+                    let next = window_at_point(
+                        &this.capture.windows,
+                        f32::from(e.position.x) * sx,
+                        f32::from(e.position.y) * sy,
+                    )
+                    .map(|(l, t, r, b)| (l / sx, t / sy, r / sx, b / sy));
+                    if this.hover_win != next {
+                        this.hover_win = next;
+                        cx.notify();
+                    }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                cx.listener(|this, e: &MouseUpEvent, window, cx| {
                     if this.dragging {
-                        this.end = Some((f32::from(e.position.x), f32::from(e.position.y)));
+                        let ex = f32::from(e.position.x);
+                        let ey = f32::from(e.position.y);
+                        let small_click = this
+                            .start
+                            .is_some_and(|(sx, sy)| (ex - sx).abs() < 6.0 && (ey - sy).abs() < 6.0);
                         this.dragging = false;
+                        if small_click {
+                            // Single click without dragging locks the detected window under cursor.
+                            let vp = window.viewport_size();
+                            let vw = f32::from(vp.width).max(1.0);
+                            let vh = f32::from(vp.height).max(1.0);
+                            let sx = this.capture.width as f32 / vw;
+                            let sy = this.capture.height as f32 / vh;
+                            if let Some((l, t, r, b)) = window_at_point(
+                                &this.capture.windows,
+                                ex * sx,
+                                ey * sy,
+                            ) {
+                                this.start = Some((l / sx, t / sy));
+                                this.end = Some((r / sx, b / sy));
+                            } else {
+                                this.start = None;
+                                this.end = None;
+                            }
+                        } else {
+                            this.end = Some((ex, ey));
+                        }
                         cx.notify();
                     }
                 }),
@@ -425,7 +617,7 @@ impl Render for ShotOverlayView {
                     .object_fit(gpui::ObjectFit::Fill),
             );
 
-        if let Some((l, t, r, b)) = sel {
+        if let Some((l, t, r, b)) = active_rect {
             let sw = r - l;
             let sh = b - t;
             let sx = self.capture.width as f32 / vp_w;
@@ -447,7 +639,7 @@ impl Render for ShotOverlayView {
             };
             let badge_y = if t >= 28.0 { t - 26.0 } else { t + 6.0 };
 
-            // 4 dim panels around the bright selected rectangle
+            // 4 dim panels around the bright selected/hovered rectangle
             root = root
                 .child(div().absolute().left_0().top_0().w_full().h(px(t)).bg(scrim))
                 .child(
@@ -477,7 +669,7 @@ impl Render for ShotOverlayView {
                         .h(px(sh))
                         .bg(scrim),
                 )
-                // Selection border
+                // Selection / hover border
                 .child(
                     div()
                         .absolute()
@@ -504,9 +696,7 @@ impl Render for ShotOverlayView {
                         .child(dim_label),
                 );
 
-            // Sibling fullscreen drag-start surface rendered BEFORE the toolbar
-            // so dragging anywhere starts a fresh selection, while toolbar buttons
-            // rendered after it with `.occlude()` handle clicks without interference.
+            // Fullscreen drag-start / double-click surface rendered BEFORE the toolbar
             root = root.child(
                 div()
                     .id("zalo-shot-canvas")
@@ -515,8 +705,14 @@ impl Render for ShotOverlayView {
                     .cursor(CursorStyle::Crosshair)
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                            let p = (f32::from(e.position.x), f32::from(e.position.y));
+                        cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                            let px_x = f32::from(e.position.x);
+                            let px_y = f32::from(e.position.y);
+                            if e.click_count >= 2 && has_locked && px_x >= l && px_x <= r && px_y >= t && px_y <= b {
+                                this.commit_send(window, cx);
+                                return;
+                            }
+                            let p = (px_x, px_y);
                             this.start = Some(p);
                             this.end = Some(p);
                             this.dragging = true;
@@ -525,7 +721,7 @@ impl Render for ShotOverlayView {
                     ),
             );
 
-            if !self.dragging {
+            if has_locked && !self.dragging {
                 root = root.child(
                     div()
                         .id("zalo-shot-toolbar")
@@ -667,7 +863,7 @@ impl Render for ShotOverlayView {
                                     div()
                                         .text_size(px(13.))
                                         .text_color(rgb(0xff_ff_ff))
-                                        .child("Kéo chuột để chọn vùng cần chụp • Enter chụp toàn màn hình • Esc để hủy"),
+                                        .child("Bấm chọn cửa sổ hoặc kéo chọn vùng • Enter chụp toàn màn hình • Esc hủy"),
                                 )
                                 .child(
                                     div()
@@ -726,5 +922,16 @@ mod tests {
         assert_eq!(decoded.dimensions(), (2, 2));
         let p = decoded.get_pixel(0, 0).0;
         assert_eq!(p, [240, 120, 10, 255]);
+    }
+
+    #[test]
+    fn window_at_point_returns_topmost_matching_window() {
+        let windows = vec![
+            (100.0, 100.0, 400.0, 300.0), // topmost
+            (0.0, 0.0, 1000.0, 700.0),    // underneath
+        ];
+        assert_eq!(window_at_point(&windows, 200.0, 200.0), Some(windows[0]));
+        assert_eq!(window_at_point(&windows, 50.0, 50.0), Some(windows[1]));
+        assert_eq!(window_at_point(&windows, 1200.0, 200.0), None);
     }
 }

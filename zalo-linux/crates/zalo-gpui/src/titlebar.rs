@@ -41,6 +41,23 @@ pub(crate) fn installer_titlebar(corners: CsdCorners, title: String) -> impl gpu
     )
 }
 
+/// Separate `Zalo Photo` window caption bar matching Electron's popup chrome:
+/// Zalo icon + `Zalo Photo` title on the left, native min/max/close controls on the right.
+pub(crate) fn photo_titlebar(corners: CsdCorners, window: &Window) -> impl gpui::IntoElement {
+    caption_bar(
+        corners,
+        true,
+        window.is_maximized(),
+        None,
+        None,
+        true,
+        true,
+        "Zalo Photo".to_owned(),
+        zalo_title_icon(),
+        false,
+    )
+}
+
 /// Gray Linux caption bar. Login window: min + close only.
 /// `leading` is the hamburger on the left of the drag region.
 #[allow(dead_code)]

@@ -755,8 +755,106 @@ fn box_of(line: &zocr::Line, width: f32, height: f32) -> OcrBox {
     }
 }
 
-/// Highlight layer drawn on top of the scanned photo.
-pub(crate) fn ocr_marks(boxes: &[OcrBox], dw: f32, dh: f32) -> gpui::AnyElement {
+/// Screen-pixel `(left, top, width, height)` of an OCR box within a `dw × dh` photo.
+#[must_use]
+pub(crate) fn ocr_box_rect(mark: &OcrBox, dw: f32, dh: f32) -> (f32, f32, f32, f32) {
+    let pad_x = 2.0;
+    let pad_y = 1.5;
+    let left = (mark.x * dw - pad_x).clamp(0.0, dw.max(0.0));
+    let top = (mark.y * dh - pad_y).clamp(0.0, dh.max(0.0));
+    let w = (mark.w * dw + pad_x * 2.0).max(10.0).min((dw - left).max(0.0));
+    let h = (mark.h * dh + pad_y * 2.0).max(12.0).min((dh - top).max(0.0));
+    (left, top, w, h)
+}
+
+/// Index of the OCR box containing image-local point `(lx, ly)`.
+#[must_use]
+pub(crate) fn ocr_box_at(boxes: &[OcrBox], lx: f32, ly: f32, dw: f32, dh: f32) -> Option<usize> {
+    // Prefer the smallest enclosing box if two boxes overlap slightly.
+    boxes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, mark)| {
+            let (left, top, w, h) = ocr_box_rect(mark, dw, dh);
+            if lx >= left && lx <= left + w && ly >= top && ly <= top + h {
+                Some((i, w * h))
+            } else {
+                None
+            }
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// All OCR box indices intersecting the drag rectangle `(x0, y0) -> (x1, y1)`.
+#[must_use]
+pub(crate) fn ocr_boxes_in_rect(
+    boxes: &[OcrBox],
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    dw: f32,
+    dh: f32,
+) -> std::collections::BTreeSet<usize> {
+    let min_x = x0.min(x1);
+    let max_x = x0.max(x1);
+    let min_y = y0.min(y1);
+    let max_y = y0.max(y1);
+    let mut out = std::collections::BTreeSet::new();
+    for (i, mark) in boxes.iter().enumerate() {
+        let (left, top, w, h) = ocr_box_rect(mark, dw, dh);
+        let overlaps = left <= max_x && left + w >= min_x && top <= max_y && top + h >= min_y;
+        if overlaps {
+            out.insert(i);
+        }
+    }
+    out
+}
+
+/// Join selected OCR boxes in reading order, falling back to all boxes when `selected` is empty.
+#[must_use]
+pub(crate) fn ocr_selected_text(
+    boxes: &[OcrBox],
+    selected: &std::collections::BTreeSet<usize>,
+) -> String {
+    if selected.is_empty() {
+        boxes
+            .iter()
+            .map(|b| b.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        selected
+            .iter()
+            .filter_map(|&i| boxes.get(i))
+            .map(|b| b.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Electron-style Live-Text highlight layer drawn directly over the photo.
+/// Lets the original photo pixels show through cleanly — unselected boxes use a
+/// subtle translucent veil and selected boxes highlight in Zalo Blue (`#0068ff`).
+pub(crate) fn ocr_marks(
+    boxes: &[OcrBox],
+    selected: &std::collections::BTreeSet<usize>,
+    drag_rect: Option<(f32, f32, f32, f32)>,
+    dw: f32,
+    dh: f32,
+) -> gpui::AnyElement {
+    let marquee = drag_rect.and_then(|(x0, y0, x1, y1)| {
+        let min_x = x0.min(x1).clamp(0.0, dw);
+        let max_x = x0.max(x1).clamp(0.0, dw);
+        let min_y = y0.min(y1).clamp(0.0, dh);
+        let max_y = y0.max(y1).clamp(0.0, dh);
+        let w = max_x - min_x;
+        let h = max_y - min_y;
+        (w > 3.0 || h > 3.0).then_some((min_x, min_y, w.max(2.0), h.max(2.0)))
+    });
     div()
         .id("ocr-marks")
         .absolute()
@@ -764,23 +862,47 @@ pub(crate) fn ocr_marks(boxes: &[OcrBox], dw: f32, dh: f32) -> gpui::AnyElement 
         .left_0()
         .w(px(dw))
         .h(px(dh))
+        .cursor(CursorStyle::IBeam)
         .children(boxes.iter().enumerate().map(|(i, mark)| {
+            let (left, top, w, h) = ocr_box_rect(mark, dw, dh);
+            let is_sel = selected.contains(&i);
             div()
                 .id(("ocr-box", i as u64))
                 .absolute()
-                .left(px(mark.x * dw))
-                .top(px(mark.y * dh))
-                .w(px((mark.w * dw).max(8.0)))
-                .h(px((mark.h * dh).max(12.0)))
-                .bg(hsla(210., 0.85, 0.42, 0.28))
-                .border_1()
-                .border_color(rgb(0x4d_a3_ff))
-                .px(px(2.))
-                .text_size(px((mark.h * dh).clamp(9.0, 14.0)))
-                .text_color(rgb(0xff_ff_ff))
-                .overflow_hidden()
-                .child(mark.text.clone())
+                .left(px(left))
+                .top(px(top))
+                .w(px(w))
+                .h(px(h))
+                .rounded(px(3.))
+                .cursor(CursorStyle::IBeam)
+                .when(is_sel, |el| {
+                    el.bg(gpui::rgba(0x00_68_ff_76))
+                        .border_1()
+                        .border_color(gpui::rgba(0x4d_a3_ff_cc))
+                })
+                .when(!is_sel, |el| {
+                    el.bg(hsla(0., 0., 1., 0.13))
+                        .hover(|st| {
+                            st.bg(hsla(0., 0., 1., 0.24))
+                                .border_1()
+                                .border_color(hsla(0., 0., 1., 0.36))
+                        })
+                })
         }))
+        .when_some(marquee, |el, (x, y, w, h)| {
+            el.child(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .h(px(h))
+                    .rounded(px(2.))
+                    .bg(gpui::rgba(0x00_68_ff_2e))
+                    .border_1()
+                    .border_color(gpui::rgba(0x4d_a3_ff_cc)),
+            )
+        })
         .into_any_element()
 }
 
@@ -940,5 +1062,46 @@ mod tests {
         assert!(ocr_missing_message().contains("OCR"));
         let err = recognize_viewer_bytes(b"not-an-image", 1).unwrap_err();
         assert!(err.contains("giải mã"));
+    }
+
+    #[test]
+    fn ocr_live_text_hit_test_marquee_and_copy_join() {
+        let boxes = vec![
+            OcrBox {
+                text: "Shopee Dũng Mobile".into(),
+                x: 0.1,
+                y: 0.1,
+                w: 0.5,
+                h: 0.1,
+            },
+            OcrBox {
+                text: "Lịch làm việc".into(),
+                x: 0.1,
+                y: 0.3,
+                w: 0.4,
+                h: 0.1,
+            },
+            OcrBox {
+                text: "My Documents".into(),
+                x: 0.1,
+                y: 0.6,
+                w: 0.4,
+                h: 0.1,
+            },
+        ];
+        // Hit inside box 0 on a 400x200 displayed photo.
+        assert_eq!(ocr_box_at(&boxes, 100.0, 30.0, 400.0, 200.0), Some(0));
+        assert_eq!(ocr_box_at(&boxes, 350.0, 180.0, 400.0, 200.0), None);
+        // Drag marquee across boxes 0 and 1 selects both, skipping box 2.
+        let sel = ocr_boxes_in_rect(&boxes, 50.0, 25.0, 180.0, 75.0, 400.0, 200.0);
+        assert_eq!(sel.into_iter().collect::<Vec<_>>(), vec![0, 1]);
+        // Selected text joins only chosen lines; empty selection falls back to all lines.
+        let only_first: std::collections::BTreeSet<usize> = [0].into_iter().collect();
+        assert_eq!(ocr_selected_text(&boxes, &only_first), "Shopee Dũng Mobile");
+        let empty = std::collections::BTreeSet::new();
+        assert_eq!(
+            ocr_selected_text(&boxes, &empty),
+            "Shopee Dũng Mobile\nLịch làm việc\nMy Documents"
+        );
     }
 }

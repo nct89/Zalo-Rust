@@ -2860,11 +2860,25 @@ impl ShellView {
             items.push(msg.clone());
         }
         let id = msg.id;
+        let mut sender_avatars = std::collections::HashMap::new();
+        for item in &items {
+            let av = if item.from_me {
+                self.avatar_of(crate::profiles::ME)
+            } else if !item.sender_uid.is_empty() {
+                self.avatar_of(&item.sender_uid)
+            } else {
+                None
+            };
+            if let Some(img) = av {
+                sender_avatars.insert(item.id, img);
+            }
+        }
         let opened = crate::photo_window::open(
             cx,
             name,
             items,
             id,
+            sender_avatars,
             self.download_dir(),
             self.session_dir.clone(),
             start_ocr,
@@ -4170,21 +4184,29 @@ impl ShellView {
         self.sticker_open = false;
         self.rail_popup = None;
         self.menu = None;
+        self.note = None;
         if self.capture_busy {
             return;
         }
         self.capture_busy = true;
-        if hide_window {
-            if let Some(wh) = window {
-                let _ = wh.update(cx, |_, w, _| w.minimize_window());
-            }
-        }
-        self.set_note("Chọn vùng cần chụp… (Esc để hủy)");
         cx.notify();
         cx.spawn(async move |this, cx| {
-            // Let minimize animation (or context-menu close repaint) settle before grabbing.
-            let wait_ms = if hide_window { 380 } else { 80 };
-            gpui::Timer::after(std::time::Duration::from_millis(wait_ms)).await;
+            // Let the dropdown menu / toast repaint away first.
+            gpui::Timer::after(std::time::Duration::from_millis(60)).await;
+            if hide_window {
+                // Must run outside `&mut ShellView` borrow; otherwise `wh.update`
+                // fails re-entrantly and silently skips minimizing the Zalo window.
+                if let Some(wh) = window {
+                    let _ = cx.update(|cx| {
+                        let _ = wh.update(cx, |_, w, _| w.minimize_window());
+                    });
+                }
+                cx.background_executor()
+                    .spawn(async move { crate::x11_frame::wait_app_windows_hidden(500) })
+                    .await;
+            } else {
+                gpui::Timer::after(std::time::Duration::from_millis(40)).await;
+            }
 
             if crate::screenshot_ui::native_x11_available() {
                 let grabbed = cx
