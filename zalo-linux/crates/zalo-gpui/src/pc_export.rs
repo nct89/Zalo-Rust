@@ -705,8 +705,8 @@ impl ShellView {
     }
 
     fn reveal_dir(&mut self, dir: &Path) {
-        match std::process::Command::new("xdg-open").arg(dir).spawn() {
-            Ok(_) => {}
+        match crate::os_util::open_external(dir) {
+            Ok(()) => {}
             Err(err) => self.set_note(err.to_string()),
         }
     }

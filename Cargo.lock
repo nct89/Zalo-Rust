@@ -8844,6 +8844,7 @@ name = "zalo-gpui"
 version = "0.2.2"
 dependencies = [
  "base64 0.22.1",
+ "embed-resource",
  "futures",
  "gpui",
  "hex",
@@ -8863,45 +8864,29 @@ dependencies = [
  "symphonia",
  "tokio",
  "unicode-segmentation",
+ "windows 0.61.3",
  "x11rb",
  "zalo-backup",
  "zalo-client",
  "zalo-core",
  "zalo-design",
- "zalo-multi",
  "zalo-protocol",
  "zalo-shell",
  "zalo-shell-mac",
+ "zalo-shell-win",
  "zalo-storage",
  "zalo-sync",
  "zcall-audio",
  "zcall-audio-mac",
+ "zcall-audio-win",
  "zcall-core",
  "zcall-engine",
  "zcall-engine-mac",
+ "zcall-engine-win",
  "zimage",
  "zjxl",
  "zocr",
  "zstd",
-]
-
-[[package]]
-name = "zalo-multi"
-version = "0.2.2"
-dependencies = [
- "aes-gcm",
- "base64 0.22.1",
- "hex",
- "rand 0.8.8",
- "reqwest",
- "ring",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "zalo-shell",
- "zalo-shell-mac",
 ]
 
 [[package]]
@@ -8938,6 +8923,17 @@ dependencies = [
  "image",
  "objc",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "zalo-shell-win"
+version = "0.2.2"
+dependencies = [
+ "image",
+ "thiserror 1.0.69",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -9105,7 +9101,13 @@ name = "zcall-audio-mac"
 version = "0.2.2"
 dependencies = [
  "cpal",
- "zcall-core",
+]
+
+[[package]]
+name = "zcall-audio-win"
+version = "0.2.2"
+dependencies = [
+ "cpal",
 ]
 
 [[package]]
@@ -9139,6 +9141,15 @@ version = "0.2.2"
 dependencies = [
  "serde_json",
  "zcall-audio-mac",
+ "zcall-core",
+]
+
+[[package]]
+name = "zcall-engine-win"
+version = "0.2.2"
+dependencies = [
+ "serde_json",
+ "zcall-audio-win",
  "zcall-core",
 ]
 

@@ -1422,9 +1422,7 @@ impl ShellView {
                     .text_color(rgb(blue))
                     .cursor_pointer()
                     .on_click(cx.listener(|_, _: &ClickEvent, _, _| {
-                        let _ = std::process::Command::new("xdg-open")
-                            .arg(GROUP_INVITE_HELP)
-                            .spawn();
+                        let _ = crate::os_util::open_external(GROUP_INVITE_HELP);
                     }))
                     .child(crate::color::str_vi(
                         "STR_GROUP_INVITATION_LEARN_MORE",

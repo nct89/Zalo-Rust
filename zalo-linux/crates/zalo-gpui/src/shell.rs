@@ -3738,8 +3738,8 @@ impl ShellView {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or(path);
-        match std::process::Command::new("xdg-open").arg(&dir).spawn() {
-            Ok(_) => self.set_note(
+        match crate::os_util::open_external(&dir) {
+            Ok(()) => self.set_note(
                 crate::color::str_vi("STR_VIEW_IN_FOLDER", "Hiển thị trong thư mục").to_owned(),
             ),
             Err(err) => self.set_note(err.to_string()),

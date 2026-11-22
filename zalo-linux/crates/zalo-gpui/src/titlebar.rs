@@ -426,6 +426,7 @@ fn caption_bar(
         .child(
             div()
                 .id("titleBar-drag")
+                .window_control_area(gpui::WindowControlArea::Drag)
                 .flex_1()
                 .h_full()
                 .flex()
@@ -477,9 +478,11 @@ fn render_button_group(
         CaptionStyle::MacTrafficLight => 8.,
         CaptionStyle::KdeBreeze => 4.,
         CaptionStyle::LinuxRound => 6.,
+        CaptionStyle::Windows => 0.,
     };
     let pad_x = match style {
         CaptionStyle::MacTrafficLight => 10.,
+        CaptionStyle::Windows => 0.,
         _ => 8.,
     };
     div()
@@ -487,6 +490,7 @@ fn render_button_group(
         .flex()
         .flex_row()
         .items_center()
+        .when(style == CaptionStyle::Windows, |el| el.h_full())
         .gap(px(gap))
         .px(px(pad_x))
         .children(
@@ -551,12 +555,39 @@ fn render_distro_caption_btn(
     }
 
     let is_close = button == WindowButton::Close;
+
+    if style == CaptionStyle::Windows {
+        let hover_bg = if is_close {
+            rgb(0xc4_2b_1c)
+        } else if dark {
+            rgb(0x3a_3e_46)
+        } else {
+            rgb(0xd4_d8_df)
+        };
+        let hover_fg = if is_close { 0xff_ff_ff } else { ink };
+        return div()
+            .id(id)
+            .w(px(46.))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_size(px(14.))
+            .text_color(rgb(ink))
+            .hover(move |s| s.bg(hover_bg).text_color(rgb(hover_fg)))
+            .tooltip(move |_, cx| crate::widgets::tip(tip_text, cx))
+            .on_click(move |_, window, cx| trigger(window, cx))
+            .child(icon_kind.fallback_glyph())
+            .into_any_element();
+    }
+
     let btn_size = match style {
         CaptionStyle::KdeBreeze => 24.,
         _ => 26.,
     };
     let rest_bg = match style {
-        CaptionStyle::KdeBreeze => hsla(0., 0., 0., 0.0),
+        CaptionStyle::KdeBreeze | CaptionStyle::Windows => hsla(0., 0., 0., 0.0),
         CaptionStyle::LinuxRound | CaptionStyle::MacTrafficLight => {
             if dark {
                 hsla(0., 0., 1., 0.08)

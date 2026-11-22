@@ -25,8 +25,29 @@ pub fn capture_region() -> Result<Option<PathBuf>, String> {
     {
         return capture_region_macos();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        return capture_region_windows();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     capture_region_linux()
+}
+
+#[cfg(target_os = "windows")]
+fn capture_region_windows() -> Result<Option<PathBuf>, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out = std::env::temp_dir().join(format!("zalo-gpui-shot-{nanos}.png"));
+    match zalo_shell::capture_interactive() {
+        Ok(bytes) if !bytes.is_empty() => {
+            std::fs::write(&out, &bytes).map_err(|e| e.to_string())?;
+            Ok(Some(out))
+        }
+        Ok(_) => Ok(None),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -50,7 +71,7 @@ fn capture_region_macos() -> Result<Option<PathBuf>, String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn capture_region_linux() -> Result<Option<PathBuf>, String> {
     use std::process::Command;
     let nanos = SystemTime::now()

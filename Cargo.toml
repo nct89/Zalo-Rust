@@ -3,9 +3,10 @@
 # - `core/*` holds OS-independent pure-Rust crates shared across Linux, Windows, and macOS.
 # - `zalo-linux/crates/*` holds the GPUI client plus Linux desktop, audio, and call integration.
 # - `zalo-macos/crates/*` holds the macOS menu bar, CoreAudio, and call bridge selected by `zalo-gpui`.
+# - `zalo-windows/crates/*` holds the Windows tray/COM shell, WASAPI, and call bridge selected by `zalo-gpui`.
 [workspace]
 resolver = "2"
-members = ["core/*", "zalo-linux/crates/*", "zalo-macos/crates/*"]
+members = ["core/*", "zalo-linux/crates/*", "zalo-macos/crates/*", "zalo-windows/crates/*"]
 default-members = ["zalo-linux/crates/zalo-gpui"]
 
 [workspace.dependencies]

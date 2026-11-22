@@ -1,9 +1,7 @@
-//! GPUI links `-lxcb` / `-lxkbcommon`. Fedora runtime packages ship
-//! `libxcb.so.1` without the unversioned `libxcb.so` symlink (that lives in
-//! `-devel`). Without sudo we alias the runtime SONAMEs for the linker.
+//! Build metadata stamping (`ZALO_APP_VERSION`, `ZALO_APP_TAG`, `ZALO_GIT_SHA`),
+//! Linux SONAME linker aliases (`libxcb.so` / `libxkbcommon.so`), and Windows
+//! `.ico` / version resource embedding.
 
-use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -44,6 +42,23 @@ fn main() {
         .unwrap_or_default();
     println!("cargo:rustc-env=ZALO_GIT_SHA={git_sha}");
 
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    #[cfg(unix)]
+    if target_os == "linux" {
+        linux_soname_aliases();
+    }
+
+    #[cfg(target_os = "windows")]
+    if target_os == "windows" {
+        windows_embed_icon();
+    }
+}
+
+#[cfg(unix)]
+fn linux_soname_aliases() {
+    use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let dir = out.join("sys-so");
     std::fs::create_dir_all(&dir).expect("sys-so dir");
@@ -59,24 +74,36 @@ fn main() {
         }
     }
     println!("cargo:rustc-link-search=native={}", dir.display());
+
+    fn find_soname(soname: &str) -> Option<PathBuf> {
+        const LIB_DIRS: &[&str] = &[
+            "/usr/lib64",
+            "/usr/lib",
+            "/lib64",
+            "/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+            "/lib/aarch64-linux-gnu",
+        ];
+        for dir in LIB_DIRS {
+            let path = Path::new(dir).join(soname);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
 }
 
-fn find_soname(soname: &str) -> Option<PathBuf> {
-    const LIB_DIRS: &[&str] = &[
-        "/usr/lib64",
-        "/usr/lib",
-        "/lib64",
-        "/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/lib/aarch64-linux-gnu",
-    ];
-    for dir in LIB_DIRS {
-        let path = Path::new(dir).join(soname);
-        if path.exists() {
-            return Some(path);
-        }
+#[cfg(target_os = "windows")]
+fn windows_embed_icon() {
+    use std::path::Path;
+    let rc = Path::new("../../../zalo-windows/packaging/zalo.rc");
+    let ico = Path::new("../../../zalo-windows/packaging/zalo.ico");
+    println!("cargo:rerun-if-changed={}", rc.display());
+    println!("cargo:rerun-if-changed={}", ico.display());
+    if rc.is_file() && ico.is_file() {
+        let _ = embed_resource::compile(rc, embed_resource::NONE);
     }
-    None
 }

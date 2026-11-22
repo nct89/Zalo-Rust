@@ -202,6 +202,11 @@ fn local_tz_offset_secs() -> i64 {
                 return tm.tm_gmtoff as i64;
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            return crate::os_util::local_tz_offset_secs_windows();
+        }
+        #[cfg(not(target_os = "windows"))]
         0
     })
 }

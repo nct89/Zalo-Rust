@@ -120,3 +120,30 @@ jobs:
 
       - name: Check the GPUI client for macOS
         run: cargo check -p zalo-gpui --features tray-xembed
+
+  windows-gui:
+    name: Windows (GPUI) check
+    runs-on: windows-latest
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install NASM (for OpenH264)
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test Windows shell, WASAPI, and call engine crates
+        run: cargo test -p zalo-shell-win -p zcall-audio-win -p zcall-engine-win -p zcall-core -- --test-threads=1
+
+      - name: Check the GPUI client for Windows
+        run: cargo check -p zalo-gpui --features tray-xembed

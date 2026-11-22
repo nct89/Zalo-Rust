@@ -2387,9 +2387,7 @@ impl ShellView {
                                             .cursor_pointer()
                                             .text_size(px(13.))
                                             .on_click(cx.listener(move |_, _, _, _| {
-                                                let _ = std::process::Command::new("xdg-open")
-                                                    .arg(&open_dir)
-                                                    .spawn();
+                                                let _ = crate::os_util::open_external(&open_dir);
                                             }))
                                             .child("Mở thư mục giải mã"),
                                     )

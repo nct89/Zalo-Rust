@@ -16,9 +16,13 @@ use gpui::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Render, RenderImage,
     StatefulInteractiveElement, Styled, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use x11rb::connection::Connection;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use x11rb::protocol::randr::ConnectionExt as _;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, ImageFormat, MapState};
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use x11rb::rust_connection::RustConnection;
 
 use crate::fonts::FAMILY_SEMIBOLD;
@@ -52,10 +56,29 @@ pub(crate) struct CapturedMonitor {
     pub windows: Vec<(f32, f32, f32, f32)>,
 }
 
-/// Returns `true` when native X11 `GetImage` screenshot capture is available.
+/// Returns `true` when the built-in native screenshot overlay is available
+/// (X11 `GetImage` on Linux, Win32 GDI `BitBlt` on Windows).
 #[must_use]
 pub(crate) fn native_x11_available() -> bool {
-    std::env::var_os("DISPLAY").is_some() && RustConnection::connect(None).is_ok()
+    #[cfg(target_os = "windows")]
+    {
+        true
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("DISPLAY").is_some() && RustConnection::connect(None).is_ok()
+    }
+}
+
+/// Captures the active physical monitor (containing the pointer, or primary)
+/// at full 1:1 native resolution.
+///
+/// # Errors
+///
+/// Returns an error if capture fails.
+#[cfg(target_os = "windows")]
+pub(crate) fn grab_active_monitor() -> Result<CapturedMonitor, String> {
+    crate::windows_shot::grab_active_monitor()
 }
 
 /// Captures the active physical monitor (containing the pointer, or primary)
@@ -64,6 +87,7 @@ pub(crate) fn native_x11_available() -> bool {
 /// # Errors
 ///
 /// Returns an error if X11 cannot be contacted or `GetImage` fails.
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn grab_active_monitor() -> Result<CapturedMonitor, String> {
     let (conn, screen_num) =
         RustConnection::connect(None).map_err(|e| format!("Không kết nối được X11: {e}"))?;
@@ -126,6 +150,7 @@ pub(crate) fn grab_active_monitor() -> Result<CapturedMonitor, String> {
 
 /// Collect visible top-level window bounds in monitor-local coordinates (topmost first)
 /// so hovering a window in the screenshot overlay highlights it for 1-click capture.
+#[cfg(not(target_os = "windows"))]
 fn collect_visible_windows(
     conn: &RustConnection,
     root: u32,
@@ -251,6 +276,7 @@ fn window_at_point(
         .find(|&(l, t, r, b)| px_x >= l && px_x <= r && px_y >= t && px_y <= b)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn pick_monitor_rect(
     conn: &RustConnection,
     root: u32,

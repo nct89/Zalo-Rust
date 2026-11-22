@@ -94,19 +94,31 @@ impl CsdCorners {
     /// composited desktops, and switch cleanly to crisp square corners (keeping
     /// resize pads) on non-composited X11 (e.g. `xfwm4 --compositor=off`).
     pub fn from_window(window: &Window) -> Self {
-        let tiling = match window.window_decorations() {
-            Decorations::Client { tiling } => tiling,
-            Decorations::Server => Tiling::default(),
-        };
-        let mut corners = Self::from_tiling(tiling, window.is_maximized(), window.is_fullscreen());
-        if !crate::x11_frame::is_composited() {
-            corners.tl = false;
-            corners.tr = false;
-            corners.bl = false;
-            corners.br = false;
-            corners.radius = px(0.);
+        // On Windows, DWM renders native drop shadows, Win11 rounded corners,
+        // and non-client edge resize zones; adding an 8px transparent CSD pad
+        // would leave an empty border inside the native HWND frame.
+        #[cfg(target_os = "windows")]
+        {
+            let _ = window;
+            return Self::none();
         }
-        corners
+        #[cfg(not(target_os = "windows"))]
+        {
+            let tiling = match window.window_decorations() {
+                Decorations::Client { tiling } => tiling,
+                Decorations::Server => Tiling::default(),
+            };
+            let mut corners =
+                Self::from_tiling(tiling, window.is_maximized(), window.is_fullscreen());
+            if !crate::x11_frame::is_composited() {
+                corners.tl = false;
+                corners.tr = false;
+                corners.bl = false;
+                corners.br = false;
+                corners.radius = px(0.);
+            }
+            corners
+        }
     }
 
     /// Any edge currently padded.
@@ -389,10 +401,17 @@ fn resize_edge(pos: Point<Pixels>, shadow: Pixels, size: Size<Pixels>) -> Option
     })
 }
 
-/// Outer window size = CSS content + CSD shadow on every edge.
+/// Outer window size = CSS content + CSD shadow on every edge (zero pad on Windows DWM).
 pub fn outer_size(width: f32, height: f32) -> Size<Pixels> {
-    let pad = zalo_design::WINDOW_SHADOW * 2.0;
-    size(px(width + pad), px(height + pad))
+    #[cfg(target_os = "windows")]
+    {
+        size(px(width), px(height))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let pad = zalo_design::WINDOW_SHADOW * 2.0;
+        size(px(width + pad), px(height + pad))
+    }
 }
 
 /// Convert a window-space click into chrome-local pixels (skip CSD inset).

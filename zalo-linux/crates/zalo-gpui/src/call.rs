@@ -366,7 +366,7 @@ fn pulse_source_name(pref: &str) -> String {
 /// Writes the Pulse/PipeWire source level. No-op in tests. Does not mark ClipGuard manual;
 /// a live call goes through [`send_mic_volume`] so the guard stops stepping.
 pub(crate) fn spawn_pulse_volume(source_pref: &str, percent: u8) {
-    if cfg!(test) || cfg!(target_os = "macos") {
+    if cfg!(test) || cfg!(target_os = "macos") || cfg!(target_os = "windows") {
         return;
     }
     let source = pulse_source_name(source_pref);
@@ -493,11 +493,11 @@ pub(crate) fn pulse_devices(kind: &str) -> Vec<(String, String)> {
     if cfg!(test) {
         return Vec::new();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         return zcall_audio::list_endpoints(kind);
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
     let class = if kind == "sinks" {
         "Audio/Sink"
@@ -512,7 +512,7 @@ pub(crate) fn pulse_devices(kind: &str) -> Vec<(String, String)> {
 }
 
 /// Nodes from `pw-dump`. `None` when the tool is missing or the dump is not JSON.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 fn pipewire_devices(class: &str) -> Option<Vec<(String, String)>> {
     let out = Command::new("pw-dump")
         .stderr(Stdio::null())
@@ -547,7 +547,7 @@ fn pipewire_devices(class: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// `(name, description)` from `pactl -f json list`, when PipeWire's dump is unavailable.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
 fn pactl_devices(kind: &str) -> Vec<(String, String)> {
     let Ok(out) = Command::new("pactl")
         .args(["-f", "json", "list", kind])

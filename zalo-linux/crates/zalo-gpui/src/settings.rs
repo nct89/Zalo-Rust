@@ -1819,9 +1819,7 @@ impl ShellView {
             }
             SAction::OpenMedia => {
                 if let Some(dir) = crate::media::media_root() {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(dir.join("photos"))
-                        .spawn();
+                    let _ = crate::os_util::open_external(dir.join("photos"));
                 }
             }
             SAction::MoveData => match zalo_shell::pick_folder("Chọn vị trí lưu trữ dữ liệu Zalo")
@@ -2912,30 +2910,37 @@ pub(crate) fn fmt_size(bytes: u64) -> String {
     }
 }
 
-/// `df` for the folder (or its nearest existing parent): mount point,
+/// Disk usage for the folder (or its nearest existing parent): mount/drive,
 /// size, used, available bytes.
 fn disk_info(path: &std::path::Path) -> Option<(String, u64, u64, u64)> {
-    let mut probe = path.to_path_buf();
-    while !probe.exists() {
-        probe = probe.parent()?.to_path_buf();
+    #[cfg(target_os = "windows")]
+    {
+        return crate::os_util::disk_info_windows(path);
     }
-    let out = std::process::Command::new("df")
-        .args(["-B1", "--output=target,size,used,avail"])
-        .arg(&probe)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1)?;
-    let f: Vec<&str> = line.split_whitespace().collect();
-    if f.len() < 4 {
-        return None;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut probe = path.to_path_buf();
+        while !probe.exists() {
+            probe = probe.parent()?.to_path_buf();
+        }
+        let out = std::process::Command::new("df")
+            .args(["-B1", "--output=target,size,used,avail"])
+            .arg(&probe)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let line = text.lines().nth(1)?;
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 4 {
+            return None;
+        }
+        Some((
+            f[0].to_owned(),
+            f[1].parse().ok()?,
+            f[2].parse().ok()?,
+            f[3].parse().ok()?,
+        ))
     }
-    Some((
-        f[0].to_owned(),
-        f[1].parse().ok()?,
-        f[2].parse().ok()?,
-        f[3].parse().ok()?,
-    ))
 }
 
 /// Move `photos/` and `thumbs/` from `from` to `to` (rename, or copy + delete

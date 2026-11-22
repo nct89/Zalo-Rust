@@ -33,6 +33,8 @@ pub enum CaptionStyle {
     KdeBreeze,
     /// macOS-style traffic light dots (for WhiteSur / McMojave / macOS themes).
     MacTrafficLight,
+    /// Windows 10/11 rectangular right-aligned caption controls (shared with `zalo-shell-win`).
+    Windows,
 }
 
 /// Resolved window-control layout and icon theme for the host distro.

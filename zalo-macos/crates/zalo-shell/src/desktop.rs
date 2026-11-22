@@ -134,6 +134,8 @@ pub enum CaptionStyle {
     KdeBreeze,
     /// Red / yellow / green dots.
     MacTrafficLight,
+    /// Windows 10/11 rectangular right-aligned caption controls (shared with `zalo-shell-win`).
+    Windows,
 }
 
 /// Resolved caption layout.

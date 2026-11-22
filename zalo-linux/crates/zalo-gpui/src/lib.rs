@@ -16,22 +16,31 @@ mod backup_worker;
 mod board;
 mod bridge;
 mod call;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod call_camera;
 #[cfg(target_os = "macos")]
 #[path = "platform/macos_camera.rs"]
 mod call_camera;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[path = "platform/windows_camera.rs"]
+mod call_camera;
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod call_screen;
 #[cfg(target_os = "macos")]
 #[path = "platform/macos_screen.rs"]
 mod call_screen;
+#[cfg(target_os = "windows")]
+#[path = "platform/windows_screen.rs"]
+mod call_screen;
 mod call_video;
 mod chat;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod clip;
 #[cfg(target_os = "macos")]
 #[path = "platform/macos_clip.rs"]
+mod clip;
+#[cfg(target_os = "windows")]
+#[path = "platform/windows_clip.rs"]
 mod clip;
 mod color;
 mod contacts;
@@ -53,6 +62,15 @@ mod login_flow;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[path = "platform/macos_media.rs"]
 mod macos_media;
+#[cfg(any(test, target_os = "windows"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[path = "platform/windows_media.rs"]
+mod windows_media;
+#[cfg(target_os = "windows")]
+#[path = "platform/windows_shot.rs"]
+mod windows_shot;
+#[path = "platform/os_util.rs"]
+mod os_util;
 mod media;
 mod media_store;
 mod noise_id;
@@ -89,10 +107,13 @@ mod voice;
 mod widgets;
 mod window_frame;
 mod ws_rpc;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod x11_frame;
 #[cfg(target_os = "macos")]
 #[path = "platform/macos_frame.rs"]
+mod x11_frame;
+#[cfg(target_os = "windows")]
+#[path = "platform/windows_frame.rs"]
 mod x11_frame;
 
 pub use call::restore_saved_mic_volume;
@@ -407,11 +428,11 @@ fn saved_shell_bounds(_cx: &App) -> (gpui::Size<gpui::Pixels>, bool) {
 /// desktop, so we center inside `_NET_WORKAREA` (with `primary_display` as
 /// fallback).
 pub(crate) fn bounds_in_work_area(size: gpui::Size<gpui::Pixels>, cx: &App) -> Bounds<gpui::Pixels> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         Bounds::centered(None, size, cx)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let fallback = cx
             .primary_display()
