@@ -215,6 +215,20 @@ def build_agy_prompt(
     pr_num = pr["number"]
     pr_title = pr["title"]
     if phase == "implement":
+        extra_feedback = ""
+        if signals["coderabbit_comments"] or signals["failed_checks"]:
+            feedback_json = json.dumps(
+                {
+                    "failed_checks": signals["failed_checks"],
+                    "coderabbit_comments": signals["coderabbit_comments"],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            extra_feedback = (
+                "\n- Đồng thời xử lý toàn bộ nhận xét review hiện có từ CodeRabbit và lỗi CI bên dưới:\n"
+                f"```json\n{feedback_json}\n```\n"
+            )
         return (
             f"Bạn đang xử lý tự động Pull Request #{pr_num} ({pr_title}) của repo Zalo-Rust.\n"
             f"- Đọc kỹ báo cáo phân tích upstream tại `{report_rel}` (và thư mục unpacked đi kèm nếu có qua --add-dir).\n"
@@ -222,6 +236,7 @@ def build_agy_prompt(
             "để tương thích bản Zalo Desktop mới (giữ nguyên `#![forbid(unsafe_code)]` ở `core/`, dùng 100% `token_rgb` cho UI, giữ biên dịch chéo Linux/macOS/Windows).\n"
             "- Không đưa `zalo-multi` hay ghi âm cuộc gọi vào `Zalo-Rust`.\n"
             "- Cập nhật `README.md` nếu có thay đổi tính năng/cấu hình.\n"
+            f"{extra_feedback}"
             "- Chạy `cargo test --workspace -- --test-threads=1` và đảm bảo pass 100% trước khi kết thúc.\n"
             "- KHÔNG tự chạy `git push`; chỉ sửa mã nguồn sạch sẽ trong thư mục hiện tại."
         )

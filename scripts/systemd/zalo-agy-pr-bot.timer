@@ -1,10 +1,10 @@
 [Unit]
-Description=Run Zalo-Rust Antigravity CLI PR Worker every 10 minutes
+Description=Run Zalo-Rust Antigravity CLI PR Worker every 3 minutes
 
 [Timer]
-OnBootSec=3min
-OnUnitActiveSec=10min
-RandomizedDelaySec=60s
+OnBootSec=2min
+OnUnitActiveSec=3min
+RandomizedDelaySec=15s
 Persistent=true
 
 [Install]
