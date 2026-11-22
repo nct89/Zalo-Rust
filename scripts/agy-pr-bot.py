@@ -19,6 +19,7 @@ with label `upstream-sync` or `agy-auto`:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pathlib
@@ -272,8 +273,21 @@ def run_agy_on_worktree(
     return proc.returncode == 0, output[-4000:]
 
 
+def git_remote_args(repo_slug: str, token: str) -> tuple[list[str], str]:
+    """Build non-interactive HTTPS auth flags so git fetch/push works under systemd without SSH agent."""
+    if token:
+        basic = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        return (
+            ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic}"],
+            f"https://github.com/{repo_slug}.git",
+        )
+    return ([], "origin")
+
+
 def verify_and_push_worktree(
     worktree: pathlib.Path,
+    repo_slug: str,
+    token: str,
     branch: str,
     commit_msg: str,
     dry_run: bool,
@@ -301,7 +315,8 @@ def verify_and_push_worktree(
 
     subprocess.run(["git", "add", "-A"], cwd=worktree, check=True)
     subprocess.run(["git", "commit", "-m", commit_msg], cwd=worktree, check=True)
-    subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], cwd=worktree, check=True)
+    extra, remote = git_remote_args(repo_slug, token)
+    subprocess.run(["git", *extra, "push", remote, f"HEAD:{branch}"], cwd=worktree, check=True)
     return True, "pushed"
 
 
@@ -378,12 +393,13 @@ def process_pr(
         run_agy_on_worktree(agy_bin, repo, prompt, None, dry_run=True)
         return
 
-    subprocess.run(["git", "fetch", "origin", branch], cwd=repo, check=True)
+    extra, remote = git_remote_args(gh.repo_slug, gh.token)
+    subprocess.run(["git", *extra, "fetch", remote, branch], cwd=repo, check=True)
     wt_dir = pathlib.Path(tempfile.mkdtemp(prefix=f"zalo-rust-pr-{pr_num}-"))
     unpacked_dir: pathlib.Path | None = None
     try:
         subprocess.run(
-            ["git", "worktree", "add", "--detach", str(wt_dir), f"origin/{branch}"],
+            ["git", "worktree", "add", "--detach", str(wt_dir), "FETCH_HEAD"],
             cwd=repo,
             check=True,
         )
@@ -420,7 +436,9 @@ def process_pr(
             if phase == "implement"
             else f"fix(review): address CodeRabbit & CI feedback on PR #{pr_num} via agy"
         )
-        pushed_ok, push_note = verify_and_push_worktree(wt_dir, branch, msg, dry_run=False)
+        pushed_ok, push_note = verify_and_push_worktree(
+            wt_dir, gh.repo_slug, gh.token, branch, msg, dry_run=False
+        )
         pr_state["rounds"] += 1
         pr_state["last_processed_sha"] = head_sha
         if phase == "implement":
