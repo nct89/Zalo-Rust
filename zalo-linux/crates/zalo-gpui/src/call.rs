@@ -127,6 +127,8 @@ struct Shared {
     speaker_volume_req: Option<u8>,
     /// One-shot request from "Test speaker/headphones" to play a chime on the selected sink.
     test_speaker_req: bool,
+    /// Pending `(aec, noise_suppression)` update for the worker (`bridge.set_audio_processing`).
+    audio_dsp_req: Option<(bool, bool)>,
     /// Latest live microphone level from `AudioBridge` (0 loudest .. 127 silence).
     live_mic_level: u8,
 }
@@ -261,6 +263,10 @@ struct AudioChoice {
     camera: String,
     /// Saved `"micVolume"`, 0..=100. Unset is 100 (0 dB, full scale).
     mic_volume: u8,
+    /// Saved `"callAec"` (WebRTC AEC3, default `true`).
+    call_aec: bool,
+    /// Saved `"callNoiseSuppression"` (RNNoise AI denoiser, default `true`).
+    call_ns: bool,
     /// Custom incoming ringtone (`linuxRingtone`). Empty uses Zalo's file.
     ringtone: String,
     /// Custom outgoing ringback (`linuxRingback`). Empty uses Zalo's file.
@@ -278,6 +284,8 @@ impl Default for AudioChoice {
             speaker: String::new(),
             camera: String::new(),
             mic_volume: 100,
+            call_aec: true,
+            call_ns: true,
             ringtone: String::new(),
             ringback: String::new(),
             dir: None,
@@ -295,6 +303,8 @@ impl AudioChoice {
             speaker: saved_device(prefs, &["speakerDevice", "speakerSink"], &speakers),
             camera: prefs.str("cameraDevice", ""),
             mic_volume: mic_percent_from_json(prefs.json("micVolume").as_ref()),
+            call_aec: prefs.bool("callAec", true),
+            call_ns: prefs.bool("callNoiseSuppression", true),
             ringtone: prefs.str("linuxRingtone", ""),
             ringback: prefs.str("linuxRingback", ""),
             mics,
@@ -356,7 +366,7 @@ fn pulse_source_name(pref: &str) -> String {
 /// Writes the Pulse/PipeWire source level. No-op in tests. Does not mark ClipGuard manual;
 /// a live call goes through [`send_mic_volume`] so the guard stops stepping.
 pub(crate) fn spawn_pulse_volume(source_pref: &str, percent: u8) {
-    if cfg!(test) {
+    if cfg!(test) || cfg!(target_os = "macos") {
         return;
     }
     let source = pulse_source_name(source_pref);
@@ -483,6 +493,12 @@ pub(crate) fn pulse_devices(kind: &str) -> Vec<(String, String)> {
     if cfg!(test) {
         return Vec::new();
     }
+    #[cfg(target_os = "macos")]
+    {
+        return zcall_audio::list_endpoints(kind);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
     let class = if kind == "sinks" {
         "Audio/Sink"
     } else {
@@ -492,9 +508,11 @@ pub(crate) fn pulse_devices(kind: &str) -> Vec<(String, String)> {
         return list;
     }
     pactl_devices(kind)
+    }
 }
 
 /// Nodes from `pw-dump`. `None` when the tool is missing or the dump is not JSON.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn pipewire_devices(class: &str) -> Option<Vec<(String, String)>> {
     let out = Command::new("pw-dump")
         .stderr(Stdio::null())
@@ -529,6 +547,7 @@ fn pipewire_devices(class: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// `(name, description)` from `pactl -f json list`, when PipeWire's dump is unavailable.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn pactl_devices(kind: &str) -> Vec<(String, String)> {
     let Ok(out) = Command::new("pactl")
         .args(["-f", "json", "list", kind])
@@ -793,6 +812,7 @@ impl ShellView {
             camera_on: job.video,
             group: job.group,
             speaker_volume: 100,
+            audio_dsp_req: Some((audio.call_aec, audio.call_ns)),
             live_mic_level: 127,
             ..Shared::default()
         }));
@@ -1721,6 +1741,32 @@ impl CallView {
         if let Ok(mut s) = self.shared.lock() {
             s.test_speaker_req = true;
         }
+        cx.notify();
+    }
+
+    fn toggle_audio_dsp(&mut self, toggle_aec: bool, cx: &mut Context<Self>) {
+        if toggle_aec {
+            self.audio.call_aec = !self.audio.call_aec;
+        } else {
+            self.audio.call_ns = !self.audio.call_ns;
+        }
+        let (aec, ns) = (self.audio.call_aec, self.audio.call_ns);
+        if let Some(dir) = self.audio.dir.clone() {
+            let mut prefs = crate::prefs::Prefs::load(Some(dir));
+            prefs.set("callAec", Value::Bool(aec));
+            prefs.set("callNoiseSuppression", Value::Bool(ns));
+        }
+        if let Ok(mut s) = self.shared.lock() {
+            s.audio_dsp_req = Some((aec, ns));
+        }
+        let notice = if toggle_aec {
+            if aec { "Đã bật khử vọng âm (AEC)" } else { "Đã tắt khử vọng âm (AEC)" }
+        } else if ns {
+            "Đã bật lọc tiếng ồn AI (RNNoise)"
+        } else {
+            "Đã tắt lọc tiếng ồn AI"
+        };
+        self.say(notice);
         cx.notify();
     }
 
@@ -3246,7 +3292,7 @@ impl CallView {
         }
 
         let mut cam_opts = Vec::new();
-        if self.video {
+        if self.video || self.camera_on {
             cam_opts.push(drop_option(
                 "ds-cam-default".into(),
                 String::new(),
@@ -3326,6 +3372,43 @@ impl CallView {
                     .into_any_element(),
             );
         }
+
+        let aec_on = self.audio.call_aec;
+        let ns_on = self.audio.call_ns;
+        let dsp_row = |eid: &'static str, label: &'static str, on: bool, toggle_aec: bool| {
+            div()
+                .id(eid)
+                .w_full()
+                .py(px(4.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_audio_dsp(toggle_aec, cx);
+                }))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(0x08_1c_36))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .w(px(34.))
+                        .h(px(18.))
+                        .p(px(2.))
+                        .rounded(px(9.))
+                        .bg(if on { rgb(0x00_68_ff) } else { rgb(0xc8_cf_d8) })
+                        .flex()
+                        .items_center()
+                        .when(on, |el| el.justify_end())
+                        .child(div().size(px(14.)).rounded(px(7.)).bg(rgb(0xff_ff_ff))),
+                )
+        };
 
         let mic_open = self.ds_dropdown == Some("mic");
         let spk_open = self.ds_dropdown == Some("speaker");
@@ -3523,6 +3606,9 @@ impl CallView {
                                     .justify_between()
                                     .children(dots),
                             )
+                            // Live DSP toggles: AEC3 + RNNoise AI noise suppression
+                            .child(dsp_row("zcall-ds-aec", "Khử vọng âm (AEC)", aec_on, true))
+                            .child(dsp_row("zcall-ds-ns", "Lọc tiếng ồn nền (AI)", ns_on, false))
                             // Divider
                             .child(div().my(px(4.)).h(px(1.)).bg(rgb(0xeb_ee_f2)))
                             // --- Section 2: Loa/tai nghe ---
@@ -4477,6 +4563,9 @@ fn worker(
 
     let mut bridge = AudioBridge::new();
     bridge.prepare_os_volume(mic_volume);
+    if let Some((aec, ns)) = shared.lock().ok().and_then(|mut s| s.audio_dsp_req.take()) {
+        bridge.set_audio_processing(aec, ns);
+    }
     eprintln!("zalo-gpui call: mic volume {mic_volume}%");
     set(shared, |s| s.mic_volume = Some(mic_volume));
     if job.group {
@@ -4738,9 +4827,9 @@ fn worker(
                         "camera" => {
                             camera = resolve_camera_selection(&id);
                             cam.failed = false;
-                            cam.wanted = job.video;
+                            let keep_on = cam.wanted;
                             cam.cap.take();
-                            set(shared, |s| s.camera_on = job.video);
+                            set(shared, |s| s.camera_on = keep_on);
                             Ok(())
                         }
                         _ => Ok(()),
@@ -4768,10 +4857,10 @@ fn worker(
             }
             engine.on_zalo_frame(&frame);
         }
-        // Handle local UI-only audio controls (speaker volume, test chime)
+        // Handle local UI-only audio controls (speaker volume, test chime, AEC/NS)
         // and publish live mic VU level for "Device Status".
         {
-            let (spk_vol_req, test_spk) = shared
+            let (spk_vol_req, test_spk, dsp_req) = shared
                 .lock()
                 .ok()
                 .map(|mut s| {
@@ -4779,14 +4868,18 @@ fn worker(
                     (
                         s.speaker_volume_req.take(),
                         std::mem::take(&mut s.test_speaker_req),
+                        s.audio_dsp_req.take(),
                     )
                 })
-                .unwrap_or((None, false));
+                .unwrap_or((None, false, None));
             if let Some(pct) = spk_vol_req {
                 bridge.set_speaker_volume(pct);
             }
             if test_spk {
                 bridge.play_test_tone();
+            }
+            if let Some((aec, ns)) = dsp_req {
+                bridge.set_audio_processing(aec, ns);
             }
         }
         engine.tick();
@@ -5830,6 +5923,8 @@ pub(crate) fn stock_sound_path(file: &str) -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             dirs.push(parent.join("zcall-sound"));
+            #[cfg(target_os = "macos")]
+            dirs.push(parent.join("../Resources/zalo-rust/zcall-sound"));
         }
     }
     dirs.push(std::path::PathBuf::from("/usr/share/zalo-rust/zcall-sound"));

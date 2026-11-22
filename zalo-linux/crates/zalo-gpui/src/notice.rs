@@ -9,7 +9,9 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::ConnectionExt;
 
 use gpui::{
@@ -164,6 +166,12 @@ pub fn work_area(scale: f32, fallback: (f32, f32, f32, f32)) -> (f32, f32, f32, 
 }
 
 fn net_work_area() -> Option<(i32, i32, i32, i32)> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
     if cfg!(test) || std::env::var_os("DISPLAY").is_none() {
         return None;
     }
@@ -190,6 +198,7 @@ fn net_work_area() -> Option<(i32, i32, i32, i32)> {
         values[2] as i32,
         values[3] as i32,
     ))
+    }
 }
 
 fn area_for(cx: &App, scale: f32) -> (f32, f32, f32, f32) {

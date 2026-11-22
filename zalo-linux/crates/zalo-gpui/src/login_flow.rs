@@ -65,6 +65,11 @@ fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
         .config_dir()
         .to_path_buf();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Wait for any in-flight server `/api/v2/login/logOut` on this device IMEI
+    // before requesting a new QR ticket so the old session is cleanly closed
+    // and cannot race with or invalidate the new QR session.
+    send(LoginEvent::Status("Đang kết nối máy chủ Zalo…".into()));
+    let _ = crate::bridge::wait_pending_logout();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -73,12 +78,17 @@ fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
         // Reuses device.json so the IMEI stays stable across logins.
         let device = Device::load_or_create(&dir).map_err(|e| e.to_string())?;
         let api = ZaloApi::new(device).map_err(|e| e.to_string())?;
-        send(LoginEvent::Status("Đang kết nối máy chủ Zalo…".into()));
         api.get_server_info()
             .await
             .map_err(|e| format!("getServerInfo: {e}"))?;
         send(LoginEvent::Status("Đang lấy mã QR…".into()));
         let mut ticket = api.request_qr().await.map_err(|e| format!("reqqr: {e}"))?;
+        eprintln!(
+            "zalo-gpui login: reqqr ok (timeout={}s, url_len={}, has_b64={})",
+            ticket.timeout_seconds,
+            ticket.qr_url.len(),
+            ticket.base64_qr.is_some()
+        );
         send(LoginEvent::Qr(QrPrompt {
             url: ticket.qr_url.clone(),
             base64_png: ticket.base64_qr.clone(),
@@ -95,6 +105,7 @@ fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
                         .or_else(|| v.pointer("/data/displayName"))
                         .and_then(|x| x.as_str())
                         .map(str::to_owned);
+                    eprintln!("zalo-gpui login: qr scanned");
                     send(LoginEvent::Scanned(name));
                     break;
                 }
@@ -196,11 +207,16 @@ fn run(send: &dyn Fn(LoginEvent)) -> Result<bool, String> {
         if switched_account {
             crate::data::migrate_legacy_store(&dir, &dest, &user_id);
         }
+        crate::background::stop();
+        crate::sync_worker::reset_sync_identity_key();
         crate::bridge::clear_login_cache();
         session.save(&dest).map_err(|e| e.to_string())?;
+        if dest != dir {
+            crate::data::wipe_session_file(&dir);
+        }
         crate::data::write_current_user(&dir, &user_id);
         crate::data::write_last_account_uid(&dest, &user_id);
-        // App prefs stay on the machine dir. The shell reads them from there.
+        // App prefs stay on the machine dir. Account-scoped prefs live under `dest`.
         Ok(true)
     })
 }

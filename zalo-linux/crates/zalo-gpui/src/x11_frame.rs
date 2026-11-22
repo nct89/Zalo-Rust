@@ -31,6 +31,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::protocol::randr;
 use x11rb::protocol::shape::{self, SK, SO};
 use x11rb::protocol::xproto::{
     AtomEnum, ClientMessageEvent, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, EventMask,
@@ -175,9 +176,234 @@ pub fn reset_settle() {
     }
 }
 
+/// Windows already centered once after map so dragging them later is never undone.
+fn centered_windows() -> &'static Mutex<HashSet<u32>> {
+    static CENTERED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    CENTERED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn centered_origin(area: (i32, i32, i32, i32), width: u16, height: u16) -> (i32, i32) {
+    let (ax, ay, aw, ah) = area;
+    let x = ax + ((aw - i32::from(width)) / 2).max(0);
+    let y = ay + ((ah - i32::from(height)) / 2).max(0);
+    (x, y)
+}
+
+fn intersect_rect(
+    a: (i32, i32, i32, i32),
+    b: (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    let x0 = a.0.max(b.0);
+    let y0 = a.1.max(b.1);
+    let x1 = (a.0 + a.2).min(b.0 + b.2);
+    let y1 = (a.1 + a.3).min(b.1 + b.3);
+    if x1 > x0 && y1 > y0 {
+        Some((x0, y0, x1 - x0, y1 - y0))
+    } else {
+        None
+    }
+}
+
+/// Target monitor work area in X11 device pixels: prefers the XRandR monitor
+/// under the pointer (intersected with `_NET_WORKAREA` so panels are respected),
+/// then the primary monitor, then `_NET_WORKAREA`, then the full root screen.
+fn active_monitor_work_area(
+    conn: &impl Connection,
+    root: u32,
+    screen: usize,
+) -> (i32, i32, i32, i32) {
+    let workarea = conn
+        .intern_atom(false, b"_NET_WORKAREA")
+        .ok()
+        .and_then(|c| c.reply().ok())
+        .map(|r| r.atom)
+        .filter(|&a| a != 0)
+        .and_then(|atom| prop32(conn, root, atom))
+        .filter(|v| v.len() >= 4 && v[2] > 0 && v[3] > 0)
+        .map(|v| (v[0] as i32, v[1] as i32, v[2] as i32, v[3] as i32));
+
+    if let Some(monitors) = randr::get_monitors(conn, root, true)
+        .ok()
+        .and_then(|c| c.reply().ok())
+    {
+        if !monitors.monitors.is_empty() {
+            let ptr = conn
+                .query_pointer(root)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| (i32::from(r.root_x), i32::from(r.root_y)));
+            let chosen = ptr
+                .and_then(|(px, py)| {
+                    monitors.monitors.iter().find(|m| {
+                        let mx = i32::from(m.x);
+                        let my = i32::from(m.y);
+                        let mw = i32::from(m.width);
+                        let mh = i32::from(m.height);
+                        px >= mx && px < mx + mw && py >= my && py < my + mh
+                    })
+                })
+                .or_else(|| monitors.monitors.iter().find(|m| m.primary))
+                .or_else(|| monitors.monitors.first());
+            if let Some(m) = chosen {
+                let mon = (
+                    i32::from(m.x),
+                    i32::from(m.y),
+                    i32::from(m.width),
+                    i32::from(m.height),
+                );
+                if mon.2 > 0 && mon.3 > 0 {
+                    if let Some(wa) = workarea {
+                        if let Some(clipped) = intersect_rect(mon, wa) {
+                            return clipped;
+                        }
+                    }
+                    return mon;
+                }
+            }
+        }
+    }
+    if let Some(wa) = workarea {
+        return wa;
+    }
+    conn.setup()
+        .roots
+        .get(screen)
+        .map(|s| (0, 0, i32::from(s.width_in_pixels), i32::from(s.height_in_pixels)))
+        .unwrap_or((0, 0, 1920, 1080))
+}
+
+fn window_is_maximized_or_fullscreen(conn: &impl Connection, window: u32) -> bool {
+    let atom = |name: &[u8]| -> Option<u32> {
+        conn.intern_atom(false, name)
+            .ok()?
+            .reply()
+            .ok()
+            .map(|r| r.atom)
+            .filter(|&a| a != 0)
+    };
+    let Some(wm_state) = atom(b"_NET_WM_STATE") else {
+        return false;
+    };
+    let Some(states) = prop32(conn, window, wm_state) else {
+        return false;
+    };
+    let fs = atom(b"_NET_WM_STATE_FULLSCREEN");
+    let max_v = atom(b"_NET_WM_STATE_MAXIMIZED_VERT");
+    let max_h = atom(b"_NET_WM_STATE_MAXIMIZED_HORZ");
+    fs.is_some_and(|a| states.contains(&a))
+        || (max_v.is_some_and(|a| states.contains(&a))
+            && max_h.is_some_and(|a| states.contains(&a)))
+}
+
+/// Center a newly created regular window on the active monitor once.
+///
+/// GPUI 0.2.2 writes `WM_NORMAL_HINTS` with only `min_size` (no `USPosition`),
+/// so X11 WMs like `xfwm4` ignore `CreateWindow(x, y)` and fall back to
+/// smart-placement (often landing in the bottom-left corner). Stamping
+/// `USPosition` before map and sending `_NET_MOVERESIZE_WINDOW` right after
+/// map lands both the main Zalo window and Zalo Photo dead-center without
+/// interfering with user drags afterwards.
+fn center_window_once(
+    conn: &impl Connection,
+    root: u32,
+    screen: usize,
+    window: u32,
+    mapped: bool,
+) -> bool {
+    if mapped
+        && centered_windows()
+            .lock()
+            .ok()
+            .is_some_and(|set| set.contains(&window))
+    {
+        return false;
+    }
+    if window_is_maximized_or_fullscreen(conn, window) {
+        if mapped {
+            if let Ok(mut set) = centered_windows().lock() {
+                set.insert(window);
+            }
+        }
+        return false;
+    }
+    let Some(geo) = conn.get_geometry(window).ok().and_then(|c| c.reply().ok()) else {
+        return false;
+    };
+    if geo.width == 0 || geo.height == 0 {
+        return false;
+    }
+    let area = active_monitor_work_area(conn, root, screen);
+    // Skip fullscreen overlays (e.g., screenshot capture overlay).
+    if i32::from(geo.width) >= area.2.saturating_sub(8)
+        && i32::from(geo.height) >= area.3.saturating_sub(8)
+    {
+        if mapped {
+            if let Ok(mut set) = centered_windows().lock() {
+                set.insert(window);
+            }
+        }
+        return false;
+    }
+    let (want_x, want_y) = centered_origin(area, geo.width, geo.height);
+    // Preserve existing WM_NORMAL_HINTS (e.g., GPUI's min_size) while adding
+    // USPosition | PPosition | PWinGravity (NorthWest) so xfwm4 honors (x, y).
+    let mut hints = [0u32; 18];
+    if let Some(existing) = prop32(conn, window, AtomEnum::WM_NORMAL_HINTS.into()) {
+        for (dst, src) in hints.iter_mut().zip(existing.iter()) {
+            *dst = *src;
+        }
+    }
+    hints[0] |= 1 | 4 | 512;
+    hints[1] = want_x as u32;
+    hints[2] = want_y as u32;
+    hints[17] = 1; // NorthWestGravity
+    let _ = conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        AtomEnum::WM_NORMAL_HINTS,
+        AtomEnum::WM_SIZE_HINTS,
+        &hints,
+    );
+    let _ = conn.configure_window(
+        window,
+        &ConfigureWindowAux::new().x(want_x).y(want_y),
+    );
+    if mapped {
+        if !notice_is_at(conn, window, root, want_x, want_y) {
+            if let Some(moveresize) = conn
+                .intern_atom(false, b"_NET_MOVERESIZE_WINDOW")
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|r| r.atom)
+                .filter(|&a| a != 0)
+            {
+                // NorthWestGravity (1) | X (1<<8) | Y (1<<9) | Source=NormalApp (1<<12).
+                let move_flags = 1u32 | (1 << 8) | (1 << 9) | (1 << 12);
+                let event = ClientMessageEvent::new(
+                    32,
+                    window,
+                    moveresize,
+                    [move_flags, want_x as u32, want_y as u32, 0, 0],
+                );
+                let _ = conn.send_event(
+                    false,
+                    root,
+                    EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+                    event,
+                );
+            }
+        }
+        if let Ok(mut set) = centered_windows().lock() {
+            set.insert(window);
+        }
+    }
+    true
+}
+
 /// Stamp `_MOTIF_WM_HINTS` (decorations off) on a brand-new CSD window *before*
 /// xfwm4 processes `MapRequest`, preventing xfwm4 from painting a server frame
 /// and then clearing the composited backing pixmap to black when stripping it.
+/// Also centers the new window on the active monitor once it maps.
 pub fn anticipate_csd_window() {
     reset_settle();
     if cfg!(test)
@@ -221,21 +447,49 @@ pub fn anticipate_csd_window() {
                 return;
             };
             let pid = std::process::id();
-            for _ in 0..35 {
-                for window in owned_clients(&conn, root, wm_pid, pid) {
-                    if known.contains(&window) {
-                        continue;
+            let mut target: Option<u32> = None;
+            for _ in 0..80 {
+                if target.is_none() {
+                    for window in owned_clients(&conn, root, wm_pid, pid) {
+                        if known.contains(&window) {
+                            continue;
+                        }
+                        let name = window_name(&conn, window, wm_name, utf8);
+                        if name.starts_with("Zalo Call") || name.starts_with("Zalo Notice") {
+                            continue;
+                        }
+                        if write_motif(&conn, window, motif) {
+                            let viewable = notice_viewable(&conn, window);
+                            center_window_once(&conn, root, screen, window, viewable);
+                            let _ = conn.flush();
+                            target = Some(window);
+                            if viewable {
+                                std::thread::sleep(Duration::from_millis(50));
+                                if let Ok(mut set) = centered_windows().lock() {
+                                    set.remove(&window);
+                                }
+                                center_window_once(&conn, root, screen, window, true);
+                                let _ = conn.flush();
+                                return;
+                            }
+                            break;
+                        }
                     }
-                    let name = window_name(&conn, window, wm_name, utf8);
-                    if name.starts_with("Zalo Call") || name.starts_with("Zalo Notice") {
-                        continue;
-                    }
-                    if write_motif(&conn, window, motif) {
+                } else if let Some(window) = target {
+                    if notice_viewable(&conn, window) {
+                        center_window_once(&conn, root, screen, window, true);
+                        let _ = conn.flush();
+                        // One follow-up pass after xfwm4 finishes async reparenting.
+                        std::thread::sleep(Duration::from_millis(50));
+                        if let Ok(mut set) = centered_windows().lock() {
+                            set.remove(&window);
+                        }
+                        center_window_once(&conn, root, screen, window, true);
                         let _ = conn.flush();
                         return;
                     }
                 }
-                std::thread::sleep(Duration::from_millis(3));
+                std::thread::sleep(Duration::from_millis(4));
             }
         });
 }
@@ -490,6 +744,9 @@ fn apply(scale: f32, known: &HashMap<u32, ShapeKey>) -> Option<(HashMap<u32, Sha
         if !motif_done {
             if !write_motif(&conn, window, motif) {
                 continue;
+            }
+            if !name_notice && !maximized {
+                center_window_once(&conn, root, screen, window, true);
             }
             changed = true;
         }
@@ -1411,5 +1668,17 @@ mod tests {
         assert_eq!(query_pointer_root(), None);
         assert_eq!(notice_root_origin(1.0), None);
         assert!(!move_notice_to(10.0, 20.0, 1.0));
+    }
+
+    #[test]
+    fn center_origin_clamps_inside_monitor_work_area() {
+        assert_eq!(centered_origin((0, 30, 1920, 1050), 1200, 720), (360, 195));
+        assert_eq!(centered_origin((1920, 0, 1920, 1080), 1140, 740), (2310, 170));
+        // Oversized window clamps to top-left of the monitor work area.
+        assert_eq!(centered_origin((10, 24, 1024, 700), 1200, 800), (10, 24));
+        assert_eq!(
+            intersect_rect((0, 0, 1920, 1080), (0, 28, 3840, 1020)),
+            Some((0, 28, 1920, 1020))
+        );
     }
 }

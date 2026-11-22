@@ -245,8 +245,8 @@ pub fn cache_path() -> Option<PathBuf> {
     if let Some(dir) = crate::data::active_data_dir() {
         return Some(dir.join("profiles.json"));
     }
-    let xdg = zalo_core::XdgDirs::from_env().ok()?;
-    let dir = xdg.cache_home().join("zalo-rust");
+    let paths = zalo_core::AppPaths::from_env("zalo-rust").ok()?;
+    let dir = paths.cache_dir().to_path_buf();
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("gpui-profiles.json"))
 }
@@ -308,13 +308,16 @@ pub fn fetch(dir: &Path, now_ms: i64) -> Result<Profiles, String> {
             errors.push(format!("me: {e}"));
         }
         if let Ok(v) = me {
-            if let Some(avatar) = find_str(&v, &["avatar", "fullAvt", "avt"]) {
+            let avatar = find_str(&v, &["avatar", "fullAvt", "avt"]).unwrap_or_default();
+            let name = find_str(&v, &["displayName", "zaloName"]).unwrap_or_default();
+            let global_id = find_str(&v, &["globalId"]).unwrap_or_default();
+            if !avatar.is_empty() || !name.is_empty() || !global_id.is_empty() {
                 out.map.insert(
                     ME.into(),
                     Profile {
-                        name: find_str(&v, &["displayName", "zaloName"]).unwrap_or_default(),
+                        name,
                         avatar,
-                        global_id: find_str(&v, &["globalId"]).unwrap_or_default(),
+                        global_id,
                         ..Profile::default()
                     },
                 );
@@ -527,7 +530,7 @@ pub fn profiles_from_v2(value: &Value) -> HashMap<String, Profile> {
         }
         let avatar = find_str(item, &["avatar", "fullAvt", "avt"]).unwrap_or_default();
         let name = find_str(item, &["displayName", "zaloName", "dName"]).unwrap_or_default();
-        if !avatar.starts_with("https://") && name.is_empty() {
+        if !avatar.starts_with("https://") && !avatar.starts_with("http://") && name.is_empty() {
             continue;
         }
         map.insert(
@@ -594,7 +597,7 @@ pub fn missing_avatar_uids(profiles: &Profiles, want: &[String]) -> Vec<String> 
         let has = profiles
             .map
             .get(uid)
-            .is_some_and(|p| p.avatar.starts_with("https://"));
+            .is_some_and(|p| p.avatar.starts_with("https://") || p.avatar.starts_with("http://"));
         if !has && !out.contains(uid) {
             out.push(uid.clone());
         }
@@ -818,7 +821,7 @@ pub fn member_profiles_from(value: &Value) -> HashMap<String, Profile> {
                 continue;
             };
             let avatar = find_str(mem, &["avatar", "avt", "fullAvt"]).unwrap_or_default();
-            if !avatar.starts_with("https://") {
+            if !avatar.starts_with("https://") && !avatar.starts_with("http://") {
                 continue;
             }
             map.entry(uid).or_insert(Profile {

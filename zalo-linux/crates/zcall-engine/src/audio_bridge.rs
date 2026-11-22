@@ -119,6 +119,9 @@ pub struct AudioBridge {
     use_in_process_apm: Arc<AtomicBool>,
     /// Negotiated audio processing toggles.
     proc_opts: AudioProcessingOptions,
+    /// User preference overrides from Call Settings / Device Status (`callAec`, `callNoiseSuppression`).
+    user_aec: Option<bool>,
+    user_ns: Option<bool>,
     /// Active Opus encoder settings.
     encoder_cfg: OpusEncoderConfig,
     /// Pending Opus encoder settings for `zcall-mic` to apply live.
@@ -193,6 +196,8 @@ impl AudioBridge {
             apm: Arc::new(InProcessApm::new(proc_opts)),
             use_in_process_apm: Arc::new(AtomicBool::new(!legacy_pw)),
             proc_opts,
+            user_aec: None,
+            user_ns: None,
             encoder_cfg: OpusEncoderConfig::default(),
             pending_encoder: Arc::new(Mutex::new(None)),
             high_pass: false,
@@ -226,13 +231,33 @@ impl AudioBridge {
         mixer.set_limits(max_frames, min_frames);
     }
 
+    /// Updates user-configured AEC and AI Noise Suppression toggles live
+    /// without reopening microphone or speaker streams.
+    pub fn set_audio_processing(&mut self, aec: bool, noise_suppression: bool) {
+        self.user_aec = Some(aec);
+        self.user_ns = Some(noise_suppression);
+        self.proc_opts.aec = aec && zcall_core::zrtc_helpers::echo_cancellation_requested();
+        self.proc_opts.noise_suppression =
+            noise_suppression && zcall_core::zrtc_helpers::noise_suppression_requested();
+        if self.use_in_process_apm.load(Ordering::Acquire) {
+            self.apm.apply_options(self.proc_opts);
+        }
+    }
+
     /// Applies negotiated `zrtcConfig` parameters: jitter bounds, group Opus
     /// bitrate/complexity/FEC (`groupAudioArgs`), and PipeWire AEC toggles.
     pub fn apply_config(&mut self, group: bool, config: &Value) {
         let (min_ms, max_ms) = playout_delay_ms(config);
         self.set_jitter_ms(min_ms, max_ms);
 
-        let proc_opts = audio_processing_options(config);
+        let mut proc_opts = audio_processing_options(config);
+        if let Some(aec) = self.user_aec {
+            proc_opts.aec = aec && zcall_core::zrtc_helpers::echo_cancellation_requested();
+        }
+        if let Some(ns) = self.user_ns {
+            proc_opts.noise_suppression =
+                ns && zcall_core::zrtc_helpers::noise_suppression_requested();
+        }
         let proc_changed = proc_opts != self.proc_opts;
         self.proc_opts = proc_opts;
         if self.use_in_process_apm.load(Ordering::Acquire) {
@@ -667,14 +692,13 @@ impl AudioBridge {
                     };
                     let now = monotonic_secs();
                     let heard = far.load(Ordering::Relaxed);
-                    let run_apm = use_in_process_apm.load(Ordering::Acquire)
-                        && apm.is_enabled()
-                        && (!bt_capture.load(Ordering::Acquire) || force_aec);
+                    let allow_aec = !bt_capture.load(Ordering::Acquire) || force_aec;
+                    let run_apm = use_in_process_apm.load(Ordering::Acquire) && apm.is_enabled();
                     let encoded = if run_apm {
                         // Keep WebRTC AEC3 converged even while muted, matching
-                        // Windows `ZaloCall.exe`. Use MicLeveler as the single
-                        // smooth leveler unless sonora AGC2 was opted in.
-                        let cleaned = apm.process_capture(&scaled, cap_lat);
+                        // Windows `ZaloCall.exe`, and keep RNNoise active even
+                        // when Bluetooth HFP bypasses software AEC3.
+                        let cleaned = apm.process_capture_with_aec(&scaled, cap_lat, allow_aec);
                         if apm.has_gain_control() {
                             pipeline.process_apm_frame(&cleaned, is_muted)
                         } else {

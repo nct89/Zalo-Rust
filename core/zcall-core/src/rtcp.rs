@@ -470,6 +470,71 @@ pub fn build_nack(sender_ssrc: u32, media_ssrc: u32, seqs: &[u16]) -> Vec<u8> {
     b
 }
 
+/// Parsed RFC 4585 Generic NACK (`PT = 205`, `FMT = 1`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NackRequest {
+    /// SSRC of the feedback sender.
+    pub sender_ssrc: u32,
+    /// SSRC of the media stream whose packets are requested.
+    pub media_ssrc: u32,
+    /// Requested RTP sequence numbers in FCI order.
+    pub seqs: Vec<u16>,
+}
+
+/// Parses a single RTCP Generic NACK packet (`PT = 205`, `FMT = 1`).
+pub fn parse_nack(pkt: &[u8]) -> Option<NackRequest> {
+    if pkt.len() < 16 || (pkt[0] >> 6) != 2 || (pkt[0] & 0x1f) != 1 || pkt[1] != 205 {
+        return None;
+    }
+    let words = usize::from(be16(pkt, 2));
+    let len = (words + 1) * 4;
+    if len < 16 || len > pkt.len() {
+        return None;
+    }
+    let sender_ssrc = be32(pkt, 4);
+    let media_ssrc = be32(pkt, 8);
+    let mut seqs = Vec::new();
+    let mut o = 12;
+    while o + 4 <= len {
+        let pid = be16(pkt, o);
+        let blp = be16(pkt, o + 2);
+        seqs.push(pid);
+        for bit in 0..16u16 {
+            if (blp & (1 << bit)) != 0 {
+                seqs.push(pid.wrapping_add(bit + 1));
+            }
+        }
+        o += 4;
+    }
+    Some(NackRequest {
+        sender_ssrc,
+        media_ssrc,
+        seqs,
+    })
+}
+
+/// Extracts all RFC 4585 Generic NACK packets from a compound RTCP buffer.
+pub fn parse_nacks_in_compound(buf: &[u8]) -> Vec<NackRequest> {
+    let mut out = Vec::new();
+    let mut o = 0;
+    while o + 4 <= buf.len() {
+        if (buf[o] >> 6) != 2 {
+            break;
+        }
+        let len = (usize::from(be16(buf, o + 2)) + 1) * 4;
+        if len < 4 || o + len > buf.len() {
+            break;
+        }
+        if buf[o + 1] == 205 && (buf[o] & 0x1f) == 1 {
+            if let Some(req) = parse_nack(&buf[o..o + len]) {
+                out.push(req);
+            }
+        }
+        o += len;
+    }
+    out
+}
+
 #[derive(Default)]
 struct Stream {
     highest: u16,
@@ -978,5 +1043,21 @@ mod tests {
         compound.extend_from_slice(&42_u32.to_be_bytes());
         fb.on_rtcp(true, &compound, 102);
         assert!(fb.take_key_frame_request());
+    }
+
+    #[test]
+    fn parses_generic_nack_and_compound_round_trip() {
+        let seqs = vec![65534_u16, 65535, 0, 2, 25];
+        let nack = build_nack(0x11, 0x22, &seqs);
+        let parsed = parse_nack(&nack).expect("parse nack");
+        assert_eq!(parsed.sender_ssrc, 0x11);
+        assert_eq!(parsed.media_ssrc, 0x22);
+        assert_eq!(parsed.seqs, seqs);
+
+        let mut compound = build_rr(0x11, &[]);
+        compound.extend_from_slice(&nack);
+        let all = parse_nacks_in_compound(&compound);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], parsed);
     }
 }

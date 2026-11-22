@@ -19,8 +19,8 @@ pub const BUDGET: usize = 4;
 /// Newest media items decoded / fetched per thread open. Older bubbles keep
 /// the placeholder until message virtualization lands.
 pub const MAX_PER_THREAD: usize = 48;
-/// Response cap, same as `zalo-gui`.
-const MAX_BYTES: usize = 8_000_000;
+/// Response cap for full-resolution photos / GIFs / stickers.
+const MAX_BYTES: usize = 25_000_000;
 
 /// One bubble waiting for its image.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,7 +88,11 @@ pub fn run_batch(session_dir: Option<&Path>, jobs: Vec<Job>) -> Vec<Done> {
         if let (Some(bytes), Some(path)) = (bytes, path) {
             if std::fs::write(&path, &bytes).is_ok() {
                 done.image = media::decode_thumb(&path, job.max_edge);
-                done.path = Some(path);
+                if done.image.is_some() {
+                    done.path = Some(path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
         out.push(done);

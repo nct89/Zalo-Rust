@@ -62,6 +62,16 @@ pub const SIG_GROUP_BROADCAST: i64 = 12098;
 pub const SIG_GROUP_SHARE: i64 = 12044;
 /// `sendSignal` 12064 → [`/api/voicecall/requestsharescreen`].
 pub const SIG_SHARE_SCREEN: i64 = 12064;
+/// `sendSignal` 12056 → [`/api/voicecall/requestaudio2video`].
+pub const SIG_AUDIO_TO_VIDEO: i64 = 12056;
+/// `sendSignal` 12435 → [`/api/voicecall/group/adduser`].
+pub const SIG_GROUP_ADD_USER: i64 = 12435;
+/// `sendSignal` 12043 → [`/api/voicecall/group/join`].
+pub const SIG_GROUP_JOIN: i64 = 12043;
+/// `sendSignal` 12445 → [`/api/voicecall/group/state`].
+pub const SIG_GROUP_STATE: i64 = 12445;
+/// `sendSignal` 12447 → [`/api/voicecall/group/notify`].
+pub const SIG_GROUP_NOTIFY: i64 = 12447;
 
 fn clone_field(data: &Value, key: &str) -> Value {
     data.get(key).cloned().unwrap_or(Value::Null)
@@ -406,8 +416,44 @@ pub fn voicecall_from_signal(
             "/api/voicecall/requestsharescreen",
             share_screen_payload(data),
         )),
+        SIG_AUDIO_TO_VIDEO => Some((
+            "/api/voicecall/requestaudio2video",
+            audio_to_video_payload(data, imei),
+        )),
+        SIG_GROUP_ADD_USER => Some((
+            "/api/voicecall/group/adduser",
+            group_payload(data, imei),
+        )),
+        SIG_GROUP_JOIN => Some((
+            "/api/voicecall/group/join",
+            group_payload(data, imei),
+        )),
+        SIG_GROUP_STATE => Some((
+            "/api/voicecall/group/state",
+            group_payload(data, imei),
+        )),
+        SIG_GROUP_NOTIFY => Some((
+            "/api/voicecall/group/notify",
+            group_payload(data, imei),
+        )),
         _ => None,
     }
+}
+
+/// 12056 body (`/api/voicecall/requestaudio2video`): 1-1 audio-to-video upgrade request.
+fn audio_to_video_payload(data: &Value, imei: &str) -> Value {
+    let mut body = json!({
+        "calleeId": data.get("calleeId").or_else(|| data.get("toId")).or_else(|| data.get("uidTo")).cloned().unwrap_or(Value::Null),
+        "callId": clone_field(data, "callId"),
+        "imei": imei,
+    });
+    if let Some(status) = data.get("status").filter(|v| !v.is_null()) {
+        body["status"] = status.clone();
+    }
+    if let Some(codec) = data.get("codec").filter(|v| !v.is_null()) {
+        body["codec"] = codec.clone();
+    }
+    body
 }
 
 /// `sendOnOffSharescreen` (`/api/voicecall/requestsharescreen`).
@@ -852,6 +898,69 @@ impl ZaloApi {
         self.voicecall_get("/api/voicecall/unholdresp", &hold_payload(json!(to_id)))
             .await
     }
+
+    /// Requests upgrading an active 1-1 voice call to video (`/api/voicecall/requestaudio2video`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn request_audio_to_video(
+        &self,
+        callee_id: &str,
+        call_id: i64,
+        status: i64,
+    ) -> Result<Value, ClientError> {
+        let payload = audio_to_video_payload(
+            &json!({ "calleeId": callee_id, "callId": call_id, "status": status }),
+            &self.device.imei,
+        );
+        self.voicecall_get("/api/voicecall/requestaudio2video", &payload)
+            .await
+    }
+
+    /// `sendAddUserRequestCallGroup` (`/api/voicecall/group/adduser`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn group_add_user(&self, data: &Value) -> Result<Value, ClientError> {
+        let payload = group_payload(data, &self.device.imei);
+        self.voicecall_get("/api/voicecall/group/adduser", &payload)
+            .await
+    }
+
+    /// `sendJoinCallGroup` (`/api/voicecall/group/join`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn group_join_call(&self, data: &Value) -> Result<Value, ClientError> {
+        let payload = group_payload(data, &self.device.imei);
+        self.voicecall_get("/api/voicecall/group/join", &payload)
+            .await
+    }
+
+    /// `getStateCallGroup` (`/api/voicecall/group/state`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn group_call_state(&self, data: &Value) -> Result<Value, ClientError> {
+        let payload = group_payload(data, &self.device.imei);
+        self.voicecall_get("/api/voicecall/group/state", &payload)
+            .await
+    }
+
+    /// `notifyCallGroup` (`/api/voicecall/group/notify`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn group_notify_call(&self, data: &Value) -> Result<Value, ClientError> {
+        let payload = group_payload(data, &self.device.imei);
+        self.voicecall_get("/api/voicecall/group/notify", &payload)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -1216,5 +1325,35 @@ mod tests {
         assert!(incoming_call_from_control(&voip[0]).is_none());
         assert!(voip_control_is_fresh(&voip[0], 50_000));
         assert!(!voip_control_is_fresh(&voip[0], 70_000));
+    }
+
+    #[test]
+    fn maps_audio_to_video_and_remaining_group_call_signals() {
+        let imei = "test-imei";
+        let (path, p) = voicecall_from_signal(
+            SIG_AUDIO_TO_VIDEO,
+            &json!({ "calleeId": "222", "callId": 42, "status": 1 }),
+            imei,
+        )
+        .expect("12056");
+        assert_eq!(path, "/api/voicecall/requestaudio2video");
+        assert_eq!(p["calleeId"], "222");
+        assert_eq!(p["callId"], 42);
+        assert_eq!(p["status"], 1);
+        assert_eq!(p["imei"], imei);
+
+        for (sig, want_path) in [
+            (SIG_GROUP_ADD_USER, "/api/voicecall/group/adduser"),
+            (SIG_GROUP_JOIN, "/api/voicecall/group/join"),
+            (SIG_GROUP_STATE, "/api/voicecall/group/state"),
+            (SIG_GROUP_NOTIFY, "/api/voicecall/group/notify"),
+        ] {
+            let (path, payload) =
+                voicecall_from_signal(sig, &json!({ "callId": 99, "groupId": "g1" }), imei)
+                    .expect("group signal");
+            assert_eq!(path, want_path);
+            assert_eq!(payload["callId"], 99);
+            assert_eq!(payload["imei"], imei);
+        }
     }
 }

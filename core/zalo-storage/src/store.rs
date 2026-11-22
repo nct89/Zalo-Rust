@@ -783,6 +783,9 @@ impl LocalStore {
                 "INSERT INTO attachments (message_id, data) VALUES (?1, ?2)
                  ON CONFLICT(message_id) DO UPDATE SET data = excluded.data",
             )?;
+            let mut bump_thread_stmt = tx.prepare_cached(
+                "UPDATE threads SET updated_at = MAX(updated_at, ?2) WHERE thread_id = ?1",
+            )?;
             for (msg, attach) in items {
                 if let Some(gid) = msg.global_msg_id {
                     let exists = has_global_stmt
@@ -806,6 +809,7 @@ impl LocalStore {
                 ])?;
                 if changed > 0 {
                     inserted += 1;
+                    bump_thread_stmt.execute(params![msg.thread_id, msg.sent_at])?;
                     if let Some(data) = attach.as_deref() {
                         let row_id = tx.last_insert_rowid();
                         if row_id > 0 {

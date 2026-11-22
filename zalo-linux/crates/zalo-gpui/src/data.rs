@@ -6,13 +6,14 @@
 //! launch with no session, keep the preview fixtures.
 
 use std::collections::HashMap;
+#[cfg(not(test))]
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::media::{MsgKind, PollChoice};
 
 use zalo_client::StoredSession;
-use zalo_core::XdgDirs;
 #[cfg(not(test))]
 use zalo_storage::ThreadKind;
 use zalo_storage::{LocalStore, MessageRecord};
@@ -277,12 +278,16 @@ pub fn live_allowed(thread_id: &str) -> bool {
     !matches!(id, "1" | "2" | "3" | "4")
 }
 
-/// XDG `~/.config/zalo-rust`.
+/// Machine config directory: `~/.config/zalo-rust` on Linux,
+/// `~/Library/Application Support/zalo-rust` on macOS.
+///
+/// Login writes `session.json` here via [`zalo_core::AppPaths`]. The shell must
+/// read the same directory or a successful QR login opens the preview fixtures.
 #[must_use]
 pub fn config_dir() -> Option<PathBuf> {
-    XdgDirs::from_env()
+    zalo_core::AppPaths::from_env("zalo-rust")
         .ok()
-        .map(|xdg| xdg.config_home().join("zalo-rust"))
+        .map(|paths| paths.config_dir().to_path_buf())
 }
 
 /// Directory of one account: `accounts/<userId>` under the machine config dir.
@@ -578,6 +583,19 @@ pub(crate) fn vn_ymd(ms: i64) -> (i64, i64, i64) {
     (year, month as i64, day as i64)
 }
 
+#[cfg(not(test))]
+fn session_self_uids(session: Option<&StoredSession>) -> HashSet<String> {
+    let mut set = HashSet::new();
+    if let Some(s) = session {
+        for opt in [&s.uin, &s.user_id, &s.send2me_id] {
+            if let Some(id) = opt.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+                set.insert(id.to_owned());
+            }
+        }
+    }
+    set
+}
+
 /// Conversations and messages currently in `dir/store.db`.
 #[must_use]
 pub(crate) fn snapshot_from_store(dir: &std::path::Path) -> Option<Snapshot> {
@@ -588,11 +606,39 @@ pub(crate) fn snapshot_from_store(dir: &std::path::Path) -> Option<Snapshot> {
     }
     #[cfg(not(test))]
     {
+        let session = StoredSession::load(dir).ok();
+        let self_uids = session_self_uids(session.as_ref());
         let store = LocalStore::open(&dir.join("store.db")).ok()?;
-        let mut snap = map_store(&store);
+        let mut snap = map_store(&store, &self_uids);
+        if let Some(s) = session {
+            snap.display_name = s.display_name;
+            snap.uin = s.uin;
+            snap.send2me_id = s.send2me_id;
+        }
         snap.session_dir = Some(dir.to_path_buf());
         snap.has_session = true;
         Some(snap)
+    }
+}
+
+/// Load a full account snapshot from a specific session directory `dir`
+/// (returning an empty logged-in shell when `store.db` does not exist yet).
+#[must_use]
+pub(crate) fn load_snapshot_from_dir(dir: &std::path::Path) -> Option<Snapshot> {
+    #[cfg(test)]
+    {
+        let _ = dir;
+        None
+    }
+    #[cfg(not(test))]
+    {
+        load_from_dir(dir).or_else(|| {
+            let session = StoredSession::load(dir).ok()?;
+            session
+                .zpw_sek()
+                .is_some()
+                .then(|| snapshot_from_session(dir, &session))
+        })
     }
 }
 
@@ -718,7 +764,12 @@ fn person_from_preview(row: &preview::PreviewPerson) -> ChatPerson {
 #[cfg(not(test))]
 fn load_from_disk() -> Option<Snapshot> {
     let dir = active_data_dir()?;
-    let session = StoredSession::load(&dir).ok()?;
+    load_from_dir(&dir)
+}
+
+#[cfg(not(test))]
+fn load_from_dir(dir: &std::path::Path) -> Option<Snapshot> {
+    let session = StoredSession::load(dir).ok()?;
     if session.zpw_sek().is_none() {
         return None;
     }
@@ -726,8 +777,9 @@ fn load_from_disk() -> Option<Snapshot> {
     if !store_path.is_file() {
         return None;
     }
+    let self_uids = session_self_uids(Some(&session));
     let store = LocalStore::open(&store_path).ok()?;
-    let mut snap = map_store(&store);
+    let mut snap = map_store(&store, &self_uids);
     if snap.convs.is_empty() {
         return None;
     }
@@ -735,7 +787,7 @@ fn load_from_disk() -> Option<Snapshot> {
     snap.uin = session.uin.clone();
     snap.send2me_id = session.send2me_id.clone();
     snap.has_session = true;
-    snap.session_dir = Some(dir.clone());
+    snap.session_dir = Some(dir.to_path_buf());
     if let Some(sid) = snap.send2me_id.as_deref().filter(|s| !s.is_empty()) {
         if let Some(existing) = snap.convs.iter_mut().find(|c| c.thread_id == sid) {
             existing.name = "My Documents".to_owned();
@@ -766,10 +818,7 @@ fn load_from_disk() -> Option<Snapshot> {
 
 #[cfg(not(test))]
 fn merge_index_friends(snap: &mut Snapshot, uin: &str) {
-    let Some(xdg) = XdgDirs::from_env().ok() else {
-        return;
-    };
-    let Some(db) = zalo_storage::zalo_pc_index_db(xdg.config_home(), uin) else {
+    let Some(db) = zalo_storage::zalo_pc_index_db_default(uin) else {
         return;
     };
     let Ok(rows) = zalo_storage::read_zalo_pc_friends(&db, uin) else {
@@ -810,10 +859,16 @@ fn record_to_chat_msg(
     thread_id: &str,
     users: &HashMap<String, String>,
     attachments: &HashMap<i64, String>,
+    self_uids: &HashSet<String>,
     you: &str,
 ) -> ChatMsg {
-    let from_me = rec.sender_id.is_none();
-    let sender_uid = rec.sender_id.clone().unwrap_or_default();
+    let raw_sender = rec.sender_id.as_deref().map(str::trim).unwrap_or("");
+    let from_me = raw_sender.is_empty() || raw_sender == "0" || self_uids.contains(raw_sender);
+    let sender_uid = if from_me {
+        String::new()
+    } else {
+        raw_sender.to_owned()
+    };
     let sender = if from_me {
         you.to_owned()
     } else {
@@ -880,6 +935,8 @@ pub fn search_thread_messages_filtered(
         let Some(dir) = active_data_dir() else {
             return Vec::new();
         };
+        let session = StoredSession::load(&dir).ok();
+        let self_uids = session_self_uids(session.as_ref());
         let store_path = dir.join("store.db");
         let Ok(store) = LocalStore::open(&store_path) else {
             return Vec::new();
@@ -902,11 +959,23 @@ pub fn search_thread_messages_filtered(
         let conv_id = hash_id(thread_id);
         let mut out: Vec<ChatMsg> = recs
             .into_iter()
-            .filter(|rec| rec.body.trim() != "sendBubbleMessage")
+            .filter(|rec| {
+                rec.body.trim() != "sendBubbleMessage"
+                    || attachments.contains_key(&rec.message_id)
+            })
             .enumerate()
             .map(|(i, rec)| {
                 let mid = u64::try_from(rec.message_id).unwrap_or(1_000_000 + i as u64);
-                record_to_chat_msg(&rec, mid, conv_id, thread_id, &users, &attachments, you)
+                record_to_chat_msg(
+                    &rec,
+                    mid,
+                    conv_id,
+                    thread_id,
+                    &users,
+                    &attachments,
+                    &self_uids,
+                    you,
+                )
             })
             .collect();
         out.sort_by_key(|m| m.at_ms);
@@ -921,7 +990,7 @@ pub fn search_thread_messages(thread_id: &str, query: &str, limit: usize) -> Vec
 }
 
 #[cfg(not(test))]
-fn map_store(store: &LocalStore) -> Snapshot {
+fn map_store(store: &LocalStore, self_uids: &HashSet<String>) -> Snapshot {
     let users: HashMap<String, String> = store
         .users()
         .unwrap_or_default()
@@ -942,7 +1011,8 @@ fn map_store(store: &LocalStore) -> Snapshot {
         let live = live_allowed(&thread.thread_id);
         let mut msgs = Vec::new();
         for rec in store.messages(&thread.thread_id).unwrap_or_default() {
-            if rec.body.trim() == "sendBubbleMessage" {
+            if rec.body.trim() == "sendBubbleMessage" && !attachments.contains_key(&rec.message_id)
+            {
                 continue;
             }
             let mid = u64::try_from(rec.message_id).unwrap_or(next_msg_id);
@@ -954,6 +1024,7 @@ fn map_store(store: &LocalStore) -> Snapshot {
                 &thread.thread_id,
                 &users,
                 &attachments,
+                self_uids,
                 you,
             ));
         }

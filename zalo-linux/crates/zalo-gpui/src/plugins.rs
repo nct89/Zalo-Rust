@@ -21,6 +21,37 @@ pub const AUTO_TRAY: bool = false;
 ///
 /// Returns a short message when neither a region tool nor the XDG portal is available.
 pub fn capture_region() -> Result<Option<PathBuf>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        return capture_region_macos();
+    }
+    #[cfg(not(target_os = "macos"))]
+    capture_region_linux()
+}
+
+#[cfg(target_os = "macos")]
+fn capture_region_macos() -> Result<Option<PathBuf>, String> {
+    use std::process::Command;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let out = std::env::temp_dir().join(format!("zalo-gpui-shot-{nanos}.png"));
+    let status = Command::new("screencapture")
+        .args(["-i", "-x"])
+        .arg(&out)
+        .status()
+        .map_err(|err| format!("screencapture: {err}"))?;
+    if status.success() && out.is_file() {
+        Ok(Some(out))
+    } else {
+        let _ = std::fs::remove_file(&out);
+        Ok(None)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_region_linux() -> Result<Option<PathBuf>, String> {
     use std::process::Command;
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

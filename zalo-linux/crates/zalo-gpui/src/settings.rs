@@ -1489,6 +1489,18 @@ impl ShellView {
                                     percent: crate::call::mic_percent_from_json(p.json("micVolume").as_ref()),
                                 },
                             },
+                            toggle(
+                                "callAec",
+                                true,
+                                "Khử vọng âm (AEC)",
+                                Some("Loại bỏ tiếng vọng từ loa khi gọi không dùng tai nghe"),
+                            ),
+                            toggle(
+                                "callNoiseSuppression",
+                                true,
+                                "Lọc tiếng ồn nền (AI)",
+                                Some("Giảm tiếng quạt, gõ phím và tạp âm môi trường bằng RNNoise"),
+                            ),
                             toggle("needMic", false, "Không nhận cuộc gọi trên thiết bị này khi thiếu micro", None),
                         ],
                     ),

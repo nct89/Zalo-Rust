@@ -6,8 +6,8 @@
 use gpui::{App, Application};
 
 fn main() {
-    if let Ok(xdg) = zalo_core::XdgDirs::from_env() {
-        zalo_protocol::init_from_dir(&xdg.config_home().join("zalo-rust"));
+    if let Ok(paths) = zalo_core::AppPaths::from_env("zalo-rust") {
+        zalo_protocol::init_from_dir(paths.config_dir());
     } else {
         let _ = zalo_protocol::apply_env_overrides();
     }

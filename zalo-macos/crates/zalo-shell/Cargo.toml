@@ -1,0 +1,31 @@
+[package]
+name = "zalo-shell-mac"
+description = "macOS menu bar, notifications, file panels, and login item for Zalo-Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zalo_shell"
+
+[features]
+default = []
+# Accepted so `zalo-gpui`'s `tray-xembed` feature resolves on macOS. XEmbed is Linux-only.
+tray-xembed = []
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2.7"

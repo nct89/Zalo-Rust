@@ -321,8 +321,8 @@ pub(crate) fn safe_zdb4_entry_name(raw: &str) -> Option<String> {
 /// Default output folder under `$XDG_DATA_HOME/zalo-rust/zdb4-extracted`.
 #[must_use]
 pub(crate) fn default_zdb4_out_dir() -> PathBuf {
-    zalo_core::XdgDirs::from_env()
-        .map(|xdg| xdg.data_home().join("zalo-rust").join("zdb4-extracted"))
+    zalo_core::AppPaths::from_env("zalo-rust")
+        .map(|paths| paths.data_dir().join("zdb4-extracted"))
         .unwrap_or_else(|_| std::env::temp_dir().join("zalo-rust-zdb4-extracted"))
 }
 

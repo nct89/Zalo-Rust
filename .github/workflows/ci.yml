@@ -96,3 +96,25 @@ jobs:
           -p zjxl
           -p zocr
           -- --test-threads=1
+
+  macos-gui:
+    name: macOS (GPUI) check
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install cmake nasm pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test macOS shell and CoreAudio crates
+        run: cargo test -p zalo-shell-mac -p zcall-audio-mac -p zcall-engine-mac -- --test-threads=1
+
+      - name: Check the GPUI client for macOS
+        run: cargo check -p zalo-gpui --features tray-xembed

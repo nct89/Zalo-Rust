@@ -331,8 +331,8 @@ fn classic_cache_dir() -> PathBuf {
     if cfg!(test) {
         return std::env::temp_dir().join("zalo-gpui-emoji-classic-test");
     }
-    zalo_core::XdgDirs::from_env()
-        .map(|xdg| xdg.cache_home().join("zalo-rust").join("emoji-classic"))
+    zalo_core::AppPaths::from_env("zalo-rust")
+        .map(|paths| paths.cache_dir().join("emoji-classic"))
         .unwrap_or_else(|_| std::env::temp_dir().join("zalo-rust-emoji-classic"))
 }
 

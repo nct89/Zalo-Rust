@@ -16,8 +16,8 @@ use crate::data::ChatMsg;
 use crate::fonts::FAMILY_SEMIBOLD;
 use crate::media::MsgKind;
 use gpui::{
-    div, hsla, img, prelude::*, px, rgb, size, App, Bounds, Context, CursorStyle, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, ParentElement, Render, RenderImage, ScrollHandle,
+    div, hsla, img, prelude::*, px, rgb, size, App, Context, CursorStyle, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, ParentElement, Render, RenderImage, ScrollHandle,
     ScrollWheelEvent, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowDecorations,
     WindowOptions,
 };
@@ -93,6 +93,7 @@ pub(crate) fn open(
     items: Vec<ChatMsg>,
     current_id: u64,
     sender_avatars: HashMap<u64, Arc<RenderImage>>,
+    initial_thumbs: HashMap<u64, Arc<RenderImage>>,
     download_dir: PathBuf,
     session_dir: Option<PathBuf>,
     start_ocr: bool,
@@ -102,7 +103,7 @@ pub(crate) fn open(
         return false;
     }
     let title = photo_window_title(&conv_name);
-    let bounds = Bounds::centered(None, size(px(1140.), px(740.)), cx);
+    let bounds = crate::bounds_in_work_area(size(px(1140.), px(740.)));
     crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
@@ -124,6 +125,7 @@ pub(crate) fn open(
                     items,
                     current_id,
                     sender_avatars,
+                    initial_thumbs,
                     download_dir,
                     session_dir,
                     start_ocr,
@@ -210,13 +212,17 @@ impl PhotoView {
         items: Vec<ChatMsg>,
         current_id: u64,
         sender_avatars: HashMap<u64, Arc<RenderImage>>,
+        initial_thumbs: HashMap<u64, Arc<RenderImage>>,
         download_dir: PathBuf,
         session_dir: Option<PathBuf>,
         start_ocr: bool,
         mute_video: bool,
     ) -> Self {
         let index = items.iter().position(|m| m.id == current_id).unwrap_or(0);
-        let thumbs = vec![None; items.len()];
+        let thumbs: Vec<Option<Arc<RenderImage>>> = items
+            .iter()
+            .map(|m| initial_thumbs.get(&m.id).cloned())
+            .collect();
         let mut this = Self {
             focus: cx.focus_handle(),
             conv_name,
@@ -361,12 +367,43 @@ impl PhotoView {
         let generation = self.generation;
         let path = msg.media_path.clone().filter(|p| p.is_file());
         let url = http_media(&msg);
+        let session = self.session_dir.clone();
+        let msg_id = msg.id;
         cx.spawn(async move |this, cx| {
-            let image = cx
+            let (image, fetched_path) = cx
                 .background_executor()
-                .spawn(async move { decode_photo(path, &url, turns) })
+                .spawn(async move {
+                    if let Some(img) = decode_photo(path.clone(), &url, turns) {
+                        return (Some(img), path);
+                    }
+                    if crate::media::is_http_url(&url) {
+                        let done = crate::fetch::run_batch(
+                            session.as_deref(),
+                            vec![crate::fetch::Job {
+                                msg_id,
+                                path: None,
+                                url: url.clone(),
+                                max_edge: 1200,
+                            }],
+                        );
+                        if let Some(downloaded) = done.into_iter().next().and_then(|d| d.path) {
+                            let img = decode_photo(Some(downloaded.clone()), &url, turns);
+                            return (img, Some(downloaded));
+                        }
+                    }
+                    (None, path)
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
+                if let Some(p) = fetched_path {
+                    if let Some(slot) = view.items.iter_mut().find(|m| m.id == msg_id) {
+                        if slot.kind != MsgKind::Video
+                            && slot.media_path.as_ref().is_none_or(|c| !c.is_file())
+                        {
+                            slot.media_path = Some(p);
+                        }
+                    }
+                }
                 if view.generation == generation && view.turns % 4 == turns {
                     if let Some(image) = image.as_ref() {
                         if view
@@ -496,7 +533,7 @@ impl PhotoView {
                     let bytes = match file {
                         Some(p) => std::fs::read(p).map_err(|e| e.to_string())?,
                         None => match dir {
-                            Some(d) if url.starts_with("https://") => {
+                            Some(d) if crate::media::is_http_url(&url) => {
                                 let u = url.clone();
                                 crate::bridge::block_api(&d, |api| async move {
                                     api.fetch_limited(&u, 8 << 20)
@@ -650,24 +687,46 @@ impl PhotoView {
 
     fn load_thumbs(&mut self, cx: &mut Context<Self>) {
         let session = self.session_dir.clone();
-        let jobs: Vec<crate::fetch::Job> = self
+        let center = self.index;
+        let n = self.items.len();
+        // Order pending thumbnails by proximity to the currently opened photo
+        // so the visible filmstrip fills in immediately, streaming in small
+        // batches of 4 instead of blocking until the whole thread downloads.
+        let mut ordered: Vec<(usize, crate::fetch::Job)> = self
             .items
             .iter()
-            .map(|msg| crate::fetch::Job {
-                msg_id: msg.id,
-                path: msg.media_path.clone().filter(|path| path.is_file()),
-                url: http_media(msg),
-                max_edge: 160,
+            .enumerate()
+            .filter(|(i, _)| self.thumbs.get(*i).is_none_or(Option::is_none))
+            .map(|(i, msg)| {
+                (
+                    i,
+                    crate::fetch::Job {
+                        msg_id: msg.id,
+                        path: msg.media_path.clone().filter(|path| path.is_file()),
+                        url: http_media(msg),
+                        max_edge: 160,
+                    },
+                )
             })
             .collect();
-        let n = jobs.len();
+        ordered.sort_by_key(|(i, _)| i.abs_diff(center));
+        let jobs: Vec<crate::fetch::Job> = ordered.into_iter().map(|(_, job)| job).collect();
+        if jobs.is_empty() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            let done = cx
-                .background_executor()
-                .spawn(async move { crate::fetch::run_batch(session.as_deref(), jobs) })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                if view.items.len() == n {
+            for chunk in jobs.chunks(crate::fetch::BUDGET) {
+                let batch = chunk.to_vec();
+                let dir = session.clone();
+                let done = cx
+                    .background_executor()
+                    .spawn(async move { crate::fetch::run_batch(dir.as_deref(), batch) })
+                    .await;
+                let alive = this.update(cx, |view, cx| {
+                    if view.items.len() != n {
+                        return;
+                    }
+                    let mut touched = false;
                     for item in done {
                         let Some(index) = view.items.iter().position(|msg| msg.id == item.msg_id)
                         else {
@@ -686,6 +745,7 @@ impl PhotoView {
                         }
                         if item.image.is_some() {
                             view.thumbs[index] = item.image;
+                            touched = true;
                         }
                     }
                     let stage_missing = view.image.is_none()
@@ -697,14 +757,19 @@ impl PhotoView {
                             .is_some_and(|path| path.is_file());
                     if view.current().kind == MsgKind::Video && view.image.is_none() {
                         view.image = view.thumbs.get(view.index).cloned().flatten();
+                        touched = true;
                     }
-                    view.film_pinned = usize::MAX;
                     if stage_missing {
                         view.reload(cx);
                     }
+                    if touched || stage_missing {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
                 }
-                cx.notify();
-            });
+            }
         })
         .detach();
     }

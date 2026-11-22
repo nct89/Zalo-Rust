@@ -893,7 +893,10 @@ impl ShellView {
             self.send2me_id = session.send2me_id;
         }
         self.profiles = crate::profiles::Profiles::load(Some(&dir.join("profiles.json")));
-        self.prefs = crate::prefs::Prefs::load(crate::data::config_dir().filter(|path| path.is_dir()));
+        self.prefs = crate::prefs::Prefs::load_scoped(
+            crate::data::config_dir().filter(|path| path.is_dir()),
+            Some(dir.clone()),
+        );
         if let Some(snap) = crate::data::snapshot_from_store(&dir) {
             let keep = self
                 .selected

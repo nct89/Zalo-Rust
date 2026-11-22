@@ -321,13 +321,45 @@ async fn run_sync_job(
         can_retry: false,
     })?;
     let device_name = device.computer_name.clone();
-    let api = Arc::new(ZaloApi::from_session(device, &session).map_err(|e| {
-        SyncRunAbort::Failed {
-            message: e.to_string(),
-            can_retry: true,
+    let mut api = ZaloApi::from_session(device, &session).map_err(|e| SyncRunAbort::Failed {
+        message: e.to_string(),
+        can_retry: true,
+    })?;
+    if let Some(sek) = session.zpw_sek() {
+        if let Err(err) =
+            crate::bridge::ensure_service_hosts(&mut api, &session_dir, &sek, false).await
+        {
+            eprintln!("zalo-gpui sync2: ensure_service_hosts failed: {err}");
         }
-    })?);
-    let (_client_id, self_uid) = WsRpcHub::global().session_ids();
+    }
+    let api = Arc::new(api);
+    let (_client_id, ws_self_uid) = WsRpcHub::global().session_ids();
+    let self_uid = if !ws_self_uid.is_empty() {
+        ws_self_uid
+    } else {
+        session
+            .user_id
+            .clone()
+            .or_else(|| session.send2me_id.clone())
+            .or_else(|| session.uin.clone())
+            .unwrap_or_default()
+    };
+    let profiles = if profiles.map.is_empty() {
+        let p = session_dir.join("profiles.json");
+        Profiles::load(p.is_file().then_some(p.as_path()))
+    } else {
+        profiles
+    };
+    let mut self_global_id = profiles
+        .map
+        .get(crate::profiles::ME)
+        .map(|p| p.global_id.clone())
+        .unwrap_or_default();
+    if self_global_id.is_empty() {
+        if let Ok(me_val) = api.get_me().await {
+            self_global_id = crate::profiles::find_str(&me_val, &["globalId"]).unwrap_or_default();
+        }
+    }
     let transport = Arc::new(GpuiSyncTransport {
         api: Arc::clone(&api),
     });
@@ -484,7 +516,18 @@ async fn run_sync_job(
             .iter()
             .map(|c| (c.conv_id.clone(), c.conv_type == ConvType::Group))
             .collect();
-        let g2pc = resolve_global_to_pc(&api, &profiles, &global_pairs).await;
+        let mut g2pc = resolve_global_to_pc(&api, &profiles, &global_pairs).await;
+        if !self_global_id.is_empty() && !self_uid.is_empty() {
+            g2pc.insert(self_global_id.clone(), self_uid.clone());
+        }
+        // Seed `g2pc` with all known profile `global_id -> pc_id` mappings so group message
+        // senders who are friends resolve without an extra `/api/gid/decrypt` round-trip.
+        for (pc_id, prof) in &profiles.map {
+            if !prof.global_id.is_empty() && pc_id != crate::profiles::ME {
+                g2pc.entry(prof.global_id.clone())
+                    .or_insert_with(|| pc_id.clone());
+            }
+        }
 
         let thread_records: Vec<ThreadRecord> = all_convs
             .iter()
@@ -511,11 +554,24 @@ async fn run_sync_job(
                 })
             })
             .collect();
+        eprintln!(
+            "zalo-gpui sync2: convs={} resolved={} threads_upsert={}",
+            all_convs.len(),
+            g2pc.len(),
+            thread_records.len()
+        );
         if !thread_records.is_empty() {
             let store_path_threads = store_path.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut store) = LocalStore::open(&store_path_threads) {
-                    let _ = store.upsert_threads_batch(&thread_records);
+                match LocalStore::open(&store_path_threads) {
+                    Ok(mut store) => {
+                        if let Err(err) = store.upsert_threads_batch(&thread_records) {
+                            eprintln!("zalo-gpui sync2: upsert_threads_batch failed: {err}");
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("zalo-gpui sync2: open store for threads failed: {err}");
+                    }
                 }
             })
             .await;
@@ -551,8 +607,12 @@ async fn run_sync_job(
         let writer_handle = std::thread::Builder::new()
             .name("zalo-sync-db-writer".into())
             .spawn(move || -> usize {
-                let Ok(mut store) = LocalStore::open(&store_path_writer) else {
-                    return 0;
+                let mut store = match LocalStore::open(&store_path_writer) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("zalo-gpui sync2: open store for messages failed: {err}");
+                        return 0;
+                    }
                 };
                 let mut total_inserted = 0usize;
                 let mut pending_notify = false;
@@ -560,10 +620,15 @@ async fn run_sync_job(
                     .checked_sub(std::time::Duration::from_secs(5))
                     .unwrap_or_else(std::time::Instant::now);
                 while let Ok(batch) = db_rx.recv() {
-                    if let Ok(n) = store.insert_messages_batch(&batch) {
-                        if n > 0 {
-                            total_inserted += n;
-                            pending_notify = true;
+                    match store.insert_messages_batch(&batch) {
+                        Ok(n) => {
+                            if n > 0 {
+                                total_inserted += n;
+                                pending_notify = true;
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("zalo-gpui sync2: insert_messages_batch failed: {err}");
                         }
                     }
                     if pending_notify
@@ -581,24 +646,70 @@ async fn run_sync_job(
             })
             .ok();
 
-        let g2pc_arc = Arc::new(g2pc);
-        let g2pc_cb = Arc::clone(&g2pc_arc);
-        let self_uid_cb = self_uid.clone();
-        let ui_prog = ui_tx.clone();
-        let db_tx_cb = Mutex::new(db_tx);
-
-        let on_messages = Arc::new(move |range: &MissingMessageRange, msgs: Vec<SyncMessage>| {
-            let items = build_synced_message_records(
-                &range.conv_id,
-                range.is_group,
-                &self_uid_cb,
-                &g2pc_cb,
-                &msgs,
-            );
-            if !items.is_empty() {
-                if let Ok(tx) = db_tx_cb.lock() {
-                    let _ = tx.send(items);
+        // Async sender-ID resolver stage between `on_messages` and the SQLite writer thread:
+        // resolves unknown group-member global noise IDs via `/api/gid/decrypt` (cached across
+        // batches) so synced group messages keep real PC sender UIDs instead of raw global IDs.
+        let (raw_tx, mut raw_rx) = tokio_mpsc::unbounded_channel::<(String, bool, Vec<SyncMessage>)>();
+        let api_resolve = Arc::clone(&api);
+        let self_uid_res = self_uid.clone();
+        let self_gid_res = self_global_id.clone();
+        let resolver_handle = tokio::spawn(async move {
+            let mut g2pc_map = g2pc;
+            let mut unresolved: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            while let Some((thread_id, is_group, msgs)) = raw_rx.recv().await {
+                if is_group {
+                    let mut need: Vec<String> = Vec::new();
+                    let mut seen: std::collections::HashSet<&str> =
+                        std::collections::HashSet::new();
+                    for msg in &msgs {
+                        let s = msg.sender_id.trim();
+                        if s.is_empty()
+                            || s == "0"
+                            || s == self_uid_res
+                            || (!self_gid_res.is_empty() && s == self_gid_res)
+                            || g2pc_map.contains_key(s)
+                            || unresolved.contains(s)
+                            || !seen.insert(s)
+                        {
+                            continue;
+                        }
+                        need.push(s.to_owned());
+                    }
+                    if !need.is_empty() {
+                        for chunk in need.chunks(50) {
+                            if let Ok(val) = api_resolve.get_uids_from_global_noise_ids(chunk).await
+                            {
+                                for (k, v) in crate::noise_id::parse_gid_map(&val) {
+                                    g2pc_map.insert(k, v);
+                                }
+                            }
+                            for s in chunk {
+                                if !g2pc_map.contains_key(s) {
+                                    unresolved.insert(s.clone());
+                                }
+                            }
+                        }
+                    }
                 }
+                let items = build_synced_message_records(
+                    &thread_id,
+                    is_group,
+                    &self_uid_res,
+                    &self_gid_res,
+                    &g2pc_map,
+                    &msgs,
+                );
+                if !items.is_empty() {
+                    let _ = db_tx.send(items);
+                }
+            }
+        });
+
+        let ui_prog = ui_tx.clone();
+        let on_messages = Arc::new(move |range: &MissingMessageRange, msgs: Vec<SyncMessage>| {
+            if !msgs.is_empty() {
+                let _ = raw_tx.send((range.conv_id.clone(), range.is_group, msgs));
             }
         });
 
@@ -620,8 +731,10 @@ async fn run_sync_job(
         )
         .await;
 
-        // Drop the callback (and its `db_tx` sender) so the SQLite writer drains and exits cleanly.
+        // Drop `on_messages` (closing `raw_tx`), wait for the sender resolver to drain (closing
+        // `db_tx`), then join the SQLite writer thread cleanly.
         drop(on_messages);
+        let _ = resolver_handle.await;
         let saved = if let Some(handle) = writer_handle {
             tokio::task::spawn_blocking(move || handle.join().unwrap_or(0))
                 .await
@@ -707,47 +820,49 @@ fn build_synced_message_records(
     thread_id: &str,
     is_group: bool,
     self_uid: &str,
+    self_global_id: &str,
     g2pc: &HashMap<String, String>,
     msgs: &[SyncMessage],
 ) -> Vec<(MessageRecord, Option<String>)> {
     let mut out = Vec::with_capacity(msgs.len());
     for msg in msgs {
-        let _ = is_group;
+        let sender_raw = msg.sender_id.trim();
+        let resolved_sender = g2pc.get(sender_raw).map(String::as_str);
+        let is_from_me = sender_raw.is_empty()
+            || sender_raw == "0"
+            || (!self_uid.is_empty() && sender_raw == self_uid)
+            || (!self_global_id.is_empty() && sender_raw == self_global_id)
+            || resolved_sender.is_some_and(|pc| !self_uid.is_empty() && pc == self_uid);
         let server_json = sync_message_to_server_json(msg, thread_id, self_uid, |gid| {
-            if gid == "0" || gid.is_empty() {
+            let g = gid.trim();
+            if g.is_empty()
+                || g == "0"
+                || (!self_global_id.is_empty() && g == self_global_id)
+                || (!self_uid.is_empty() && g == self_uid)
+            {
                 self_uid.to_owned()
+            } else if let Some(pc) = g2pc.get(g) {
+                pc.clone()
+            } else if !is_group && !thread_id.is_empty() && g == sender_raw {
+                thread_id.to_owned()
             } else {
-                g2pc.get(gid).cloned().unwrap_or_else(|| gid.to_owned())
+                g.to_owned()
             }
         });
         let global_id_i64 = msg.global_id.parse::<i64>().ok().filter(|&n| n > 0);
-        let sender_pc = if msg.sender_id == "0" || msg.sender_id.is_empty() {
-            Some(self_uid.to_owned())
+        // `LocalStore` convention (`data.rs` + `realtime.rs`): `sender_id == None` means
+        // sent by this account (`from_me = true`). For 1-1 incoming messages, fall back
+        // to `thread_id` so the peer's avatar and display name always resolve.
+        let sender_pc = if is_from_me {
+            None
+        } else if let Some(pc) = resolved_sender {
+            Some(pc.to_owned())
+        } else if !is_group && !thread_id.is_empty() {
+            Some(thread_id.to_owned())
         } else {
-            Some(
-                g2pc.get(&msg.sender_id)
-                    .cloned()
-                    .unwrap_or_else(|| msg.sender_id.clone()),
-            )
+            Some(sender_raw.to_owned())
         };
-        let body = if !msg.content.is_empty() {
-            msg.content.clone()
-        } else if let Some(ref att) = msg.meta.as_ref().and_then(|m| m.attachs.first()) {
-            if let Some(t) = att.title.as_deref().filter(|s| !s.is_empty()) {
-                t.to_owned()
-            } else if let Some(d) = att.description.as_deref().filter(|s| !s.is_empty()) {
-                d.to_owned()
-            } else {
-                let kind = server_json
-                    .as_ref()
-                    .and_then(|v| v.get("msgType"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("attachment");
-                format!("[{kind}]")
-            }
-        } else {
-            String::new()
-        };
+        let body = synced_message_body(msg, server_json.as_ref());
         let rec = MessageRecord {
             message_id: 0,
             thread_id: thread_id.to_owned(),
@@ -765,6 +880,72 @@ fn build_synced_message_records(
         out.push((rec, attach));
     }
     out
+}
+
+fn clean_sync_text(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| {
+            !s.is_empty() && *s != "sendBubbleMessage" && !crate::media::is_local_media_uri(s)
+        })
+        .map(str::to_owned)
+}
+
+fn synced_message_body(msg: &SyncMessage, server_json: Option<&Value>) -> String {
+    let att = msg.meta.as_ref().and_then(|m| m.attachs.first());
+    let server_type = server_json
+        .and_then(|v| v.get("msgType"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let action = att.and_then(|a| a.action.as_deref()).unwrap_or("");
+    let title = clean_sync_text(att.and_then(|a| a.title.as_deref()));
+    let desc = clean_sync_text(att.and_then(|a| a.description.as_deref()));
+
+    match server_type {
+        "chat.photo" => title
+            .or_else(|| clean_sync_text(Some(msg.content.as_str())))
+            .unwrap_or_else(|| "[Hình ảnh]".into()),
+        "chat.sticker" => "[Sticker]".into(),
+        "chat.gif" => "[GIF]".into(),
+        "chat.voice" => "[Tin nhắn thoại]".into(),
+        "chat.video.msg" | "chat.video.live.msg" => "[Video]".into(),
+        "chat.doodle" => "[Vẽ hình]".into(),
+        "share.file" => match title {
+            Some(name) => format!("[File] {name}"),
+            None => "[File]".into(),
+        },
+        "chat.location.new" => match desc.or(title) {
+            Some(label) => format!("[Vị trí] {label}"),
+            None => "[Vị trí]".into(),
+        },
+        "chat.ecard" => match desc.or(title) {
+            Some(label) => format!("[Thiệp] {label}"),
+            None => "[Thiệp]".into(),
+        },
+        "group.poll" => match title {
+            Some(q) => format!("[Bình chọn] {q}"),
+            None => "[Bình chọn]".into(),
+        },
+        "chat.undo" => "Tin nhắn đã thu hồi".into(),
+        "chat.delete" | "chat.delete.everyone" => "Tin nhắn đã bị xóa".into(),
+        "chat.recommended" => match action {
+            "recommened.misscall" => "[Cuộc gọi nhỡ]".into(),
+            "recommened.calltime" => "[Cuộc gọi]".into(),
+            "recommened.user" | "recommened.vip" => match (title, desc) {
+                (Some(t), Some(d)) => format!("[Danh thiếp] {t}\n{d}"),
+                (Some(t), None) => format!("[Danh thiếp] {t}"),
+                _ => "[Danh thiếp]".into(),
+            },
+            _ => clean_sync_text(att.and_then(|a| a.href.as_deref()))
+                .or(title)
+                .or(desc)
+                .or_else(|| clean_sync_text(Some(msg.content.as_str())))
+                .unwrap_or_else(|| "[Liên kết]".into()),
+        },
+        _ => clean_sync_text(Some(msg.content.as_str()))
+            .or(title)
+            .or(desc)
+            .unwrap_or_default(),
+    }
 }
 
 impl ShellView {
@@ -1154,5 +1335,95 @@ impl ShellView {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zalo_sync::proto::{SyncAttach, SyncMetaData};
+
+    #[test]
+    fn build_synced_records_marks_self_messages_and_resolves_peer_and_call_bodies() {
+        let mut g2pc = HashMap::new();
+        g2pc.insert("g_peer_1".to_owned(), "2001".to_owned());
+        g2pc.insert("g_member_2".to_owned(), "2002".to_owned());
+
+        let own_by_zero = SyncMessage {
+            sender_id: "0".into(),
+            client_id: 10,
+            msg_type: 0,
+            timestamp: 1_700_000_000_000,
+            global_id: "100".into(),
+            content: "hello".into(),
+            ..SyncMessage::default()
+        };
+        let own_by_global = SyncMessage {
+            sender_id: "g_self_999".into(),
+            client_id: 11,
+            msg_type: 0,
+            timestamp: 1_700_000_001_000,
+            global_id: "101".into(),
+            content: "from phone".into(),
+            ..SyncMessage::default()
+        };
+        let peer_call = SyncMessage {
+            sender_id: "unmapped_peer_gid".into(),
+            client_id: 12,
+            msg_type: 12,
+            timestamp: 1_700_000_002_000,
+            global_id: "102".into(),
+            content: String::new(),
+            meta: Some(SyncMetaData {
+                attachs: vec![SyncAttach {
+                    action: Some("recommened.calltime".into()),
+                    title: Some("sendBubbleMessage".into()),
+                    ..SyncAttach::default()
+                }],
+                ..SyncMetaData::default()
+            }),
+            ..SyncMessage::default()
+        };
+        let group_msg = SyncMessage {
+            sender_id: "g_member_2".into(),
+            client_id: 13,
+            msg_type: 0,
+            timestamp: 1_700_000_003_000,
+            global_id: "103".into(),
+            content: "test".into(),
+            ..SyncMessage::default()
+        };
+
+        let one_to_one = build_synced_message_records(
+            "2001",
+            false,
+            "1000",
+            "g_self_999",
+            &g2pc,
+            &[own_by_zero, own_by_global, peer_call],
+        );
+        assert_eq!(one_to_one.len(), 3);
+        assert_eq!(one_to_one[0].0.sender_id, None, "sender_id 0 must be from_me");
+        assert_eq!(
+            one_to_one[1].0.sender_id, None,
+            "self_global_id must be from_me"
+        );
+        assert_eq!(
+            one_to_one[2].0.sender_id.as_deref(),
+            Some("2001"),
+            "1-1 incoming falls back to thread_id"
+        );
+        assert_eq!(one_to_one[2].0.body, "[Cuộc gọi]");
+
+        let grp = build_synced_message_records(
+            "g_9000",
+            true,
+            "1000",
+            "g_self_999",
+            &g2pc,
+            &[group_msg],
+        );
+        assert_eq!(grp[0].0.sender_id.as_deref(), Some("2002"));
+        assert_eq!(grp[0].0.body, "test");
     }
 }

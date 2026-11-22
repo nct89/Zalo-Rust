@@ -173,11 +173,12 @@ impl Default for AudioProcessingOptions {
     fn default() -> Self {
         Self {
             aec: true,
-            // WebRTC NS on Linux USB/BT mics cuts continuous speech by 19–32 dB
-            // after 1–2 s (observed in Linux microphone benchmarks).
-            // Keep off by default; opt-in via ZCALL_NOISE_SUPPRESSION=1.
-            noise_suppression: false,
-            ns_level: 0,
+            // Powered by in-process RNNoise (`nnnoiseless`), which preserves
+            // continuous speech while suppressing steady background noise
+            // (fans, keyboards, hiss). Opt out via ZCALL_NOISE_SUPPRESSION=0
+            // or the in-app Call Settings / Device Status toggle.
+            noise_suppression: true,
+            ns_level: 2,
             high_pass: false,
             // Zalo's agcMode=3 is fixed digital, not AGC2 AdaptiveDigital.
             // Keep sonora AGC2 off so AudioPipeline's single smooth MicLeveler
@@ -189,11 +190,11 @@ impl Default for AudioProcessingOptions {
     }
 }
 
-/// Returns `true` only when the user explicitly opted in via
-/// `ZCALL_NOISE_SUPPRESSION=1` (and did not disable all processing).
+/// Returns `true` unless the user explicitly opted out via
+/// `ZCALL_NOISE_SUPPRESSION=0` or `ZCALL_AUDIO_PROCESSING=0`.
 pub fn noise_suppression_requested() -> bool {
     std::env::var("ZCALL_AUDIO_PROCESSING").ok().as_deref() != Some("0")
-        && std::env::var("ZCALL_NOISE_SUPPRESSION").ok().as_deref() == Some("1")
+        && std::env::var("ZCALL_NOISE_SUPPRESSION").ok().as_deref() != Some("0")
 }
 
 /// Returns `true` only when the user explicitly opted into WebRTC AGC2 via
@@ -445,14 +446,14 @@ mod tests {
     fn audio_processing_defaults_match_windows_zrtc_config() {
         let opts = audio_processing_options(&json!({}));
         assert!(opts.aec);
-        assert!(!opts.noise_suppression);
+        assert!(opts.noise_suppression);
         assert!(!opts.gain_control);
         assert_eq!(opts.agc_gain_db, 9);
         assert!(!opts.high_pass);
 
         let custom = audio_processing_options(&json!({
             "audioEchoCancellation": false,
-            "audioNoiseSuppression": true,
+            "audioNoiseSuppression": false,
             "audioNSLevel": 3,
             "audioHighPassFilter": true,
             "audioGainControl": false,

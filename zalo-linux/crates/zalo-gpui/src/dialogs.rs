@@ -2701,10 +2701,57 @@ impl ShellView {
             crate::data::persist_thread_title(&id, &name);
         }
         let fallback = crate::color::str_vi("STR_ZALO_USER", "Người dùng Zalo");
+        let you = crate::color::str_vi("STR_YOU", "Bạn");
         let profiles = &self.profiles.map;
-        for msgs in self.messages.values_mut() {
+        let aliases = &self.profiles.aliases;
+        let me_global_id = profiles
+            .get(crate::profiles::ME)
+            .map(|p| p.global_id.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let mut self_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for opt in [&self.uin, &self.send2me_id, &me_global_id] {
+            if let Some(id) = opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                self_ids.insert(id.to_owned());
+            }
+        }
+        let mut rev_global: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for (pc_id, p) in profiles {
+            if !p.global_id.is_empty() && pc_id != crate::profiles::ME && !pc_id.starts_with("g_") {
+                rev_global.insert(p.global_id.clone(), pc_id.clone());
+            }
+        }
+        let conv_meta: std::collections::HashMap<u64, (String, String, bool)> = self
+            .convs
+            .iter()
+            .map(|c| (c.id, (c.thread_id.clone(), c.name.clone(), c.is_group)))
+            .collect();
+        for (conv_id, msgs) in self.messages.iter_mut() {
+            let meta = conv_meta.get(conv_id);
             for m in msgs.iter_mut() {
-                if m.from_me || m.sender_uid.is_empty() {
+                if m.from_me {
+                    continue;
+                }
+                if !m.sender_uid.is_empty() && self_ids.contains(m.sender_uid.trim()) {
+                    m.from_me = true;
+                    m.sender = you.to_owned();
+                    m.sender_uid.clear();
+                    continue;
+                }
+                if let Some(pc_uid) = rev_global.get(m.sender_uid.trim()) {
+                    m.sender_uid = pc_uid.clone();
+                }
+                if let Some((tid, _, is_group)) = meta {
+                    if !*is_group
+                        && !tid.is_empty()
+                        && (m.sender_uid.is_empty()
+                            || (!profiles.contains_key(&m.sender_uid) && m.sender_uid != *tid))
+                    {
+                        m.sender_uid = tid.clone();
+                    }
+                }
+                if m.sender_uid.is_empty() {
                     continue;
                 }
                 let raw = m.sender.trim();
@@ -2714,14 +2761,26 @@ impl ShellView {
                 if !unknown {
                     continue;
                 }
-                let Some(name) = profiles
+                if let Some(alias) = aliases.get(&m.sender_uid).filter(|a| !a.is_empty()) {
+                    m.sender = alias.clone();
+                    continue;
+                }
+                if let Some(name) = profiles
                     .get(&m.sender_uid)
                     .map(|p| p.name.trim().to_owned())
                     .filter(|n| !n.is_empty() && !crate::profiles::is_id_label(&m.sender_uid, n))
-                else {
+                {
+                    m.sender = name;
                     continue;
-                };
-                m.sender = name;
+                }
+                if let Some((tid, conv_name, is_group)) = meta {
+                    if !*is_group
+                        && !conv_name.trim().is_empty()
+                        && !crate::profiles::is_id_label(tid, conv_name)
+                    {
+                        m.sender = conv_name.clone();
+                    }
+                }
             }
         }
     }

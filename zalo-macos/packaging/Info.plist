@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>vi</string>
+  <key>CFBundleExecutable</key>
+  <string>zalo-gpui</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.nct89.ZaloRust</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>Zalo Rust</string>
+  <key>CFBundleDisplayName</key>
+  <string>Zalo Rust</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Zalo dùng micro để gọi thoại, gọi video và gửi tin nhắn thoại.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Zalo dùng camera để gọi video.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Zalo dùng quyền ghi màn hình để chia sẻ màn hình và chụp ảnh.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Zalo mở tệp và thư mục bạn chọn.</string>
+  <key>LSUIElement</key>
+  <false/>
+</dict>
+</plist>

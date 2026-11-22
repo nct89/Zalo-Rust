@@ -12,7 +12,6 @@ use gpui::RenderImage;
 use image::codecs::gif::GifDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::{AnimationDecoder, Frame};
-use zalo_core::XdgDirs;
 
 use crate::color::str_vi;
 
@@ -159,7 +158,12 @@ pub fn media_root() -> Option<PathBuf> {
     if let Some(r) = MEDIA_ROOT.read().ok().and_then(|r| r.clone()) {
         return Some(r);
     }
-    Some(XdgDirs::from_env().ok()?.cache_home().join("zalo-rust"))
+    Some(
+        zalo_core::AppPaths::from_env("zalo-rust")
+            .ok()?
+            .cache_dir()
+            .to_path_buf(),
+    )
 }
 
 /// `<media root>/photos`.
@@ -199,18 +203,33 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
     if let Some(q) = value.get("quote").filter(|v| v.is_object()) {
         meta.quote_sender = q
             .get("sender")
+            .or_else(|| q.get("fromD"))
+            .or_else(|| q.get("ownerId"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
         meta.quote_text = q
             .get("text")
+            .or_else(|| q.get("msg"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_owned();
-        meta.quote_global_id = q.get("gid").and_then(|v| v.as_i64());
-        meta.quote_cli_id = q.get("cid").and_then(|v| v.as_i64());
+        meta.quote_global_id = q
+            .get("gid")
+            .or_else(|| q.get("globalMsgId"))
+            .and_then(json_i64);
+        meta.quote_cli_id = q
+            .get("cid")
+            .or_else(|| q.get("cliMsgId"))
+            .and_then(json_i64);
     }
     let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind.is_empty() && value.get("msgType").and_then(|v| v.as_str()).is_some() {
+        // Phone → PC sync stores the server message (`msgType` + `content`),
+        // not the compact `kind` object the live socket writes.
+        fill_from_server_message(meta, &value);
+        return;
+    }
     let num = |key: &str| -> u64 {
         value
             .get(key)
@@ -284,7 +303,7 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
     }
     // Voice / video file (`size` is the length in ms for those two).
     let href = text("href");
-    if href.starts_with("https://") {
+    if is_http_url(&href) {
         meta.href = href;
     }
     meta.width = num("width") as u32;
@@ -305,41 +324,253 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
     }
     let thumb = text("thumb");
     let hd = text("hd");
-    // A GIF's `thumb` is often a still PNG. The moving file is `hd` / `.gif`.
+    // A GIF's `thumb` is often a still PNG; the moving file is `hd` / `.gif`.
+    // A photo's `thumb` is often a low-res 1:1 square crop from Zalo CDN,
+    // whereas `hd` / `href` is the full-resolution uncropped image.
     meta.url = if meta.kind == MsgKind::Gif {
         [hd.as_str(), thumb.as_str()]
             .into_iter()
-            .find(|u| u.starts_with("https://") && url_path_ends_gif(u))
-            .or_else(|| {
-                [hd.as_str(), thumb.as_str()]
-                    .into_iter()
-                    .find(|u| u.starts_with("https://"))
-            })
+            .find(|u| is_http_url(u) && url_path_ends_gif(u))
+            .or_else(|| [hd.as_str(), thumb.as_str()].into_iter().find(|u| is_http_url(u)))
             .unwrap_or("")
             .to_owned()
+    } else if matches!(meta.kind, MsgKind::Photo | MsgKind::Doodle) {
+        pick_full_photo_url("", &hd, &meta.href, &thumb)
     } else {
         [thumb.as_str(), hd.as_str()]
             .into_iter()
-            .find(|u| u.starts_with("https://"))
+            .find(|u| is_http_url(u))
             .unwrap_or("")
             .to_owned()
     };
-    // A doodle's picture is `content.href` (Electron copies it to `oriUrl`).
-    if meta.kind == MsgKind::Doodle && meta.url.is_empty() && meta.href.starts_with("https://") {
-        meta.url = meta.href.clone();
-    }
     if meta.path.is_none() {
-        meta.path = cached_url(&thumb)
-            .or_else(|| cached_url(&hd))
-            .or_else(|| cached_url(&meta.url));
+        meta.path = cached_url(&meta.url);
+    }
+}
+
+/// True when `url` is an http(s) URL.
+#[must_use]
+pub fn is_http_url(url: &str) -> bool {
+    let t = url.trim();
+    t.starts_with("https://") || t.starts_with("http://")
+}
+
+/// True when a Zalo CDN photo URL points to a small cropped thumbnail rather
+/// than the full-resolution original image.
+#[must_use]
+pub fn is_thumb_photo_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("/thumb/") || lower.contains("/t/") || lower.contains("_thumb.")
+}
+
+/// Choose the highest-resolution uncropped photo URL from Zalo's attachment
+/// fields (`oriUrl`, `hd`, `href`, `thumb`).
+///
+/// Zalo CDN's `thumb` is frequently a blurry 240×240 square crop, while
+/// `oriUrl`, `hd`, and `href` carry the full-resolution uncropped image
+/// (including `.jxl`, which [`decode_rgba`] decodes via `zjxl`). In Sync 2
+/// payloads, `content.href` sometimes mirrors `content.thumb` while
+/// `params.hd` carries the real HD `.jxl` URL — comparing against `thumb`
+/// ensures `params.hd` wins in that case.
+#[must_use]
+pub fn pick_full_photo_url(ori: &str, hd: &str, href: &str, thumb: &str) -> String {
+    let thumb = thumb.trim();
+    let full_candidates = [ori.trim(), hd.trim(), href.trim()];
+    let is_full = |u: &&str| is_http_url(u) && *u != thumb && !is_thumb_photo_url(u);
+    if let Some(best) = full_candidates
+        .iter()
+        .find(|u| is_full(u) && !u.to_ascii_lowercase().contains(".jxl"))
+        .or_else(|| full_candidates.iter().find(|u| is_full(u)))
+    {
+        return (*best).to_owned();
+    }
+    if let Some(best) = full_candidates
+        .iter()
+        .find(|u| is_http_url(u) && **u != thumb)
+    {
+        return (*best).to_owned();
+    }
+    [href.trim(), hd.trim(), ori.trim(), thumb]
+        .into_iter()
+        .find(|u| is_http_url(u))
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Attachment written by Sync 2: the server message (`msgType`, `content`,
+/// `content.params` as a JSON string).
+fn fill_from_server_message(meta: &mut MediaMeta, value: &serde_json::Value) {
+    let msg_type = value
+        .get("msgType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let content = nested_object(value.get("content"));
+    let params = nested_object(content.get("params"));
+    let action = content
+        .get("action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let https = |v: Option<&serde_json::Value>| -> String {
+        v.and_then(|item| item.as_str())
+            .filter(|url| is_http_url(url))
+            .unwrap_or("")
+            .to_owned()
+    };
+    let text = |obj: &serde_json::Value, key: &str| -> String {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned()
+    };
+    let num = |obj: &serde_json::Value, key: &str| -> u32 {
+        obj.get(key)
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
+            .unwrap_or(0) as u32
+    };
+    let picture = |content: &serde_json::Value, params: &serde_json::Value| -> String {
+        let thumb = {
+            let t = https(content.get("thumb"));
+            if t.is_empty() {
+                https(params.get("thumb"))
+            } else {
+                t
+            }
+        };
+        pick_full_photo_url(
+            &https(params.get("oriUrl")),
+            &https(params.get("hd")),
+            &https(content.get("href")),
+            &thumb,
+        )
+    };
+    match msg_type {
+        "chat.photo" => {
+            meta.kind = MsgKind::Photo;
+            meta.url = picture(&content, &params);
+            meta.width = num(&params, "width");
+            meta.height = num(&params, "height");
+        }
+        "chat.gif" => {
+            meta.kind = MsgKind::Gif;
+            let href = https(content.get("href"));
+            let hd = https(params.get("hd"));
+            meta.url = [href, hd, https(content.get("thumb"))]
+                .into_iter()
+                .find(|url| is_http_url(url))
+                .unwrap_or_default();
+            meta.width = num(&params, "width");
+            meta.height = num(&params, "height");
+        }
+        "chat.sticker" => {
+            meta.kind = MsgKind::Sticker;
+            if let Some(sticker) = zalo_client::StickerRef::from_value(&content)
+                .or_else(|| zalo_client::StickerRef::from_value(&params))
+            {
+                meta.url = sticker.image_url();
+                meta.width = 130;
+                meta.height = 130;
+            }
+            if meta.url.is_empty() {
+                meta.url = picture(&content, &params);
+            }
+        }
+        "chat.voice" => {
+            meta.kind = MsgKind::Voice;
+            meta.href = https(content.get("href"));
+            meta.size = u64::from(num(&params, "duration"));
+        }
+        "chat.video.msg" => {
+            meta.kind = MsgKind::Video;
+            meta.href = https(content.get("href"));
+            meta.url = https(content.get("thumb"));
+            meta.size = u64::from(num(&params, "duration"));
+            meta.width = num(&params, "video_width").max(num(&params, "width"));
+            meta.height = num(&params, "video_height").max(num(&params, "height"));
+        }
+        "share.file" => {
+            meta.kind = MsgKind::File;
+            meta.title = text(&content, "title");
+            meta.href = https(content.get("href"));
+            let size = content
+                .get("fileSize")
+                .or_else(|| params.get("fileSize"))
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_i64().map(|n| n.max(0) as u64))
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .unwrap_or(0);
+            meta.size = size;
+        }
+        "chat.doodle" => {
+            meta.kind = MsgKind::Doodle;
+            meta.url = https(content.get("href"));
+            if meta.url.is_empty() {
+                meta.url = picture(&content, &params);
+            }
+            meta.width = num(&params, "width");
+            meta.height = num(&params, "height");
+        }
+        "chat.location.new" => {
+            meta.kind = MsgKind::Location;
+            meta.title = text(&content, "title");
+            meta.href = text(&content, "href");
+            meta.url = https(content.get("thumb"));
+        }
+        "chat.ecard" => {
+            meta.kind = MsgKind::Ecard;
+            meta.title = text(&content, "title");
+            meta.href = text(&content, "href");
+            meta.url = https(content.get("thumb"));
+        }
+        "group.poll" => {
+            let body = poll_from_message(&content);
+            apply_poll(meta, &body);
+        }
+        "chat.recommended" | "chat.link" => match action {
+            "recommened.misscall" => meta.kind = MsgKind::MissedCall,
+            "recommened.calltime" => meta.kind = MsgKind::Call,
+            "recommened.user" | "recommened.vip" => {
+                meta.kind = MsgKind::Card;
+                meta.title = text(&content, "title");
+                meta.url = https(content.get("thumb"));
+                if meta.url.is_empty() {
+                    meta.url = https(params.get("avatar"));
+                }
+            }
+            _ => {
+                let href = text(&content, "href");
+                if href.starts_with("http://") || href.starts_with("https://") {
+                    meta.kind = MsgKind::Link;
+                    meta.href = href;
+                    meta.title = text(&content, "title");
+                    meta.url = https(content.get("thumb"));
+                }
+            }
+        },
+        _ => {}
+    }
+    if meta.path.is_none() && !meta.url.is_empty() {
+        meta.path = cached_url(&meta.url);
+    }
+}
+
+fn nested_object(value: Option<&serde_json::Value>) -> serde_json::Value {
+    match value {
+        Some(serde_json::Value::String(text)) => {
+            serde_json::from_str(text).unwrap_or(serde_json::Value::Null)
+        }
+        Some(other) => other.clone(),
+        None => serde_json::Value::Null,
     }
 }
 
 /// Cache file for a remote media URL (`~/.cache/zalo-rust/photos/<fnv>`),
-/// creating the directory. `None` for non-https URLs.
+/// creating the directory. `None` for non-http(s) URLs.
 #[must_use]
 pub fn cache_path_for(url: &str) -> Option<PathBuf> {
-    if !url.starts_with("https://") {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
         return None;
     }
     let dir = media_root()?.join("photos");
@@ -470,8 +701,9 @@ fn fill_from_body(meta: &mut MediaMeta, body: &str) {
         "[Hình ảnh]" => meta.kind = MsgKind::Photo,
         "[Sticker]" => meta.kind = MsgKind::Sticker,
         "[GIF]" => meta.kind = MsgKind::Gif,
-        "[Cuộc gọi nhỡ]" => meta.kind = MsgKind::MissedCall,
-        "[Cuộc gọi]" => meta.kind = MsgKind::Call,
+        "[Cuộc gọi nhỡ]" | "Cuộc gọi nhỡ" => meta.kind = MsgKind::MissedCall,
+        "[Cuộc gọi]" | "Cuộc gọi" | "Cuộc gọi đến" | "Cuộc gọi đi" | "Cuộc gọi thoại đến"
+        | "Cuộc gọi thoại đi" => meta.kind = MsgKind::Call,
         "[Tin nhắn thoại]" | "[Voice]" => meta.kind = MsgKind::Voice,
         "[Video]" => meta.kind = MsgKind::Video,
         _ if is_group_call_body(trimmed) => {
@@ -534,34 +766,57 @@ pub fn host_of(url: &str) -> &str {
     rest.split(['/', '?', '#']).next().unwrap_or(rest)
 }
 
+fn is_latin_char(ch: char) -> bool {
+    matches!(ch as u32, 0x0000..=0x02FF | 0x1E00..=0x1EFF)
+}
+
+/// Proportional advance estimate at the 15 px bubble size (Segoe UI / Inter).
+/// Vietnamese diacritics (`U+0080..=U+02FF`, `U+1E00..=U+1EFF`) are Latin
+/// glyphs, NOT CJK full-width cells; treating them as 15 px caused premature
+/// wrapping inside chat bubbles with large empty space on the right.
 fn char_px(ch: char) -> f32 {
-    if ch == '\t' {
-        return 28.0;
-    }
-    // Average advance at the 15 px bubble size (Segoe UI Text).
-    if ch.is_ascii() {
-        8.2
-    } else {
-        15.0
+    match ch {
+        '\t' => 28.0,
+        ' ' => 4.5,
+        '.' | ',' | ':' | ';' | '!' | '|' | '\'' | '`' => 4.6,
+        'i' | 'l' | 'j' | 'I' | 'í' | 'ì' | 'ỉ' | 'ĩ' | 'ị' | 'Í' | 'Ì' | 'Ỉ' | 'Ĩ' | 'Ị' => 5.0,
+        'f' | 'r' | 't' | '(' | ')' | '[' | ']' | '/' | '\\' | '-' => 5.8,
+        'm' | 'w' => 12.0,
+        'M' | 'W' => 13.8,
+        c if c.is_ascii_uppercase() => 10.0,
+        c if c.is_ascii_digit() => 8.2,
+        c if c.is_ascii_lowercase() => 8.0,
+        c if c.is_ascii() => 8.4,
+        c if is_latin_char(c) => {
+            if c.is_uppercase() {
+                10.0
+            } else {
+                8.0
+            }
+        }
+        _ => 15.5,
     }
 }
 
-/// Advance at the 13 px settings-note size. Vietnamese diacritics are one
-/// Latin cell. Treating them as CJK (15 px) wrapped every few words.
+/// Advance at the 13 px settings-note size (scaled proportionally from 15 px).
 fn note_char_px(ch: char) -> f32 {
     if ch == '\t' {
         return 28.0;
     }
-    match ch as u32 {
-        0x0000..=0x02FF | 0x1E00..=0x1EFF => 7.0,
-        _ => 13.5,
-    }
+    char_px(ch) * (13.0 / 15.0)
 }
 
 /// Insert newlines so a long token cannot blow the bubble width.
 #[must_use]
 pub fn wrap_bubble_text(text: &str, max_px: f32) -> String {
     wrap_with(text, max_px, char_px)
+}
+
+/// Wrap text at an arbitrary pixel font size and optional semibold weight.
+#[must_use]
+pub fn wrap_text_at(text: &str, max_px: f32, font_px: f32, semibold: bool) -> String {
+    let scale = (font_px / 15.0).max(0.5) * if semibold { 1.07 } else { 1.0 };
+    wrap_with(text, max_px / scale, char_px)
 }
 
 /// Wrap a settings note. Wider per Latin letter than [`wrap_bubble_text`].
@@ -585,8 +840,12 @@ fn wrap_with(text: &str, max_px: f32, metric: fn(char) -> f32) -> String {
 fn wrap_line(line: &str, max_px: f32, out: &mut String, metric: fn(char) -> f32) {
     let mut line_w = 0.0_f32;
     for piece in line.split_inclusive(' ') {
-        let ww: f32 = piece.chars().map(metric).sum();
-        if line_w > 0.0 && line_w + ww > max_px {
+        let trimmed = piece.trim_end_matches(' ');
+        let word_w: f32 = trimmed.chars().map(metric).sum();
+        if line_w > 0.0 && line_w + word_w > max_px {
+            while out.ends_with(' ') {
+                out.pop();
+            }
             out.push('\n');
             line_w = 0.0;
             let piece = piece.trim_start();
@@ -598,6 +857,10 @@ fn wrap_line(line: &str, max_px: f32, out: &mut String, metric: fn(char) -> f32)
             push_token(piece, max_px, out, &mut line_w, metric);
         }
     }
+}
+
+fn is_token_break(ch: char) -> bool {
+    matches!(ch, '/' | '_' | '-' | '?' | '&' | '=' | '.' | ':' | ',' | ';' | '—' | '–')
 }
 
 fn push_token(
@@ -613,22 +876,56 @@ fn push_token(
         *line_w += ww;
         return;
     }
-    for ch in token.chars() {
-        let w = metric(ch);
-        if *line_w + w > max_px && *line_w > 0.0 {
-            out.push('\n');
-            *line_w = 0.0;
-            if ch == ' ' {
-                continue;
+    let chars: Vec<char> = token.chars().collect();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let mut end = idx;
+        let mut w_acc = *line_w;
+        while end < chars.len() {
+            let cw = metric(chars[end]);
+            if w_acc + cw > max_px && w_acc > 0.0 {
+                break;
+            }
+            w_acc += cw;
+            end += 1;
+        }
+        if end == idx {
+            end = (idx + 1).min(chars.len());
+        }
+        if end < chars.len() {
+            // Prefer breaking right after a natural separator (`_`, `/`, `-`, `.`, …)
+            // in the second half of the chunk so extensions like `.zip` do not split
+            // into `.zi\np`.
+            let min_split = idx + ((end - idx) / 2).max(1);
+            if let Some(pos) = (min_split..end).rev().find(|&k| is_token_break(chars[k])) {
+                let break_at = if chars[pos] == '.' && end - pos <= 5 {
+                    pos
+                } else {
+                    pos + 1
+                };
+                if break_at > idx {
+                    end = break_at;
+                }
             }
         }
-        out.push(ch);
-        *line_w += w;
+        for &ch in &chars[idx..end] {
+            if *line_w == 0.0 && ch == ' ' {
+                continue;
+            }
+            out.push(ch);
+            *line_w += metric(ch);
+        }
+        idx = end;
+        if idx < chars.len() {
+            out.push('\n');
+            *line_w = 0.0;
+        }
     }
 }
 
 /// Definite width of a wrapped string, capped at [`BUBBLE_INNER`].
 #[must_use]
+#[allow(dead_code)]
 pub fn text_box_w(wrapped: &str) -> f32 {
     let mut max = 24.0_f32;
     for line in wrapped.lines() {
@@ -1315,19 +1612,42 @@ pub fn clock_below_card(kind: MsgKind) -> bool {
     )
 }
 
+/// True when `text` is a raw mobile/local file URI (e.g. Android
+/// `content://media/external/images/media/17201`) that Zalo sometimes puts in
+/// photo `title` instead of a user caption.
+#[must_use]
+pub fn is_local_media_uri(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    lower.starts_with("content://")
+        || lower.starts_with("file://")
+        || lower.starts_with("/storage/")
+        || lower.starts_with("/data/")
+        || lower.starts_with("/sdcard/")
+}
+
 /// True when the body is only a media marker (do not also paint it as text).
 #[must_use]
 pub fn hide_marker_text(kind: MsgKind, text: &str) -> bool {
     let t = text.trim();
     match kind {
-        MsgKind::Photo => t == "[Hình ảnh]" || t.is_empty(),
-        MsgKind::Sticker => t == "[Sticker]",
-        MsgKind::Gif => t == "[GIF]",
+        MsgKind::Photo => {
+            t == "[Hình ảnh]" || t == "[chat.photo]" || t.is_empty() || is_local_media_uri(t)
+        }
+        MsgKind::Sticker => t == "[Sticker]" || t == "[chat.sticker]" || t.is_empty(),
+        MsgKind::Gif => {
+            t == "[GIF]" || t == "[chat.gif]" || t.is_empty() || is_local_media_uri(t)
+        }
         MsgKind::File => t.starts_with("[File]"),
-        MsgKind::Voice => t == "[Tin nhắn thoại]" || t == "[Voice]",
-        MsgKind::Video => t == "[Video]",
+        MsgKind::Voice => t == "[Tin nhắn thoại]" || t == "[Voice]" || t == "[chat.voice]",
+        MsgKind::Video => t == "[Video]" || t == "[chat.video.msg]" || is_local_media_uri(t),
         MsgKind::Poll => true,
-        MsgKind::Doodle => t == "[Vẽ hình]" || t == "[Hình vẽ]" || t.is_empty(),
+        MsgKind::Doodle => {
+            t == "[Vẽ hình]"
+                || t == "[Hình vẽ]"
+                || t == "[chat.doodle]"
+                || t.is_empty()
+                || is_local_media_uri(t)
+        }
         MsgKind::Location | MsgKind::Ecard => true,
         MsgKind::Call | MsgKind::MissedCall | MsgKind::Card | MsgKind::Link => true,
         MsgKind::Text => false,
@@ -1365,6 +1685,28 @@ mod tests {
             "note {note_first} bubble {bubble_first}"
         );
         assert_eq!(wrap_ui_note("Không ảnh nền", 200.0), "Không ảnh nền");
+    }
+
+    #[test]
+    fn vietnamese_bubble_does_not_wrap_prematurely() {
+        let login_msg = "Đăng nhập Zalo trên máy tính thành công";
+        let wrapped = wrap_bubble_text(login_msg, BUBBLE_INNER);
+        assert_eq!(
+            wrapped, login_msg,
+            "Vietnamese text fitting in BUBBLE_INNER must stay on one line"
+        );
+        let guard_msg = "Cùng Zalo bảo vệ tài khoản của bạn";
+        assert_eq!(wrap_bubble_text(guard_msg, BUBBLE_INNER), guard_msg);
+        assert!(cache_path_for("http://cdn.example/a.jpg").is_some());
+        assert!(cache_path_for("https://cdn.example/a.jpg").is_some());
+
+        // Sync 2 server quote + poll metadata.
+        let synced_quote = r#"{"msgType":"webchat","content":"ok","quote":{"fromD":"Trường","msg":"hello","globalMsgId":"42","cliMsgId":"99"}}"#;
+        let qm = classify("ok", Some(synced_quote));
+        assert_eq!(qm.quote_sender, "Trường");
+        assert_eq!(qm.quote_text, "hello");
+        assert_eq!(qm.quote_global_id, Some(42));
+        assert_eq!(qm.quote_cli_id, Some(99));
     }
 
     #[test]
@@ -1488,11 +1830,11 @@ mod tests {
     }
 
     #[test]
-    fn photo_url_prefers_thumb_and_group_call_is_call() {
-        let json = r#"{"kind":"photo","thumb":"https://t.example/a.jpg","hd":"https://b.example/a.jpg","width":10,"height":10,"local":null}"#;
+    fn photo_url_prefers_hd_over_thumb_and_group_call_is_call() {
+        let json = r#"{"kind":"photo","thumb":"https://t.example/thumb/a.jpg","hd":"https://b.example/full/a.jpg","width":10,"height":10,"local":null}"#;
         assert_eq!(
             classify("[Hình ảnh]", Some(json)).url,
-            "https://t.example/a.jpg"
+            "https://b.example/full/a.jpg"
         );
         let json = r#"{"kind":"gif","thumb":"","hd":"https://g.example/a.gif","width":10,"height":10,"local":null}"#;
         assert_eq!(classify("[GIF]", Some(json)).url, "https://g.example/a.gif");
@@ -1514,6 +1856,34 @@ mod tests {
         assert_eq!(call.kind, MsgKind::Call);
         assert_eq!(call.title, "Cuộc gọi nhóm");
         assert!(hide_marker_text(call.kind, "sendGroupCallMessage"));
+        assert_eq!(classify("Cuộc gọi đi", None).kind, MsgKind::Call);
+        assert_eq!(classify("Cuộc gọi nhỡ", None).kind, MsgKind::MissedCall);
+        // When `content.href` mirrors `content.thumb`, Sync 2 must pick `params.hd`
+        // (full-res uncropped) instead of the blurry cropped `thumb`.
+        let synced_photo = r#"{"msgType":"chat.photo","content":{"thumb":"https://t.example/thumb/a.jpg","href":"https://t.example/thumb/a.jpg","params":"{\"width\":1544,\"height\":910,\"hd\":\"https://photo.example/a.jxl\"}"}}"#;
+        let photo = classify("[Hình ảnh]", Some(synced_photo));
+        assert_eq!(photo.kind, MsgKind::Photo);
+        assert_eq!(photo.url, "https://photo.example/a.jxl");
+        assert_eq!(photo.width, 1544);
+        assert!(hide_marker_text(
+            MsgKind::Photo,
+            "content://media/external/images/media/17201"
+        ));
+        let wrapped_file = wrap_text_at(
+            "Google_AI_Ultra_Pro_Super_Long_Package_Archive.zip",
+            270.0,
+            14.0,
+            true,
+        );
+        assert!(
+            !wrapped_file.ends_with("\np"),
+            "extension must not orphan last char: {wrapped_file}"
+        );
+        let synced_call = r#"{"msgType":"chat.recommended","content":{"action":"recommened.calltime","title":"sendBubbleMessage","params":"{\"isCaller\":1,\"duration\":12}"}}"#;
+        assert_eq!(
+            classify("Cuộc gọi đến", Some(synced_call)).kind,
+            MsgKind::Call
+        );
     }
 
     #[test]

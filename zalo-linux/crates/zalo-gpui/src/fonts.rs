@@ -242,6 +242,8 @@ fn font_dirs() -> Vec<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             dirs.push(parent.join("fonts"));
+            #[cfg(target_os = "macos")]
+            dirs.push(parent.join("../Resources/zalo-rust/fonts"));
         }
     }
     dirs.push(PathBuf::from("/usr/share/zalo-rust/fonts"));

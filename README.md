@@ -124,7 +124,7 @@ Zalo-Rust/
 ├── docs/              # Architecture, sync/backup design notes & UI showcase mockups
 ├── zalo-linux/        # Linux platform crates + .deb / .rpm / Arch / AppImage / Flatpak packaging
 ├── zalo-windows/      # Target directory for Windows port (Win32/DirectX GPUI, WASAPI, DXGI)
-└── zalo-macos/        # Target directory for macOS port (Cocoa/Metal GPUI, CoreAudio, AVFoundation)
+└── zalo-macos/        # macOS menu bar, CoreAudio call bridge, and .app packaging
 ```
 
 ### Workspace Crates
@@ -145,7 +145,10 @@ Zalo-Rust/
 | `zalo-linux/` | `zalo-shell` | Linux (`zbus`, `x11rb`) | System tray (SNI/DBusMenu/XEmbed), freedesktop notifications, single-instance IPC, XDG portals |
 | `zalo-linux/` | `zcall-audio` | Linux (PulseAudio/PipeWire) | Call audio capture & playout |
 | `zalo-linux/` | `zcall-engine` | Linux (V4L2) | Native call media engine (`zcall-native`) bridging `zcall-core` |
-| `zalo-linux/` | `zalo-gpui` | Linux (GPUI, Wayland + X11) | Native GPU-accelerated desktop client (`zalo-gpui`) |
+| `zalo-linux/` | `zalo-gpui` | Linux + macOS (GPUI) | Native GPU desktop client. Linux uses X11/Wayland; macOS uses the Cocoa/Metal GPUI backend |
+| `zalo-macos/` | `zalo-shell-mac` | macOS | Menu bar (`NSStatusItem`), Dock badge, notifications, file panels, LaunchAgent |
+| `zalo-macos/` | `zcall-audio-mac` | macOS (CoreAudio) | Call and media playback through CoreAudio |
+| `zalo-macos/` | `zcall-engine-mac` | macOS | Opus call bridge on top of CoreAudio |
 
 ## Build from Source
 
@@ -168,9 +171,6 @@ sudo apt-get install -y --no-install-recommends \
 # Build universal release binary (Wayland + X11 + SNI/XEmbed tray)
 cargo build --release -p zalo-gpui
 
-# Optional: minimal pure-Wayland build (omits X11 XEmbed tray fallback)
-cargo build --release -p zalo-gpui --no-default-features
-
 # Run the full workspace test suite (single-threaded for V4L2 device tests)
 cargo test --workspace -- --test-threads=1
 
@@ -183,6 +183,19 @@ To build a local `.deb` package:
 ```bash
 bash zalo-linux/packaging/deb/build-deb.sh
 ```
+
+### macOS
+
+On a Mac with Xcode command-line tools, CMake, and NASM:
+
+```bash
+brew install cmake nasm pkg-config
+cargo build --release -p zalo-gpui
+# .app bundle + zip (ad-hoc signed, not notarized)
+VERSION=0.1.0 bash zalo-macos/packaging/build-app.sh
+```
+
+Camera and screen share use `ffmpeg` (`brew install ffmpeg`) and need Camera / Screen Recording permission. Details are in [zalo-macos/README.md](zalo-macos/README.md).
 
 ## CLI & Runtime Configuration
 

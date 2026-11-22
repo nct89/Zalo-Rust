@@ -602,6 +602,14 @@ impl EngineCore {
             }
             return;
         }
+        if c.call_type != 3 && cam == 1 && c.state == "connected" {
+            c.call_type = 3;
+            self.emit(json!({
+                "type": "sendSignal",
+                "command": 12056,
+                "data": {"callId": c.call_id, "calleeId": c.peer_id, "status": 1},
+            }));
+        }
         self.emit(json!({
             "type": "sendSignal",
             "command": 12006,
@@ -818,6 +826,24 @@ impl EngineCore {
                 }));
                 self.call = Some(c);
             }
+            "requestaudio2video" | "audio2video" => {
+                let Some(mut c) = self.call.clone() else {
+                    return;
+                };
+                if let Some(id) = call_id_field(&d) {
+                    if id != c.call_id {
+                        return;
+                    }
+                }
+                c.call_type = 3;
+                c.peer_cam_off = false;
+                self.ui.peer(&json!({
+                    "camOff": c.peer_cam_off,
+                    "muted": c.peer_muted,
+                    "sharing": c.peer_sharing,
+                }));
+                self.call = Some(c);
+            }
             _ => {}
         }
     }
@@ -839,7 +865,7 @@ impl EngineCore {
             self._group_share_answered(data);
             return;
         }
-        if cmd == "12064" {
+        if cmd == "12064" || cmd == "12056" {
             return;
         }
         if cmd != "401" || c.state != "calling" || c.group {
@@ -3581,5 +3607,25 @@ mod tests {
         ));
         let end_frame = sent(&h.engine.frames, 406).pop().expect("406 finish");
         assert_eq!(end_frame["data"]["status"], 160);
+    }
+
+    #[test]
+    fn turning_camera_on_in_voice_call_emits_audio_to_video_upgrade_12056() {
+        let mut h = setup();
+        ring(&mut h.engine, CALL_ID);
+        h.engine.answer(false);
+        assert_ne!(h.engine.call.as_ref().unwrap().call_type, 3);
+        assert!(sent(&h.engine.frames, 12056).is_empty());
+
+        h.engine._cam_mic(Some(true));
+        let upgrades = sent(&h.engine.frames, 12056);
+        assert_eq!(upgrades.len(), 1);
+        assert_eq!(upgrades[0]["data"]["status"], 1);
+        assert_eq!(h.engine.call.as_ref().unwrap().call_type, 3);
+
+        // Subsequent toggle off/on does not re-emit 12056 once upgraded.
+        h.engine._cam_mic(Some(false));
+        h.engine._cam_mic(Some(true));
+        assert_eq!(sent(&h.engine.frames, 12056).len(), 1);
     }
 }

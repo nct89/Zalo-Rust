@@ -2579,13 +2579,30 @@ impl ShellView {
             .when(selecting.is_some(), |el| el.pl(px(40.)))
             .when(msg.from_me, |el| el.justify_end().pl(px(88.)))
             .when(!msg.from_me, |el| {
+                let fallback_user = str_vi("STR_ZALO_USER", "Người dùng Zalo");
+                let avatar_photo = self
+                    .shown_photo(&msg.sender_uid)
+                    .or_else(|| (!is_group).then(|| self.shown_photo(&msg.thread_id)).flatten());
+                let avatar_uid = if !is_group
+                    && (msg.sender_uid.is_empty() || self.shown_photo(&msg.sender_uid).is_none())
+                {
+                    msg.thread_id.as_str()
+                } else {
+                    msg.sender_uid.as_str()
+                };
+                let avatar_name = if !is_group
+                    && (msg.sender.trim().is_empty() || msg.sender.trim() == fallback_user)
+                {
+                    self.conv(msg.conv)
+                        .map(|c| c.name.as_str())
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or(msg.sender.as_str())
+                } else {
+                    msg.sender.as_str()
+                };
                 el.justify_start().pr(px(48.)).child(
                     div().flex_none().w(px(40.)).mr(px(10.)).when(first, |el| {
-                        el.child(small_avatar(
-                            &msg.sender,
-                            &msg.sender_uid,
-                            self.shown_photo(&msg.sender_uid),
-                        ))
+                        el.child(small_avatar(avatar_name, avatar_uid, avatar_photo))
                     }),
                 )
             })
@@ -4312,11 +4329,14 @@ impl ShellView {
                 div()
                     .px(px(8.))
                     .py(px(6.))
-                    .max_w(px(MAX_W))
-                    .text_size(px(14.))
-                    .line_height(px(20.))
-                    .text_color(rgb(ink))
-                    .child(caption),
+                    .child(render_wrapped_lines(
+                        &caption,
+                        MAX_W - 16.0,
+                        14.0,
+                        20.0,
+                        ink,
+                        false,
+                    )),
             );
         }
         col.into_any_element()
@@ -4370,11 +4390,27 @@ impl ShellView {
         }
         match msg.kind {
             MsgKind::Photo | MsgKind::Gif | MsgKind::Doodle => {
-                let (w, h) = media::photo_size(msg.media_w, msg.media_h);
-                let mut col = div().flex().flex_col().gap(px(6.)).w(px(w));
+                let (bw, bh) = self
+                    .media_bitmaps
+                    .get(&msg.id)
+                    .map(|image| {
+                        let s = image.size(0);
+                        (s.width.0.max(0) as u32, s.height.0.max(0) as u32)
+                    })
+                    .filter(|&(w, h)| w > 0 && h > 0)
+                    .unwrap_or((msg.media_w, msg.media_h));
+                let (w, h) = media::photo_size(bw, bh);
+                let has_caption = !media::hide_marker_text(msg.kind, &msg.text);
+                let col_w = if has_caption { w.max(220.0) } else { w };
+                let mut col = div().flex().flex_col().gap(px(6.)).w(px(col_w));
                 col = col.child(self.photo_block(msg, w, h, field, cx));
-                if !media::hide_marker_text(msg.kind, &msg.text) {
-                    col = col.child(wrapped_text(&msg.text, ink));
+                if has_caption {
+                    col = col.child(
+                        div()
+                            .px(px(8.))
+                            .pb(px(6.))
+                            .child(wrapped_text_max(&msg.text, ink, (col_w - 16.0).max(160.0))),
+                    );
                 }
                 col.into_any_element()
             }
@@ -4599,13 +4635,9 @@ impl ShellView {
                                 .flex_col()
                                 .w(px(300.))
                                 .gap(px(6.))
-                                .child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .line_height(px(20.))
-                                        .text_color(rgb(blue))
-                                        .child(media::wrap_bubble_text(&msg.href, 290.)),
-                                )
+                                .child(render_wrapped_lines(
+                                    &msg.href, 296., 14., 20., blue, false,
+                                ))
                                 .child(
                                     div()
                                         .flex()
@@ -4632,33 +4664,29 @@ impl ShellView {
                                                 .flex_col()
                                                 .gap(px(4.))
                                                 .p(px(10.))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(14.))
-                                                        .line_height(px(20.))
-                                                        .font_family(fonts::FAMILY_SEMIBOLD)
-                                                        .text_color(rgb(ink))
-                                                        .child(media::wrap_bubble_text(
-                                                            &display_title,
-                                                            270.,
-                                                        )),
-                                                )
+                                                .child(render_wrapped_lines(
+                                                    &display_title,
+                                                    278.,
+                                                    14.,
+                                                    20.,
+                                                    ink,
+                                                    true,
+                                                ))
                                                 .when(!desc_is_dup, |el| {
-                                                    el.child(
-                                                        div()
-                                                            .text_size(px(13.))
-                                                            .line_height(px(18.))
-                                                            .text_color(rgb(muted))
-                                                            .child(media::wrap_bubble_text(
-                                                                &clip_chars(&p.desc, 110),
-                                                                270.,
-                                                            )),
-                                                    )
+                                                    el.child(render_wrapped_lines(
+                                                        &clip_chars(&p.desc, 110),
+                                                        278.,
+                                                        13.,
+                                                        18.,
+                                                        muted,
+                                                        false,
+                                                    ))
                                                 })
                                                 .child(
                                                     div()
                                                         .text_size(px(13.))
                                                         .text_color(rgb(blue))
+                                                        .truncate()
                                                         .child(if p.src.is_empty() {
                                                             host.clone()
                                                         } else {
@@ -4995,7 +5023,7 @@ impl ShellView {
             .flex()
             .flex_col()
             .gap(px(6.))
-            .max_w(px(300.))
+            .max_w(px(media::BUBBLE_INNER))
             .child(bubble_text(&msg.text, ink))
             .child(
                 div()
@@ -5130,14 +5158,9 @@ impl ShellView {
                     .child(shown),
             )
             .when(!caption.is_empty(), |el| {
-                el.child(
-                    div()
-                        .mt(px(2.))
-                        .text_size(px(14.))
-                        .line_height(px(20.))
-                        .text_color(rgb(muted))
-                        .child(caption),
-                )
+                el.child(div().mt(px(2.)).child(render_wrapped_lines(
+                    &caption, 220., 14., 20., muted, false,
+                )))
             })
             .into_any_element()
     }
@@ -5177,14 +5200,7 @@ impl ShellView {
             .w(px(308.))
             .max_w(px(308.))
             .gap(px(6.))
-            .child(
-                div()
-                    .text_size(px(15.))
-                    .line_height(px(22.))
-                    .font_family(FAMILY_SEMIBOLD)
-                    .text_color(rgb(ink))
-                    .child(media::wrap_bubble_text(&question, 292.)),
-            );
+            .child(render_wrapped_lines(&question, 296., 15., 22., ink, true));
         if closed {
             col = col.child(
                 div()
@@ -5430,6 +5446,20 @@ fn bubble_font() -> Font {
     }
 }
 
+fn bubble_semibold_font() -> Font {
+    Font {
+        family: FAMILY_SEMIBOLD.into(),
+        features: FontFeatures::default(),
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Noto Color Emoji".into(),
+            "Noto Emoji".into(),
+            "Segoe UI Emoji".into(),
+        ])),
+        weight: FontWeight::SEMIBOLD,
+        style: FontStyle::Normal,
+    }
+}
+
 fn bubble_text(text: &str, color: u32) -> gpui::AnyElement {
     use crate::emoji::PictogramPart;
     let parts = crate::emoji::split_pictograms(text);
@@ -5444,57 +5474,137 @@ fn bubble_text(text: &str, color: u32) -> gpui::AnyElement {
 
 fn pictogram_parts(parts: Vec<crate::emoji::PictogramPart>, color: u32) -> gpui::AnyElement {
     use crate::emoji::PictogramPart;
+    // Group into explicit newline-separated rows; within each row paint each
+    // word as `whitespace_nowrap()` so GPUI 0.2.2 never splits Vietnamese words
+    // on diacritics while still letting inline emoji tiles flow naturally.
+    let mut rows: Vec<Vec<gpui::AnyElement>> = vec![Vec::new()];
+    let mut elem_idx: u64 = 0;
+    for part in parts {
+        match part {
+            PictogramPart::Text(run) => {
+                for (li, seg) in run.split('\n').enumerate() {
+                    if li > 0 {
+                        rows.push(Vec::new());
+                    }
+                    for word in seg.split_inclusive(' ') {
+                        let wrapped = media::wrap_bubble_text(word, media::BUBBLE_INNER);
+                        for (wi, chunk) in wrapped.split('\n').enumerate() {
+                            if wi > 0 {
+                                rows.push(Vec::new());
+                            }
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            elem_idx += 1;
+                            rows.last_mut().unwrap().push(
+                                div()
+                                    .id(("emo-run", elem_idx))
+                                    .whitespace_nowrap()
+                                    .min_h(px(22.))
+                                    .child(chunk.to_owned())
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
+            }
+            PictogramPart::Tile(item) => {
+                elem_idx += 1;
+                rows.last_mut().unwrap().push(
+                    div()
+                        .id(("emo-tile", elem_idx))
+                        .flex_none()
+                        .mr(px(2.))
+                        .child(
+                            img(item.path.clone())
+                                .size(px(20.))
+                                .object_fit(ObjectFit::Contain),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+    }
     div()
         .max_w(px(media::BUBBLE_INNER))
         .min_w(px(0.))
         .flex()
-        .flex_row()
-        .flex_wrap()
-        .items_end()
-        .gap(px(2.))
+        .flex_col()
         .text_size(px(15.))
         .line_height(px(22.))
         .text_color(rgb(color))
         .font(bubble_font())
-        .children(parts.into_iter().enumerate().map(|(i, part)| match part {
-            PictogramPart::Text(run) => div()
-                .id(("emo-run", i as u64))
-                .whitespace_normal()
-                .child(media::wrap_bubble_text(&run, media::BUBBLE_INNER))
-                .into_any_element(),
-            PictogramPart::Tile(item) => div()
-                .id(("emo-tile", i as u64))
-                .child(
-                    img(item.path.clone())
-                        .size(px(20.))
-                        .object_fit(ObjectFit::Contain),
-                )
-                .into_any_element(),
+        .children(rows.into_iter().map(|items| {
+            if items.is_empty() {
+                div().h(px(22.)).into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_end()
+                    .max_w(px(media::BUBBLE_INNER))
+                    .min_w(px(0.))
+                    .children(items)
+                    .into_any_element()
+            }
+        }))
+        .into_any_element()
+}
+
+fn render_wrapped_lines(
+    text: &str,
+    max_w: f32,
+    font_px: f32,
+    line_h: f32,
+    color: u32,
+    semibold: bool,
+) -> gpui::AnyElement {
+    let wrapped = media::wrap_text_at(text, max_w, font_px, semibold);
+    let lines: Vec<String> = wrapped.split('\n').map(str::to_owned).collect();
+    div()
+        .flex()
+        .flex_col()
+        .max_w(px(max_w))
+        .min_w(px(0.))
+        .text_size(px(font_px))
+        .line_height(px(line_h))
+        .text_color(rgb(color))
+        .font(if semibold {
+            bubble_semibold_font()
+        } else {
+            bubble_font()
+        })
+        .children(lines.into_iter().map(move |line| {
+            if line.is_empty() {
+                div().h(px(line_h)).into_any_element()
+            } else {
+                div()
+                    .whitespace_nowrap()
+                    .min_h(px(line_h))
+                    .child(line)
+                    .into_any_element()
+            }
         }))
         .into_any_element()
 }
 
 fn wrapped_text(text: &str, color: u32) -> gpui::AnyElement {
+    wrapped_text_max(text, color, media::BUBBLE_INNER)
+}
+
+fn wrapped_text_max(text: &str, color: u32, max_w: f32) -> gpui::AnyElement {
     // `.text-message__container span-15`: 15 px / 22 px; a bare link is
-    // `a.text-is-link` `#0068ff`.
-    let wrapped = media::wrap_bubble_text(text, media::BUBBLE_INNER);
-    let width = media::text_box_w(&wrapped);
+    // `a.text-is-link` `#0068ff`. Pre-wrap with proportional Latin+Vietnamese
+    // widths and paint each line with `whitespace_nowrap()` so GPUI 0.2.2
+    // neither breaks Vietnamese words on diacritics nor inflates bubble width.
     let is_link = media::first_link(text).is_some_and(|u| text.trim() == u);
-    div()
-        .w(px(width))
-        .max_w(px(media::BUBBLE_INNER))
-        .min_w(px(0.))
-        .whitespace_normal()
-        .text_size(px(15.))
-        .line_height(px(22.))
-        .text_color(rgb(if is_link {
-            token_rgb("--B55", "#0068ff")
-        } else {
-            color
-        }))
-        .font(bubble_font())
-        .child(wrapped)
-        .into_any_element()
+    let color = if is_link {
+        token_rgb("--B55", "#0068ff")
+    } else {
+        color
+    };
+    render_wrapped_lines(text, max_w, 15.0, 22.0, color, false)
 }
 
 /// Electron `.fl-th-txt`: 374×195, radius 4, above the file row.

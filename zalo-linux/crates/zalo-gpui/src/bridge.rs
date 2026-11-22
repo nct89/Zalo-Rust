@@ -585,6 +585,22 @@ pub(crate) fn clear_login_cache() {
     }
 }
 
+static PENDING_LOGOUT: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Waits for an in-flight `/api/v2/login/logOut` request (if any) to complete
+/// before a newly opened QR login requests a fresh ticket for the same device
+/// IMEI. Returns `true` when a pending logout was actually waited on.
+pub(crate) fn wait_pending_logout() -> bool {
+    let handle = PENDING_LOGOUT.lock().ok().and_then(|mut slot| slot.take());
+    if let Some(handle) = handle {
+        let _ = handle.join();
+        true
+    } else {
+        false
+    }
+}
+
 /// Fires `/api/v2/login/logOut` on a background thread using an in-memory
 /// `(Device, StoredSession)` snapshot captured *before* `session.json` is wiped
 /// from disk, avoiding the race where `wipe_session_file` wins before the worker
@@ -592,16 +608,16 @@ pub(crate) fn clear_login_cache() {
 pub(crate) fn spawn_logout_snapshot(
     device: Device,
     session: StoredSession,
-    dir: PathBuf,
+    _dir: PathBuf,
 ) {
     clear_login_cache();
     if cfg!(test) {
         return;
     }
-    let _ = std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("zalo-gpui-logout".into())
         .spawn(move || {
-            let Ok(mut api) = ZaloApi::from_session(device, &session) else {
+            let Ok(api) = ZaloApi::from_session(device, &session) else {
                 return;
             };
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
@@ -610,16 +626,21 @@ pub(crate) fn spawn_logout_snapshot(
             else {
                 return;
             };
-            let _ = rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                async {
-                    if let Some(sek) = session.zpw_sek() {
-                        let _ = ensure_service_hosts(&mut api, &dir, &sek, false).await;
-                    }
-                    let _ = api.logout().await;
-                },
-            ));
-        });
+            // `tokio::time::timeout` must be constructed *inside* the Tokio
+            // runtime context; evaluating it as an argument to `rt.block_on`
+            // panics with "there is no reactor running".
+            rt.block_on(async {
+                match tokio::time::timeout(std::time::Duration::from_secs(4), api.logout()).await {
+                    Ok(Ok(_)) => eprintln!("zalo-gpui logout: server logOut ok"),
+                    Ok(Err(err)) => eprintln!("zalo-gpui logout: server logOut err: {err}"),
+                    Err(_) => eprintln!("zalo-gpui logout: server logOut timed out"),
+                }
+            });
+        })
+        .ok();
+    if let Ok(mut slot) = PENDING_LOGOUT.lock() {
+        *slot = handle;
+    }
 }
 
 fn cached_login_info(dir: &std::path::Path, sek: &str) -> Option<zalo_client::LoginInfo> {
@@ -628,7 +649,7 @@ fn cached_login_info(dir: &std::path::Path, sek: &str) -> Option<zalo_client::Lo
     (cached.dir == dir && cached.sek == sek).then(|| cached.info.clone())
 }
 
-async fn ensure_service_hosts(
+pub(crate) async fn ensure_service_hosts(
     api: &mut ZaloApi,
     dir: &std::path::Path,
     sek: &str,

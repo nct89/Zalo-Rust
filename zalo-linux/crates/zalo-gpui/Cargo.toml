@@ -18,7 +18,9 @@ all = "warn"
 
 [features]
 default = ["tray-xembed"]
-tray-xembed = ["zalo-shell/tray-xembed"]
+# Kept so `cargo build -p zalo-gpui --features tray-xembed` stays valid.
+# XEmbed itself is a default feature of the Linux `zalo-shell` crate.
+tray-xembed = []
 
 [lib]
 name = "zalo_gpui"
@@ -37,7 +39,6 @@ zalo-protocol = { workspace = true }
 zalo-storage = { workspace = true }
 zalo-sync = { workspace = true }
 zalo-backup = { workspace = true }
-zalo-shell = { path = "../zalo-shell" }
 qrcode = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 serde.workspace = true
@@ -49,13 +50,10 @@ md-5 = { workspace = true }
 zjxl = { workspace = true }
 zimage = { workspace = true }
 zcall-core = { workspace = true }
-zcall-audio = { path = "../zcall-audio" }
-zcall-engine = { path = "../zcall-engine" }
 zocr = { workspace = true }
 openh264 = "0.8"
 libc = "0.2"
 raw-window-handle = "0.6"
-x11rb = { version = "0.13.2", features = ["shape", "randr"] }
 reqwest = { workspace = true }
 sha2 = "0.10"
 hex = { workspace = true }
@@ -65,3 +63,14 @@ base64 = { workspace = true }
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "ogg", "vorbis", "isomp4", "pcm", "wav", "adpcm"] }
 rusty_mp3 = "1.1"
 mp4 = "0.14"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+zalo-shell = { path = "../zalo-shell" }
+zcall-audio = { path = "../zcall-audio" }
+zcall-engine = { path = "../zcall-engine" }
+x11rb = { version = "0.13.2", features = ["shape", "randr"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+zalo-shell-mac = { path = "../../../zalo-macos/crates/zalo-shell" }
+zcall-audio-mac = { path = "../../../zalo-macos/crates/zcall-audio" }
+zcall-engine-mac = { path = "../../../zalo-macos/crates/zcall-engine" }

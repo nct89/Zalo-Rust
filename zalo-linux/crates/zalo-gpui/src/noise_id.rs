@@ -96,27 +96,29 @@ pub async fn resolve_pc_to_global(
 /// Resolves cross-platform global noise IDs back to PC IDs (`"<uid>"` for 1-1, `"g_<grid>"` for groups).
 ///
 /// 1. Uses reverse lookup in `Profiles` (`profile.global_id -> pc_id`).
-/// 2. Falls back to `GET /api/gid/decrypt` for uncached 1-1 global IDs (2 retries, 300ms delay).
+/// 2. For uncached groups, fetches `get_group_list` + `get_multi_group_info` to map `gridInfoMap[grid].globalId -> g_<grid>`.
+/// 3. For uncached 1-1 users, checks `get_friends` if profiles lack `global_id`, then falls back to `GET /api/gid/decrypt` (2 retries, 300ms delay).
 pub async fn resolve_global_to_pc(
     api: &ZaloApi,
     profiles: &Profiles,
     global_ids: &[(String, bool)], // (global_id, is_group)
 ) -> HashMap<String, String> {
-    let mut rev_users: HashMap<&str, &str> = HashMap::new();
-    let mut rev_groups: HashMap<&str, &str> = HashMap::new();
+    let mut rev_users: HashMap<String, String> = HashMap::new();
+    let mut rev_groups: HashMap<String, String> = HashMap::new();
     for (pc_id, prof) in &profiles.map {
         if prof.global_id.is_empty() {
             continue;
         }
         if pc_id.starts_with("g_") {
-            rev_groups.insert(prof.global_id.as_str(), pc_id.as_str());
+            rev_groups.insert(prof.global_id.clone(), pc_id.clone());
         } else if pc_id != crate::profiles::ME {
-            rev_users.insert(prof.global_id.as_str(), pc_id.as_str());
+            rev_users.insert(prof.global_id.clone(), pc_id.clone());
         }
     }
 
     let mut out: HashMap<String, String> = HashMap::new();
     let mut missing_users: Vec<String> = Vec::new();
+    let mut missing_groups: Vec<String> = Vec::new();
     let mut seen: HashSet<&str> = HashSet::new();
 
     for (gid, is_group) in global_ids {
@@ -125,14 +127,70 @@ pub async fn resolve_global_to_pc(
             continue;
         }
         if *is_group {
-            if let Some(&pc) = rev_groups.get(g) {
-                out.insert(g.to_owned(), pc.to_owned());
+            if let Some(pc) = rev_groups.get(g) {
+                out.insert(g.to_owned(), pc.clone());
+            } else {
+                missing_groups.push(g.to_owned());
             }
-        } else if let Some(&pc) = rev_users.get(g) {
-            out.insert(g.to_owned(), pc.to_owned());
+        } else if let Some(pc) = rev_users.get(g) {
+            out.insert(g.to_owned(), pc.clone());
+        } else if profiles.map.contains_key(g) {
+            out.insert(g.to_owned(), g.to_owned());
         } else {
             missing_users.push(g.to_owned());
         }
+    }
+
+    // Resolve missing group global IDs via `get_group_list` -> `get_multi_group_info`.
+    if !missing_groups.is_empty() {
+        let mut live_groups: HashMap<String, String> = HashMap::new();
+        let mut known_grids: HashSet<String> = HashSet::new();
+        if let Ok(list) = api.get_group_list().await {
+            let ids = crate::profiles::group_ids(&list);
+            for id in &ids {
+                known_grids.insert(id.strip_prefix("g_").unwrap_or(id).to_owned());
+            }
+            for chunk in ids.chunks(BATCH_SIZE) {
+                if let Ok(val) = api.get_multi_group_info(chunk).await {
+                    for (pc_key, prof) in crate::profiles::groups_from(&val) {
+                        if !prof.global_id.is_empty() {
+                            live_groups.insert(prof.global_id, pc_key);
+                        }
+                    }
+                }
+            }
+        }
+        for g in missing_groups {
+            if let Some(pc) = live_groups.get(&g) {
+                out.insert(g, pc.clone());
+            } else {
+                let bare = g.strip_prefix("g_").unwrap_or(&g);
+                if known_grids.contains(bare) || crate::profiles::is_numeric_uid(bare) {
+                    let pc = format!("g_{bare}");
+                    out.insert(g, pc);
+                }
+            }
+        }
+    }
+
+    // If profiles had no friend `global_id`s (e.g. fresh login), fetch `get_friends` once
+    // before calling `/api/gid/decrypt` for the remaining non-friend users.
+    if !missing_users.is_empty() && rev_users.is_empty() {
+        if let Ok(val) = api.get_friends().await {
+            for (uid, prof) in crate::profiles::friends_from(&val) {
+                if !prof.global_id.is_empty() {
+                    rev_users.insert(prof.global_id, uid);
+                }
+            }
+        }
+        missing_users.retain(|g| {
+            if let Some(pc) = rev_users.get(g) {
+                out.insert(g.clone(), pc.clone());
+                false
+            } else {
+                true
+            }
+        });
     }
 
     for chunk in missing_users.chunks(BATCH_SIZE) {
@@ -143,10 +201,14 @@ pub async fn resolve_global_to_pc(
                     fetched = Some(val);
                     break;
                 }
-                Err(_) if attempt < RETRY_COUNT => {
-                    tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                Err(err) => {
+                    if attempt < RETRY_COUNT {
+                        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                    } else {
+                        eprintln!("zalo-gpui noise_id: gid/decrypt failed: {err}");
+                        break;
+                    }
                 }
-                Err(_) => break,
             }
         }
         if let Some(val) = fetched {

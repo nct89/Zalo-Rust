@@ -16,9 +16,9 @@ for f in \
   "Zalo-Segoe-UI-Text.41364bc2c9bcbffced63c4bad472bfa9.ttf" \
   "zalo-font.6835d695d84d61b03bec2efaf8b51c42.ttf"
 do
-  [ -f "$FONTS_SRC/$f" ] && install -Dm644 "$FONTS_SRC/$f" "$DST_DIR/fonts/$f"
+  [ -f "$FONTS_SRC/$f" ] && install -m 644 "$FONTS_SRC/$f" "$DST_DIR/fonts/$f"
 done
 
 for s in zalo_ringtone.mp3 zalo_ringback.mp3 endcall.mp3; do
-  [ -f "$SOUNDS_SRC/$s" ] && install -Dm644 "$SOUNDS_SRC/$s" "$DST_DIR/zcall-sound/$s"
+  [ -f "$SOUNDS_SRC/$s" ] && install -m 644 "$SOUNDS_SRC/$s" "$DST_DIR/zcall-sound/$s"
 done

@@ -1,9 +1,10 @@
-//! Native GPUI shell for the Zalo Linux Rust client.
+//! Native GPUI shell for the Zalo desktop client.
 //!
 //! Toolkit: GPUI 0.2.2 (Zed, Discord Phoenix column). Compact-app React is not
 //! translated; layout comes from `zalo-design` CSS constants and `STR_*`.
 //! Protocol crates keep `unsafe_code = forbid`. This crate allows unsafe
-//! because GPUI macros may emit GPU/window FFI.
+//! because GPUI macros may emit GPU/window FFI. Linux owns the X11 frame,
+//! clipboard, and V4L2 camera; macOS swaps those modules for AppKit paths.
 
 #![allow(unsafe_code)]
 
@@ -15,10 +16,22 @@ mod backup_worker;
 mod board;
 mod bridge;
 mod call;
+#[cfg(not(target_os = "macos"))]
 mod call_camera;
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_camera.rs"]
+mod call_camera;
+#[cfg(not(target_os = "macos"))]
+mod call_screen;
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_screen.rs"]
 mod call_screen;
 mod call_video;
 mod chat;
+#[cfg(not(target_os = "macos"))]
+mod clip;
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_clip.rs"]
 mod clip;
 mod color;
 mod contacts;
@@ -36,6 +49,10 @@ mod line_input;
 mod links;
 mod login;
 mod login_flow;
+#[cfg(any(test, target_os = "macos"))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[path = "platform/macos_media.rs"]
+mod macos_media;
 mod media;
 mod media_store;
 mod noise_id;
@@ -54,6 +71,10 @@ mod rail;
 mod read_sync;
 mod realtime;
 mod calendar;
+#[cfg(not(target_os = "macos"))]
+mod screenshot_ui;
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_shot.rs"]
 mod screenshot_ui;
 mod settings;
 mod shell;
@@ -68,6 +89,10 @@ mod voice;
 mod widgets;
 mod window_frame;
 mod ws_rpc;
+#[cfg(not(target_os = "macos"))]
+mod x11_frame;
+#[cfg(target_os = "macos")]
+#[path = "platform/macos_frame.rs"]
 mod x11_frame;
 
 pub use call::restore_saved_mic_volume;
@@ -363,7 +388,7 @@ fn saved_shell_bounds(_cx: &App) -> (gpui::Size<gpui::Pixels>, bool) {
 /// Center `size` in the first `_NET_WORKAREA` rectangle (the primary
 /// monitor minus the panel). Falls back to the top-left if that rectangle
 /// is missing.
-fn bounds_in_work_area(size: gpui::Size<gpui::Pixels>) -> Bounds<gpui::Pixels> {
+pub(crate) fn bounds_in_work_area(size: gpui::Size<gpui::Pixels>) -> Bounds<gpui::Pixels> {
     let (wx, wy, ww, wh) = crate::notice::work_area(1.0, (0.0, 0.0, 1920.0, 1080.0));
     let w = f32::from(size.width);
     let h = f32::from(size.height);

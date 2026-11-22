@@ -301,6 +301,10 @@ pub struct ShellView {
     /// Group ids already queried via `fetch_missing_groups` this run (prevents
     /// infinite re-fetch loops on left/unavailable groups).
     group_gaps_tried: HashSet<String>,
+    /// User ids already queried via `fetch_missing` (`getprofiles/v2`) this run
+    /// so opening another conversation can still fill its missing senders without
+    /// re-fetching the same unresolvable ids.
+    profile_uids_tried: HashSet<String>,
     /// Daily profile fetch is in flight. Gap fill waits so it is not wiped.
     profiles_fetching: bool,
     /// Also load every friend's avatar (group picker open).
@@ -387,10 +391,7 @@ fn prefs_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    zalo_core::XdgDirs::from_env()
-        .ok()
-        .map(|x| x.config_home().join("zalo-rust"))
-        .filter(|d| d.is_dir())
+    crate::data::config_dir()
 }
 
 /// Full-size photo viewer state.
@@ -478,11 +479,25 @@ pub(crate) struct ShellStartupData {
 
 impl ShellStartupData {
     pub(crate) fn load() -> Self {
+        let snap = data::load_snapshot();
+        let profile_path = if cfg!(test) {
+            None
+        } else {
+            snap.session_dir
+                .as_ref()
+                .map(|d| d.join("profiles.json"))
+                .or_else(crate::profiles::cache_path)
+        };
+        let account_prefs_dir = if cfg!(test) {
+            None
+        } else {
+            snap.session_dir.clone()
+        };
         Self {
-            snap: data::load_snapshot(),
-            profiles: crate::profiles::Profiles::load(crate::profiles::cache_path().as_deref()),
-            prefs: crate::prefs::Prefs::load(prefs_dir()),
+            profiles: crate::profiles::Profiles::load(profile_path.as_deref()),
+            prefs: crate::prefs::Prefs::load_scoped(prefs_dir(), account_prefs_dir),
             link_previews: crate::links::load(crate::links::cache_path().as_deref()),
+            snap,
         }
     }
 }
@@ -735,6 +750,7 @@ impl ShellView {
             avatars_queued: true,
             profile_gaps_started: false,
             group_gaps_tried: HashSet::new(),
+            profile_uids_tried: HashSet::new(),
             profiles_fetching: false,
             avatar_all: false,
             dialog: None,
@@ -786,15 +802,21 @@ impl ShellView {
         }
         // Older caches have no `friend` flag: refresh once so Contacts is real.
         // A group list with members but no `creatorId` cannot put the owner
-        // first in the collage, so refresh once through the same fetch.
+        // first in the collage, and caches without `global_id` cannot resolve
+        // Sync 2 conversations, so refresh once through the same fetch.
         let flagged = this.profiles.map.values().any(|p| p.friend);
         let needs_creator = this
             .profiles
             .map
             .values()
             .any(|p| !p.member_ids.is_empty() && p.creator_id.is_empty());
-        this.profiles_refresh =
-            this.has_session && (this.profiles.stale(data::now_ms()) || !flagged || needs_creator);
+        let needs_global_id = !this.profiles.map.is_empty()
+            && !this.profiles.map.values().any(|p| !p.global_id.is_empty());
+        this.profiles_refresh = this.has_session
+            && (this.profiles.stale(data::now_ms())
+                || !flagged
+                || needs_creator
+                || needs_global_id);
         this.wire_lock_input(cx);
         // A set screen-lock code also locks at start-up (zalo-gui behaviour).
         if !this.prefs.str("lockHash", "").is_empty() {
@@ -922,7 +944,7 @@ impl ShellView {
             .filter(|msg| {
                 let remote_ok = live
                     && auto_dl
-                    && msg.media_url.starts_with("https://")
+                    && crate::media::is_http_url(&msg.media_url)
                     && (msg.file_size == 0 || msg.file_size <= max_auto);
                 matches!(
                     msg.kind,
@@ -947,7 +969,7 @@ impl ShellView {
                 max_edge: match msg.kind {
                     crate::media::MsgKind::Sticker => crate::media::STICKER_SIZE as u32,
                     crate::media::MsgKind::Card => 96,
-                    _ => crate::media::PHOTO_MAX_W as u32,
+                    _ => 480,
                 },
             })
             .collect();
@@ -959,7 +981,7 @@ impl ShellView {
     }
 
     /// Queue thumbnails for the info panel's "Photos/Videos" grid (the newest
-    /// eight photos, which may be older than the loaded message window).
+    /// eight photos/videos, which may be older than the loaded message window).
     pub(crate) fn warm_info_media(&mut self, conv_id: u64) {
         let live = self.session_dir.is_some()
             && self.convs.iter().any(|row| row.id == conv_id && row.live);
@@ -973,11 +995,14 @@ impl ShellView {
                     crate::media::MsgKind::Photo
                         | crate::media::MsgKind::Doodle
                         | crate::media::MsgKind::Gif
+                        | crate::media::MsgKind::Video
                 )
             })
             .take(8)
             .filter(|m| {
-                (m.media_path.is_some() || (live && m.media_url.starts_with("https://")))
+                let has_url = m.media_url.starts_with("https://")
+                    || m.media_url.starts_with("http://");
+                (m.media_path.is_some() || (live && has_url))
                     && !self.media_bitmaps.contains_key(&m.id)
                     && !self.media_pending.contains(&m.id)
             })
@@ -1987,6 +2012,7 @@ impl ShellView {
             }
         }
         if let Some(gid) = m.global_msg_id {
+            let mut upgraded_media = false;
             let id = self.messages.get_mut(&conv_id).and_then(|list| {
                 let row = list.iter_mut().find(|x| x.global_msg_id == Some(gid))?;
                 if m.kind != crate::media::MsgKind::Text && row.kind == crate::media::MsgKind::Text
@@ -1998,6 +2024,9 @@ impl ShellView {
                     }
                     if !m.media_url.is_empty() {
                         row.media_url = m.media_url.clone();
+                        row.media_path = crate::media::cache_path_for(&row.media_url)
+                            .filter(|p| p.is_file());
+                        upgraded_media = true;
                     }
                     if !m.href.is_empty() {
                         row.href = m.href.clone();
@@ -2008,6 +2037,25 @@ impl ShellView {
                     if m.height > 0 {
                         row.media_h = m.height;
                     }
+                } else if row.kind == crate::media::MsgKind::Photo
+                    && m.kind == crate::media::MsgKind::Photo
+                    && !m.media_url.is_empty()
+                    && row.media_url != m.media_url
+                    && !crate::media::is_thumb_photo_url(&m.media_url)
+                {
+                    row.media_url = m.media_url.clone();
+                    row.media_path =
+                        crate::media::cache_path_for(&row.media_url).filter(|p| p.is_file());
+                    if m.width > 0 {
+                        row.media_w = m.width;
+                    }
+                    if m.height > 0 {
+                        row.media_h = m.height;
+                    }
+                    if crate::media::is_local_media_uri(&row.text) {
+                        row.text = m.text.clone();
+                    }
+                    upgraded_media = true;
                 } else if row.kind == crate::media::MsgKind::Text
                     && (m.text == "Tin nhắn đã bị xóa"
                         || m.text == "[Tin nhắn đã tự xóa]"
@@ -2024,6 +2072,15 @@ impl ShellView {
                 Some(row.id)
             });
             if let Some(id) = id {
+                if upgraded_media {
+                    self.media_bitmaps.remove(&id);
+                    self.media_pending.remove(&id);
+                    self.media_failed.remove(&id);
+                    if self.selected == Some(conv_id) {
+                        self.warm_media(conv_id);
+                        self.warm_info_media(conv_id);
+                    }
+                }
                 if m.urgency > 0 {
                     self.urgency_msgs.insert(id, m.urgency);
                 }
@@ -2665,7 +2722,8 @@ impl ShellView {
         self.detached.insert(id);
         let thread = conv.thread_id.clone();
         let outer = crate::window_frame::outer_size(720.0, 640.0);
-        let bounds = gpui::Bounds::centered(None, outer, cx);
+        let bounds = crate::bounds_in_work_area(outer);
+        crate::x11_frame::anticipate_csd_window();
         let _ = cx.open_window(
             gpui::WindowOptions {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
@@ -2754,6 +2812,16 @@ impl ShellView {
         }
     }
 
+    /// Account-scoped `profiles.json` path bound to this shell's `session_dir`.
+    fn profiles_cache_path(&self) -> Option<PathBuf> {
+        if cfg!(test) {
+            return None;
+        }
+        self.session_dir
+            .as_ref()
+            .map(|dir| dir.join("profiles.json"))
+    }
+
     /// Reloads conversations and messages from `LocalStore` (called after Sync 2 persists batches),
     /// preserving the currently selected conversation thread.
     pub(crate) fn reload_from_store(&mut self) {
@@ -2761,12 +2829,22 @@ impl ShellView {
             .selected
             .and_then(|id| self.convs.iter().find(|c| c.id == id))
             .map(|c| c.thread_id.clone());
-        let snap = data::load_snapshot();
+        let prev_msg_count = self
+            .selected
+            .map(|id| self.messages_of(id).len())
+            .unwrap_or(0);
+        let was_at_bottom = self.is_msgs_at_bottom();
+        let snap = self
+            .session_dir
+            .as_deref()
+            .and_then(data::load_snapshot_from_dir)
+            .unwrap_or_else(data::load_snapshot);
         if snap.send2me_id.as_deref().is_some_and(|s| !s.is_empty()) {
             self.send2me_id = snap.send2me_id;
         }
         self.convs = snap.convs;
         self.messages = snap.messages;
+        self.next_msg_id = self.next_msg_id.max(snap.next_msg_id);
         self.ensure_my_documents_conv();
         self.load_conv_flags();
         if let Some(tid) = prev_thread {
@@ -2780,8 +2858,22 @@ impl ShellView {
             self.selected = initial_thread(&self.convs);
         }
         self.apply_profile_aliases();
+        self.msg_list_state.set((None, 0, 0));
+        self.avatar_miss.clear();
+        self.group_gaps_tried.clear();
+        self.profile_uids_tried.clear();
+        self.media_shelf = crate::media_store::Shelf::default();
         self.profile_gaps_started = false;
         self.avatars_queued = true;
+        if let Some(id) = self.selected {
+            self.warm_media(id);
+            if self.info_open {
+                self.warm_info_media(id);
+            }
+            if prev_msg_count == 0 || was_at_bottom {
+                self.scroll_msgs_to_bottom();
+            }
+        }
         if self.has_session && self.profiles.stale(data::now_ms()) {
             self.profiles_refresh = true;
         }
@@ -2861,6 +2953,7 @@ impl ShellView {
         }
         let id = msg.id;
         let mut sender_avatars = std::collections::HashMap::new();
+        let mut initial_thumbs = std::collections::HashMap::new();
         for item in &items {
             let av = if item.from_me {
                 self.avatar_of(crate::profiles::ME)
@@ -2872,6 +2965,9 @@ impl ShellView {
             if let Some(img) = av {
                 sender_avatars.insert(item.id, img);
             }
+            if let Some(thumb) = self.media_bitmaps.get(&item.id).cloned() {
+                initial_thumbs.insert(item.id, thumb);
+            }
         }
         let opened = crate::photo_window::open(
             cx,
@@ -2879,6 +2975,7 @@ impl ShellView {
             items,
             id,
             sender_avatars,
+            initial_thumbs,
             self.download_dir(),
             self.session_dir.clone(),
             start_ocr,
@@ -2942,9 +3039,10 @@ impl ShellView {
                                         .filter(|n| !n.is_empty());
                                 }
                                 view.profiles.merge(p);
-                                if let Some(path) = crate::profiles::cache_path() {
+                                if let Some(path) = view.profiles_cache_path() {
                                     view.profiles.save(&path);
                                 }
+                                view.avatar_miss.clear();
                                 view.apply_profile_aliases();
                                 view.avatars_queued = true;
                                 view.refresh_notice_avatar(cx);
@@ -3117,31 +3215,52 @@ impl ShellView {
             return;
         };
         self.profile_gaps_started = true;
-        let mut want_set: HashSet<&str> = HashSet::with_capacity(512);
+        // Prioritize visible conversations & active-thread senders ahead of
+        // hundreds of offline group members so `.take(80)` never starves them.
+        let mut want: Vec<String> = Vec::with_capacity(256);
+        let mut seen: HashSet<String> = HashSet::with_capacity(256);
+        let mut push_uid = |uid: &str| {
+            let u = uid.trim();
+            if !u.is_empty() && !u.starts_with("g_") && seen.insert(u.to_owned()) {
+                want.push(u.to_owned());
+            }
+        };
+        if let Some(sel_id) = self.selected {
+            if let Some(conv) = self.conv(sel_id) {
+                push_uid(&conv.thread_id);
+            }
+            for msg in self.messages_of(sel_id).iter().rev().take(120) {
+                push_uid(&msg.sender_uid);
+            }
+        }
+        for conv in &self.convs {
+            push_uid(&conv.thread_id);
+        }
         for msgs in self.messages.values() {
-            for msg in msgs {
-                if !msg.sender_uid.is_empty() {
-                    want_set.insert(msg.sender_uid.as_str());
+            for msg in msgs.iter().rev().take(40) {
+                push_uid(&msg.sender_uid);
+            }
+        }
+        for conv in &self.convs {
+            if conv.is_group {
+                for uid in self.group_collage_uids(&conv.thread_id) {
+                    push_uid(&uid);
                 }
             }
         }
         for profile in self.profiles.map.values() {
             for uid in &profile.member_ids {
-                if !uid.is_empty() {
-                    want_set.insert(uid.as_str());
-                }
+                push_uid(uid);
             }
         }
-        for conv in &self.convs {
-            if !conv.thread_id.is_empty() && !conv.thread_id.starts_with("g_") {
-                want_set.insert(conv.thread_id.as_str());
-            }
-        }
-        let want: Vec<String> = want_set.into_iter().map(str::to_owned).collect();
         let missing: Vec<String> = crate::profiles::missing_avatar_uids(&self.profiles, &want)
             .into_iter()
+            .filter(|uid| !self.profile_uids_tried.contains(uid))
             .take(80)
             .collect();
+        for uid in &missing {
+            self.profile_uids_tried.insert(uid.clone());
+        }
         let thread_ids: Vec<String> = self.convs.iter().map(|c| c.thread_id.clone()).collect();
         let groups: Vec<String> = crate::profiles::groups_needing_info(&self.profiles, &thread_ids)
             .into_iter()
@@ -3230,9 +3349,10 @@ impl ShellView {
                 }
                 if changed {
                     view.apply_profile_aliases();
-                    if let Some(path) = crate::profiles::cache_path() {
+                    if let Some(path) = view.profiles_cache_path() {
                         view.profiles.save(&path);
                     }
+                    view.avatar_miss.clear();
                     view.avatars_queued = true;
                     view.refresh_notice_avatar(cx);
                 }
@@ -3247,12 +3367,13 @@ impl ShellView {
                     let _ = this.update(cx, |view, cx| {
                         let mut changed = false;
                         for (uid, got) in map {
-                            let slot = view.profiles.map.entry(uid).or_default();
+                            let slot = view.profiles.map.entry(uid.clone()).or_default();
                             if (got.avatar.starts_with("https://")
                                 || got.avatar.starts_with("http://"))
                                 && !crate::sidebar::is_real_avatar(&slot.avatar)
                             {
                                 slot.avatar = got.avatar;
+                                view.avatar_miss.remove(&uid);
                                 changed = true;
                             }
                             if slot.name.is_empty() && !got.name.is_empty() {
@@ -3262,7 +3383,7 @@ impl ShellView {
                         }
                         if changed {
                             view.apply_profile_aliases();
-                            if let Some(path) = crate::profiles::cache_path() {
+                            if let Some(path) = view.profiles_cache_path() {
                                 view.profiles.save(&path);
                             }
                             view.avatars_queued = true;
@@ -3278,12 +3399,13 @@ impl ShellView {
                 match got {
                     Ok(map) => {
                         for (uid, got) in map {
-                            let slot = view.profiles.map.entry(uid).or_default();
+                            let slot = view.profiles.map.entry(uid.clone()).or_default();
                             if (got.avatar.starts_with("https://")
                                 || got.avatar.starts_with("http://"))
                                 && !crate::sidebar::is_real_avatar(&slot.avatar)
                             {
                                 slot.avatar = got.avatar;
+                                view.avatar_miss.remove(&uid);
                                 changed = true;
                             }
                             if slot.name.is_empty() && !got.name.is_empty() {
@@ -3301,7 +3423,7 @@ impl ShellView {
                 }
                 if changed {
                     view.apply_profile_aliases();
-                    if let Some(path) = crate::profiles::cache_path() {
+                    if let Some(path) = view.profiles_cache_path() {
                         view.profiles.save(&path);
                     }
                     view.avatars_queued = true;
@@ -3894,9 +4016,8 @@ impl ShellView {
             self.msg_search_presets_open = false;
         }
         self.selected = Some(id);
-        if self.convs.iter().any(|c| c.id == id && c.is_group) {
-            self.avatars_queued = true;
-        }
+        self.avatars_queued = true;
+        self.profile_gaps_started = false;
         self.rail = Rail::Chats;
         self.note = None;
         self.sticker_open = false;

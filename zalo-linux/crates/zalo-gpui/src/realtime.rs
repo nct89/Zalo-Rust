@@ -90,8 +90,10 @@ pub struct Incoming {
     pub text: String,
     /// Kind for the bubble.
     pub kind: MsgKind,
-    /// Photo / sticker / GIF URL.
+    /// Photo / sticker / GIF URL (full-resolution uncropped URL for photos).
     pub media_url: String,
+    /// Optional low-res thumbnail URL (kept as fallback in stored attachments).
+    pub thumb_url: String,
     /// Declared width.
     pub width: u32,
     /// Declared height.
@@ -801,12 +803,35 @@ pub(crate) async fn sync_my_documents_cloud(
             let Ok(store) = LocalStore::open(&sp) else {
                 return std::collections::HashSet::new();
             };
-            store
-                .messages(&sid)
+            let msgs = store.messages(&sid).unwrap_or_default();
+            let atts: std::collections::HashMap<i64, String> = store
+                .attachments()
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|m| m.global_msg_id)
-                .collect()
+                .collect();
+            let needs_photo_upgrade = msgs.iter().any(|m| {
+                let Some(raw) = atts.get(&m.message_id) else {
+                    return false;
+                };
+                let Ok(v) = serde_json::from_str::<Value>(raw) else {
+                    return false;
+                };
+                if v.get("kind").and_then(Value::as_str) != Some("photo") {
+                    return false;
+                }
+                if v.get("hd_checked").and_then(Value::as_bool) == Some(true) {
+                    return false;
+                }
+                let thumb = v.get("thumb").and_then(Value::as_str).unwrap_or("");
+                let hd = v.get("hd").and_then(Value::as_str).unwrap_or("");
+                hd.is_empty()
+                    || crate::media::is_thumb_photo_url(hd)
+                    || (!thumb.is_empty() && hd == thumb)
+            });
+            if needs_photo_upgrade {
+                return std::collections::HashSet::new();
+            }
+            msgs.into_iter().filter_map(|m| m.global_msg_id).collect()
         })
         .await
         .unwrap_or_default()
@@ -1004,7 +1029,7 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
     };
     let https = |v: Option<&Value>| {
         v.and_then(Value::as_str)
-            .filter(|u| u.starts_with("https://"))
+            .filter(|u| crate::media::is_http_url(u))
             .map(str::to_owned)
     };
     let mut m = Incoming {
@@ -1030,13 +1055,19 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
         "chat.undo" => return None,
         "chat.photo" => {
             m.kind = MsgKind::Photo;
-            m.media_url = https(content.get("thumb"))
-                .or_else(|| https(params.get("hd")))
-                .or_else(|| https(content.get("href")))
+            let ori = https(params.get("oriUrl")).unwrap_or_default();
+            let hd = https(params.get("hd")).unwrap_or_default();
+            let href = https(content.get("href")).unwrap_or_default();
+            let thumb = https(content.get("thumb"))
+                .or_else(|| https(params.get("thumb")))
                 .unwrap_or_default();
+            m.media_url = crate::media::pick_full_photo_url(&ori, &hd, &href, &thumb);
+            m.thumb_url = thumb;
             m.width = params.get("width").and_then(json_i64).unwrap_or(0).max(0) as u32;
             m.height = params.get("height").and_then(json_i64).unwrap_or(0).max(0) as u32;
-            m.text = field("title").unwrap_or_else(|| "[Hình ảnh]".into());
+            m.text = field("title")
+                .filter(|t| !crate::media::is_local_media_uri(t))
+                .unwrap_or_else(|| "[Hình ảnh]".into());
             m.group_layout_id = photo_group_layout(&params);
         }
         "chat.gif" => {
@@ -1314,7 +1345,8 @@ fn fill_quote(m: &mut Incoming, value: &Value, self_uin: &str) {
     };
 }
 
-/// Rewrite a row that was stored as plain text before this client knew the kind.
+/// Rewrite a row that was stored as plain text before this client knew the kind,
+/// or upgrade legacy cropped-thumbnail photo attachments to full-resolution URLs.
 fn refresh_richer(store: &LocalStore, m: &Incoming) {
     let Some(gid) = m.global_msg_id else {
         return;
@@ -1322,20 +1354,41 @@ fn refresh_richer(store: &LocalStore, m: &Incoming) {
     let marker = m.text == "Tin nhắn đã bị xóa"
         || m.text == "[Tin nhắn đã tự xóa]"
         || m.text.starts_with("[Việc cần làm]");
+    let photo_upgrade = m.kind == MsgKind::Photo && !m.media_url.is_empty();
     let rich = matches!(
         m.kind,
         MsgKind::Location | MsgKind::Doodle | MsgKind::Ecard | MsgKind::Card
     );
-    if !rich && !marker {
+    if !rich && !marker && !photo_upgrade {
         return;
     }
     let Ok(ids) = store.replace_body_by_global_id(&m.thread_id, gid, &m.text) else {
         return;
     };
-    if !rich {
+    if !rich && !photo_upgrade {
         return;
     }
     let mut data = match m.kind {
+        MsgKind::Photo => {
+            let thumb = if m.thumb_url.is_empty() {
+                m.media_url.as_str()
+            } else {
+                m.thumb_url.as_str()
+            };
+            let mut obj = serde_json::json!({
+                "kind": "photo",
+                "thumb": thumb,
+                "hd": m.media_url,
+                "hd_checked": true,
+                "width": m.width,
+                "height": m.height,
+                "local": null
+            });
+            if m.group_layout_id != 0 {
+                obj["group_layout_id"] = serde_json::json!(m.group_layout_id);
+            }
+            obj
+        }
         MsgKind::Doodle => serde_json::json!({
             "kind": "doodle", "thumb": m.media_url, "hd": m.media_url,
             "width": m.width, "height": m.height, "local": null
@@ -1440,8 +1493,14 @@ pub(crate) fn store_all(path: &Path, list: &mut [Incoming]) {
                     "photo"
                 };
                 {
+                    let thumb = if m.thumb_url.is_empty() {
+                        m.media_url.as_str()
+                    } else {
+                        m.thumb_url.as_str()
+                    };
                     let mut obj = serde_json::json!({
-                        "kind": kind, "thumb": m.media_url, "hd": m.media_url,
+                        "kind": kind, "thumb": thumb, "hd": m.media_url,
+                        "hd_checked": true,
                         "width": m.width, "height": m.height, "local": null
                     });
                     if m.group_layout_id != 0 {

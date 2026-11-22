@@ -1,12 +1,22 @@
 //! Local screen share for a Zalo call.
 //!
-//! Grabs an X11 physical monitor (via RandR), a screen region, or an individual
-//! application window natively in pure Rust via `x11rb` (`GetImage`), downscales
-//! with a 2-pass separable area-box filter (`INTER_AREA`) so small desktop text
-//! stays sharp, converts to packed I420 (`yuv420p`) with 2×2 chroma averaging,
-//! and encodes H.264 Baseline Annex-B with OpenH264 — zero external `ffmpeg` or
-//! `xrandr` subprocesses required.
+//! Supports both:
+//! - **Wayland (`org.freedesktop.portal.ScreenCast` + PipeWire)**: opens the
+//!   native compositor picker (GNOME/KDE/Hyprland/Sway/Flatpak) via `zalo-shell`,
+//!   streams frames from the PipeWire remote FD via GStreamer `pipewiresrc`
+//!   (with `grim` fallback on wlroots).
+//! - **X11 (`x11rb` `GetImage`)**: grabs physical monitors (RandR), screen
+//!   regions, or individual windows in pure Rust with 2-pass `INTER_AREA`
+//!   downscaling so desktop text remains sharp.
+//!
+//! Both paths use adaptive frame-rate pacing (`4..=15 fps`) with fast luma
+//! frame-diff detection so motion stays smooth while static slides/code save
+//! CPU and uplink bandwidth, encoded as H.264 Baseline Annex-B via OpenH264.
 
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -27,13 +37,22 @@ const MAX_HEIGHT: usize = 720;
 /// Matches `call_video::PREVIEW_MAX_EDGE` (fits inside GPUI's 1024 px atlas
 /// while keeping 16:9 screen previews crisp at `960×540`).
 const PREVIEW_MAX_EDGE: usize = 960;
-const FPS: u32 = 8;
+/// Active motion capture/encode ceiling (fps).
+const MAX_FPS: u32 = 15;
+/// Static screen capture cadence (fps) when no pixels changed.
+const MIN_FPS: u32 = 4;
+/// How long to stay at `MAX_FPS` after the last detected motion.
+const MOTION_HOLD: Duration = Duration::from_millis(1_500);
+/// Maximum gap before sending a keepalive P-frame on a completely static screen.
+const STATIC_KEEPALIVE: Duration = Duration::from_secs(1);
 const BITRATE_BPS: u32 = 1_200_000;
 const KEY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Screen / monitor / region / window target selected by the user before sharing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ShareTarget {
+    /// Interactive Wayland XDG Desktop Portal (`ScreenCast` + PipeWire) picker.
+    WaylandPortal,
     /// Entire primary display (fallback when X11 geometry is unavailable).
     #[default]
     FullScreen,
@@ -67,6 +86,7 @@ impl ShareTarget {
     /// Short label for the share-picker row and active sharing banner.
     pub(crate) fn label(&self) -> String {
         match self {
+            Self::WaylandPortal => "Chọn màn hình / cửa sổ (Wayland)".into(),
             Self::FullScreen => "Toàn màn hình".into(),
             Self::Region { label, .. } => label.clone(),
             Self::Window { title, .. } => title.clone(),
@@ -76,6 +96,7 @@ impl ShareTarget {
     /// Secondary detail line (kind + dimensions) for the share-picker UI.
     pub(crate) fn detail(&self) -> String {
         match self {
+            Self::WaylandPortal => "Hộp thoại hệ thống XDG ScreenCast Portal • PipeWire".into(),
             Self::FullScreen => "Toàn bộ màn hình hiện tại".into(),
             Self::Region { label, w, h, .. } => {
                 if label.starts_with("Màn hình") || label.starts_with("Toàn màn hình") {
@@ -137,17 +158,28 @@ fn list_randr_monitors(conn: &RustConnection, root: Window) -> Vec<MonitorRect> 
     monitors
 }
 
-/// Lists selectable X11 share targets: each physical monitor (via RandR),
-/// half-screen regions of the primary monitor, and visible top-level
-/// application windows (excluding desktop wallpaper, docks, and Zalo Call).
+/// Lists selectable share targets: Wayland ScreenCast Portal (first when running
+/// on Wayland with portal support), plus X11 monitors, half-screen regions, and
+/// top-level windows when an X11/XWayland server is available.
 pub(crate) fn list_share_targets() -> Vec<ShareTarget> {
     let mut targets = Vec::new();
+    if zalo_shell::is_wayland_session() && zalo_shell::portal_screencast_available() {
+        targets.push(ShareTarget::WaylandPortal);
+    }
     let Ok((conn, screen_num)) = RustConnection::connect(None) else {
-        targets.push(ShareTarget::FullScreen);
+        if targets.is_empty() {
+            targets.push(if zalo_shell::is_wayland_session() {
+                ShareTarget::WaylandPortal
+            } else {
+                ShareTarget::FullScreen
+            });
+        }
         return targets;
     };
     let Some(screen) = conn.setup().roots.get(screen_num) else {
-        targets.push(ShareTarget::FullScreen);
+        if targets.is_empty() {
+            targets.push(ShareTarget::FullScreen);
+        }
         return targets;
     };
     let root = screen.root;
@@ -403,13 +435,117 @@ impl Drop for ScreenCapture {
 
 /// Why a grab cannot start, before any capture thread is spawned.
 pub(crate) fn grab_unavailable() -> Option<String> {
+    if zalo_shell::is_wayland_session() {
+        if zalo_shell::portal_screencast_available() || tool_exists("grim") {
+            return None;
+        }
+        if std::env::var_os("DISPLAY").is_some() && RustConnection::connect(None).is_ok() {
+            return None;
+        }
+        return Some(
+            "Chia sẻ màn hình trên Wayland cần XDG ScreenCast Portal (xdg-desktop-portal) hoặc grim."
+                .into(),
+        );
+    }
     if std::env::var_os("DISPLAY").is_none() {
-        return Some("Chia sẻ màn hình cần phiên X11 (DISPLAY).".into());
+        return Some("Chia sẻ màn hình cần phiên X11 (DISPLAY) hoặc Wayland Portal.".into());
     }
     if RustConnection::connect(None).is_err() {
         return Some("Không kết nối được máy chủ X11 để chụp màn hình.".into());
     }
     None
+}
+
+fn tool_exists(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+}
+
+fn gst_pipewiresrc_available() -> bool {
+    if !tool_exists("gst-launch-1.0") {
+        return false;
+    }
+    if tool_exists("gst-inspect-1.0") {
+        return Command::new("gst-inspect-1.0")
+            .arg("pipewiresrc")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    }
+    true
+}
+
+/// Fast sampled luma change detector: checks every 16th byte of the Y plane.
+/// Returns `true` when frames differ in dimensions or >= 0.05% of sampled pixels
+/// changed by >= 6 luma levels (catches typing, cursor/scroll, video playback
+/// while ignoring tiny sensor/subpixel noise).
+pub(crate) fn luma_changed(prev: &[u8], curr: &[u8]) -> bool {
+    if prev.len() != curr.len() || curr.is_empty() {
+        return true;
+    }
+    let step = 16usize;
+    let total_samples = (curr.len() + step - 1) / step;
+    let threshold = (total_samples / 2000).max(2);
+    let mut diffs = 0usize;
+    let mut idx = 0usize;
+    while idx < curr.len() {
+        if prev[idx].abs_diff(curr[idx]) >= 6 {
+            diffs += 1;
+            if diffs >= threshold {
+                return true;
+            }
+        }
+        idx += step;
+    }
+    false
+}
+
+/// Adaptive frame-rate pacer (`MIN_FPS`..=`MAX_FPS`) with static-frame skipping.
+struct AdaptivePacer {
+    last_motion: Instant,
+    last_sent: Instant,
+    prev_y: Vec<u8>,
+}
+
+impl AdaptivePacer {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_motion: now,
+            last_sent: now - STATIC_KEEPALIVE,
+            prev_y: Vec::new(),
+        }
+    }
+
+    /// Evaluates the newly captured Y plane (`y_plane`), returning
+    /// `(should_encode, next_interval)`.
+    fn evaluate(&mut self, y_plane: &[u8], force_send: bool, now: Instant) -> (bool, Duration) {
+        let changed = luma_changed(&self.prev_y, y_plane);
+        if changed {
+            self.last_motion = now;
+            self.prev_y.clear();
+            self.prev_y.extend_from_slice(y_plane);
+        }
+        let active = changed || now.duration_since(self.last_motion) < MOTION_HOLD;
+        let next_interval = if active {
+            Duration::from_secs_f64(1.0 / f64::from(MAX_FPS))
+        } else {
+            Duration::from_secs_f64(1.0 / f64::from(MIN_FPS))
+        };
+        let keepalive_due = now.duration_since(self.last_sent) >= STATIC_KEEPALIVE;
+        let should_encode = changed || force_send || keepalive_due;
+        if should_encode {
+            self.last_sent = now;
+        }
+        (should_encode, next_interval)
+    }
+
+    fn reset(&mut self) {
+        self.prev_y.clear();
+    }
 }
 
 fn capture_loop(
@@ -423,10 +559,413 @@ fn capture_loop(
         let _ = tx.try_send(CamEvent::Failed(text));
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        capture_loop_inner(&stop, &force_key, &tx, &preview, &target);
+        if matches!(target, ShareTarget::WaylandPortal) {
+            capture_wayland_portal(&stop, &force_key, &tx, &preview);
+        } else {
+            capture_loop_inner(&stop, &force_key, &tx, &preview, &target);
+        }
     }));
     if result.is_err() {
         fail("Chia sẻ màn hình bị lỗi và đã dừng. Cuộc gọi vẫn mở.".into());
+    }
+}
+
+/// Captures Wayland screen/window via `org.freedesktop.portal.ScreenCast` +
+/// PipeWire (`gst-launch-1.0 pipewiresrc`), falling back to `grim` on wlroots.
+fn capture_wayland_portal(
+    stop: &AtomicBool,
+    force_key: &AtomicBool,
+    tx: &SyncSender<CamEvent>,
+    preview: &Mutex<Option<LocalPreview>>,
+) {
+    let fail = |text: String| {
+        let _ = tx.try_send(CamEvent::Failed(text));
+    };
+
+    if zalo_shell::portal_screencast_available() {
+        let session = match zalo_shell::start_screencast(zalo_shell::SOURCE_TYPE_BOTH) {
+            Ok(sess) => sess,
+            Err(err) => {
+                if !stop.load(Ordering::Acquire) {
+                    fail(err.to_string());
+                }
+                return;
+            }
+        };
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        if !gst_pipewiresrc_available() {
+            drop(session);
+            if tool_exists("grim") {
+                capture_grim_loop(stop, force_key, tx, preview);
+                return;
+            }
+            fail(
+                "Cần cài gói gstreamer1.0-tools và gstreamer1.0-pipewire để chia sẻ màn hình trên Wayland."
+                    .into(),
+            );
+            return;
+        }
+
+        let src_w = session.stream.width.unwrap_or(MAX_WIDTH as u32) as usize;
+        let src_h = session.stream.height.unwrap_or(MAX_HEIGHT as u32) as usize;
+        let (enc_w, enc_h) = fit_screen_size(src_w, src_h);
+        let (prev_w, prev_h) = fit_edge_even(enc_w, enc_h, PREVIEW_MAX_EDGE);
+        let mut encoder = match open_screen_encoder(enc_w, enc_h) {
+            Ok(enc) => enc,
+            Err(_) => {
+                fail("Không mở được bộ mã hình chia sẻ màn hình.".into());
+                return;
+            }
+        };
+
+        let raw_fd = session.pipewire_fd().as_raw_fd();
+        let node_id = session.stream.node_id;
+        let caps = format!(
+            "video/x-raw,format=I420,width={enc_w},height={enc_h},framerate={MAX_FPS}/1"
+        );
+        let mut cmd = Command::new("gst-launch-1.0");
+        cmd.args([
+            "-q",
+            "pipewiresrc",
+            &format!("fd={raw_fd}"),
+            &format!("path={node_id}"),
+            "do-timestamp=true",
+            "keepalive-time=500",
+            "!",
+            "videoconvert",
+            "!",
+            "videoscale",
+            "method=bilinear",
+            "!",
+            &caps,
+            "!",
+            "fdsink",
+            "fd=1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+        // Clear FD_CLOEXEC on the PipeWire remote FD in the child right before exec
+        // so `gst-launch-1.0 pipewiresrc fd=<raw_fd>` inherits the portal FD.
+        unsafe {
+            cmd.pre_exec(move || {
+                let flags = libc::fcntl(raw_fd, libc::F_GETFD);
+                if flags < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::fcntl(raw_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                fail(format!("Không chạy được gst-launch-1.0: {err}"));
+                return;
+            }
+        };
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            fail("Không mở được luồng hình ảnh từ PipeWire.".into());
+            return;
+        };
+
+        eprintln!(
+            "zalo-gpui call: screen share Wayland Portal node={node_id} {src_w}x{src_h} -> {enc_w}x{enc_h} @{MIN_FPS}..{MAX_FPS}fps"
+        );
+
+        let frame_bytes = enc_w * enc_h * 3 / 2;
+        let y_len = enc_w * enc_h;
+        let mut buf = vec![0_u8; frame_bytes];
+        let started_at = Instant::now();
+        let mut last_key = started_at - KEY_INTERVAL;
+        let mut pacer = AdaptivePacer::new(started_at);
+        let mut frame_no = 0_u64;
+
+        while !stop.load(Ordering::Acquire) {
+            if stdout.read_exact(&mut buf).is_err() {
+                if !stop.load(Ordering::Acquire) {
+                    fail("Luồng chia sẻ màn hình Wayland đã kết thúc.".into());
+                }
+                break;
+            }
+            let now = Instant::now();
+            let want_key =
+                force_key.swap(false, Ordering::AcqRel) || last_key.elapsed() >= KEY_INTERVAL;
+            let (should_encode, _next_interval) = pacer.evaluate(&buf[..y_len], want_key, now);
+            if !should_encode {
+                continue;
+            }
+            if frame_no % 2 == 0 {
+                if let Some(bgra) = i420_to_bgra_preview(&buf, enc_w, enc_h, prev_w, prev_h) {
+                    if let Ok(mut slot) = preview.lock() {
+                        *slot = Some(LocalPreview {
+                            w: prev_w as u32,
+                            h: prev_h as u32,
+                            bgra: Arc::new(bgra),
+                        });
+                    }
+                }
+            }
+            frame_no = frame_no.wrapping_add(1);
+
+            if want_key {
+                encoder.force_intra_frame();
+                last_key = now;
+            }
+            let picture = YUVBuffer::from_vec(buf.clone(), enc_w, enc_h);
+            let ts_ms = now.duration_since(started_at).as_millis() as u64;
+            let Ok(bitstream) = encoder.encode_at(&picture, Timestamp::from_millis(ts_ms)) else {
+                continue;
+            };
+            if bitstream.frame_type() == openh264::encoder::FrameType::Skip {
+                continue;
+            }
+            let data = bitstream.to_vec();
+            if data.is_empty() {
+                continue;
+            }
+            let key = bitstream.frame_type() == openh264::encoder::FrameType::IDR;
+            if key {
+                last_key = now;
+            }
+            match tx.try_send(CamEvent::Frame { key, data }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    if key {
+                        force_key.store(true, Ordering::Release);
+                    }
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(session);
+        return;
+    }
+
+    if tool_exists("grim") {
+        capture_grim_loop(stop, force_key, tx, preview);
+        return;
+    }
+    fail("Không tìm thấy XDG ScreenCast Portal hoặc grim trên phiên Wayland.".into());
+}
+
+/// Fallback Wayland screen capture via `grim -t ppm -` (wlroots: Sway/Hyprland).
+fn capture_grim_loop(
+    stop: &AtomicBool,
+    force_key: &AtomicBool,
+    tx: &SyncSender<CamEvent>,
+    preview: &Mutex<Option<LocalPreview>>,
+) {
+    let fail = |text: String| {
+        let _ = tx.try_send(CamEvent::Failed(text));
+    };
+    let mut encoder: Option<(openh264::encoder::Encoder, usize, usize)> = None;
+    let started_at = Instant::now();
+    let mut last_key = started_at - KEY_INTERVAL;
+    let mut pacer = AdaptivePacer::new(started_at);
+    let mut next_tick = Instant::now();
+    let mut frame_no = 0_u64;
+
+    while !stop.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now < next_tick {
+            std::thread::sleep((next_tick - now).min(Duration::from_millis(25)));
+            continue;
+        }
+        let out = match Command::new("grim")
+            .args(["-t", "ppm", "-"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => {
+                if !stop.load(Ordering::Acquire) {
+                    fail("grim ngừng chụp màn hình Wayland.".into());
+                }
+                return;
+            }
+        };
+        let Some((cap_w, cap_h, rgb)) = parse_ppm_p6(&out) else {
+            continue;
+        };
+        let (want_w, want_h) = fit_screen_size(cap_w, cap_h);
+        if encoder.as_ref().is_none_or(|(_, w, h)| (*w, *h) != (want_w, want_h)) {
+            match open_screen_encoder(want_w, want_h) {
+                Ok(enc) => {
+                    encoder = Some((enc, want_w, want_h));
+                    pacer.reset();
+                    force_key.store(true, Ordering::Release);
+                }
+                Err(_) => {
+                    fail("Không mở được bộ mã hình chia sẻ màn hình.".into());
+                    return;
+                }
+            }
+        }
+        let Some((enc, enc_w, enc_h)) = encoder.as_mut() else {
+            continue;
+        };
+        let (enc_w, enc_h) = (*enc_w, *enc_h);
+        let enc_bgra = rgb_to_bgra_area(rgb, cap_w, cap_h, enc_w, enc_h);
+        let i420 = bgra_to_i420(&enc_bgra, enc_w, enc_h);
+        let now = Instant::now();
+        let want_key =
+            force_key.swap(false, Ordering::AcqRel) || last_key.elapsed() >= KEY_INTERVAL;
+        let (should_encode, next_interval) = pacer.evaluate(&i420[..enc_w * enc_h], want_key, now);
+        next_tick = (now + next_interval).max(now);
+        if !should_encode {
+            continue;
+        }
+        if frame_no % 2 == 0 {
+            let (prev_w, prev_h) = fit_edge_even(enc_w, enc_h, PREVIEW_MAX_EDGE);
+            let prev_bgra = if (prev_w, prev_h) == (enc_w, enc_h) {
+                enc_bgra
+            } else {
+                scale_bgrx_area(&enc_bgra, enc_w, enc_h, 4, prev_w, prev_h)
+            };
+            if let Ok(mut slot) = preview.lock() {
+                *slot = Some(LocalPreview {
+                    w: prev_w as u32,
+                    h: prev_h as u32,
+                    bgra: Arc::new(prev_bgra),
+                });
+            }
+        }
+        frame_no = frame_no.wrapping_add(1);
+        if want_key {
+            enc.force_intra_frame();
+            last_key = now;
+        }
+        let picture = YUVBuffer::from_vec(i420, enc_w, enc_h);
+        let ts_ms = now.duration_since(started_at).as_millis() as u64;
+        let Ok(bitstream) = enc.encode_at(&picture, Timestamp::from_millis(ts_ms)) else {
+            continue;
+        };
+        if bitstream.frame_type() == openh264::encoder::FrameType::Skip {
+            continue;
+        }
+        let data = bitstream.to_vec();
+        if data.is_empty() {
+            continue;
+        }
+        let key = bitstream.frame_type() == openh264::encoder::FrameType::IDR;
+        if key {
+            last_key = now;
+        }
+        match tx.try_send(CamEvent::Frame { key, data }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                if key {
+                    force_key.store(true, Ordering::Release);
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => return,
+        }
+    }
+}
+
+/// Parses a binary PPM (`P6`) image into `(width, height, rgb_bytes)`.
+pub(crate) fn parse_ppm_p6(bytes: &[u8]) -> Option<(usize, usize, &[u8])> {
+    if !bytes.starts_with(b"P6") {
+        return None;
+    }
+    let mut pos = 2usize;
+    let mut nums = [0usize; 3];
+    for slot in &mut nums {
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            if b == b'#' {
+                while pos < bytes.len() && bytes[pos] != b'\n' {
+                    pos += 1;
+                }
+            } else if b.is_ascii_whitespace() {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+        let start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if start == pos {
+            return None;
+        }
+        *slot = std::str::from_utf8(&bytes[start..pos]).ok()?.parse().ok()?;
+    }
+    if pos >= bytes.len() || !bytes[pos].is_ascii_whitespace() {
+        return None;
+    }
+    pos += 1;
+    let (w, h, maxval) = (nums[0], nums[1], nums[2]);
+    if w == 0 || h == 0 || maxval != 255 {
+        return None;
+    }
+    let need = w.checked_mul(h)?.checked_mul(3)?;
+    if bytes.len().saturating_sub(pos) < need {
+        return None;
+    }
+    Some((w, h, &bytes[pos..pos + need]))
+}
+
+fn rgb_to_bgra_area(rgb: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+    let mut bgr = vec![0_u8; sw * sh * 3];
+    for (dst, src) in bgr.chunks_exact_mut(3).zip(rgb.chunks_exact(3)) {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+    }
+    scale_bgrx_area(&bgr, sw, sh, 3, dw, dh)
+}
+
+fn i420_to_bgra_preview(
+    i420: &[u8],
+    w: usize,
+    h: usize,
+    prev_w: usize,
+    prev_h: usize,
+) -> Option<Vec<u8>> {
+    let y_len = w.checked_mul(h)?;
+    let c_len = (w / 2).checked_mul(h / 2)?;
+    if w % 2 != 0 || h % 2 != 0 || i420.len() < y_len + c_len * 2 {
+        return None;
+    }
+    let y = &i420[..y_len];
+    let u = &i420[y_len..y_len + c_len];
+    let v = &i420[y_len + c_len..y_len + c_len * 2];
+    let cw = w / 2;
+    let mut bgra = vec![255_u8; y_len * 4];
+    for row in 0..h {
+        let u_row = (row / 2) * cw;
+        for col in 0..w {
+            let c = i32::from(y[row * w + col]) - 16;
+            let d = i32::from(u[u_row + col / 2]) - 128;
+            let e = i32::from(v[u_row + col / 2]) - 128;
+            let y298 = 298 * c + 128;
+            let r = ((y298 + 409 * e) >> 8).clamp(0, 255) as u8;
+            let g = ((y298 - 100 * d - 208 * e) >> 8).clamp(0, 255) as u8;
+            let b = ((y298 + 516 * d) >> 8).clamp(0, 255) as u8;
+            let px = (row * w + col) * 4;
+            bgra[px] = b;
+            bgra[px + 1] = g;
+            bgra[px + 2] = r;
+        }
+    }
+    if (prev_w, prev_h) == (w, h) {
+        Some(bgra)
+    } else {
+        Some(scale_bgrx_area(&bgra, w, h, 4, prev_w, prev_h))
     }
 }
 
@@ -438,7 +977,7 @@ fn resolve_grab_rect(
     target: &ShareTarget,
 ) -> Option<(i16, i16, u16, u16)> {
     match target {
-        ShareTarget::FullScreen => {
+        ShareTarget::WaylandPortal | ShareTarget::FullScreen => {
             if let Some(primary) = list_randr_monitors(conn, root).into_iter().next() {
                 Some((primary.x, primary.y, primary.w, primary.h))
             } else {
@@ -506,29 +1045,29 @@ fn capture_loop_inner(
         }
     };
     eprintln!(
-        "zalo-gpui call: screen share X11 «{}» {}x{} -> {}x{} @{}fps",
+        "zalo-gpui call: screen share X11 «{}» {}x{} -> {}x{} @{}..{}fps",
         target.label(),
         init_w,
         init_h,
         enc_w,
         enc_h,
-        FPS
+        MIN_FPS,
+        MAX_FPS
     );
 
-    let interval = Duration::from_secs_f64(1.0 / f64::from(FPS));
     let started_at = Instant::now();
     let mut last_key = started_at - KEY_INTERVAL;
+    let mut pacer = AdaptivePacer::new(started_at);
     let mut frame_no = 0_u64;
     let mut next_tick = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
         let now = Instant::now();
         if now < next_tick {
-            let sleep_for = (next_tick - now).min(Duration::from_millis(25));
+            let sleep_for = (next_tick - now).min(Duration::from_millis(20));
             std::thread::sleep(sleep_for);
             continue;
         }
-        next_tick = (next_tick + interval).max(now);
 
         let Some((gx, gy, gw, gh)) = resolve_grab_rect(&conn, root, root_w, root_h, target) else {
             if !stop.load(Ordering::Acquire) {
@@ -544,6 +1083,7 @@ fn capture_loop_inner(
                 encoder = next_enc;
                 enc_w = want_w;
                 enc_h = want_h;
+                pacer.reset();
                 force_key.store(true, Ordering::Release);
             }
         }
@@ -571,6 +1111,15 @@ fn capture_loop_inner(
         // both I420 (with 2×2 chroma averaging) and crisp local preview.
         let enc_bgra = scale_bgrx_area(&reply.data, cap_w, cap_h, bpp, enc_w, enc_h);
         let i420 = bgra_to_i420(&enc_bgra, enc_w, enc_h);
+        let now = Instant::now();
+        let want_key =
+            force_key.swap(false, Ordering::AcqRel) || last_key.elapsed() >= KEY_INTERVAL;
+        let (should_encode, next_interval) = pacer.evaluate(&i420[..enc_w * enc_h], want_key, now);
+        next_tick = (now + next_interval).max(now);
+        if !should_encode {
+            continue;
+        }
+
         if frame_no % 2 == 0 {
             let prev_bgra = if (prev_w, prev_h) == (enc_w, enc_h) {
                 enc_bgra
@@ -587,12 +1136,12 @@ fn capture_loop_inner(
         }
         frame_no = frame_no.wrapping_add(1);
 
-        if force_key.swap(false, Ordering::AcqRel) || last_key.elapsed() >= KEY_INTERVAL {
+        if want_key {
             encoder.force_intra_frame();
-            last_key = Instant::now();
+            last_key = now;
         }
         let picture = YUVBuffer::from_vec(i420, enc_w, enc_h);
-        let ts_ms = Instant::now().duration_since(started_at).as_millis() as u64;
+        let ts_ms = now.duration_since(started_at).as_millis() as u64;
         let Ok(bitstream) = encoder.encode_at(&picture, Timestamp::from_millis(ts_ms)) else {
             continue;
         };
@@ -909,7 +1458,7 @@ fn open_screen_encoder(
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
         .bitrate(BitRate::from_bps(BITRATE_BPS))
-        .max_frame_rate(FrameRate::from_hz(FPS as f32))
+        .max_frame_rate(FrameRate::from_hz(MAX_FPS as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(0))
         .profile(Profile::Baseline)
         .level(Level::Level_4_0)
@@ -974,5 +1523,44 @@ mod tests {
             .expect("encode screen frame");
         assert!(!bs.to_vec().is_empty());
         assert_eq!(bs.frame_type(), openh264::encoder::FrameType::IDR);
+    }
+
+    #[test]
+    fn adaptive_pacer_ramps_up_on_motion_and_skips_static_frames() {
+        let t0 = Instant::now();
+        let mut pacer = AdaptivePacer::new(t0);
+        let frame_a = vec![40_u8; 640 * 360];
+        let mut frame_b = frame_a.clone();
+        for b in frame_b.iter_mut().take(16_000) {
+            *b = 200;
+        }
+        // First frame always encodes at MAX_FPS cadence.
+        let (send, interval) = pacer.evaluate(&frame_a, false, t0);
+        assert!(send);
+        assert!(interval <= Duration::from_millis(75));
+
+        // Identical frame shortly after: skipped during static period.
+        let (send, _) = pacer.evaluate(&frame_a, false, t0 + Duration::from_millis(100));
+        assert!(!send);
+
+        // After MOTION_HOLD without change: drops cadence to MIN_FPS (250 ms) and sends keepalive.
+        let (send, interval) = pacer.evaluate(&frame_a, false, t0 + Duration::from_millis(1_700));
+        assert!(send);
+        assert!(interval >= Duration::from_millis(200));
+
+        // New motion immediately ramps back up to MAX_FPS.
+        let (send, interval) = pacer.evaluate(&frame_b, false, t0 + Duration::from_millis(1_800));
+        assert!(send);
+        assert!(interval <= Duration::from_millis(75));
+    }
+
+    #[test]
+    fn parses_binary_ppm_p6_with_comments() {
+        let mut ppm = b"P6\n# grim capture\n2 2\n255\n".to_vec();
+        ppm.extend_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]);
+        let (w, h, rgb) = parse_ppm_p6(&ppm).expect("ppm");
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(rgb.len(), 12);
+        assert_eq!(&rgb[0..3], &[10, 20, 30]);
     }
 }

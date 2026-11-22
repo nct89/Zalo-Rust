@@ -155,17 +155,22 @@ impl ShellView {
     }
 
     fn queue_store_thumbs(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        let jobs: Vec<(String, String)> = self
+        let jobs: Vec<(String, String, Option<String>)> = self
             .media_shelf
             .images
             .iter()
             .filter_map(|item| {
-                let url = if item.thumb.starts_with("http") {
+                let primary = if item.thumb.starts_with("http") {
                     item.thumb.clone()
                 } else if item.url.starts_with("http") {
                     item.url.clone()
                 } else {
                     return None;
+                };
+                let fallback = if item.url.starts_with("http") && item.url != primary {
+                    Some(item.url.clone())
+                } else {
+                    None
                 };
                 if self.media_shelf.thumbs.contains_key(&item.id)
                     || self.media_shelf.thumb_pending.contains(&item.id)
@@ -173,29 +178,64 @@ impl ShellView {
                 {
                     return None;
                 }
-                Some((item.id.clone(), url))
+                Some((item.id.clone(), primary, fallback))
             })
             .collect();
         if jobs.is_empty() {
             return;
         }
-        for (id, _) in &jobs {
+        for (id, _, _) in &jobs {
             self.media_shelf.thumb_pending.insert(id.clone());
         }
         cx.spawn(async move |this, cx| {
             let fetch_jobs: Vec<crate::fetch::Job> = jobs
                 .iter()
                 .enumerate()
-                .map(|(i, (_, url))| crate::fetch::Job {
+                .map(|(i, (_, url, _))| crate::fetch::Job {
                     msg_id: i as u64,
                     path: None,
                     url: url.clone(),
                     max_edge: 200,
                 })
                 .collect();
+            let fallbacks: Vec<(u64, String)> = jobs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, _, fb))| fb.as_ref().map(|u| (i as u64, u.clone())))
+                .collect();
             let done = cx
                 .background_executor()
-                .spawn(async move { crate::fetch::run_batch(Some(&dir), fetch_jobs) })
+                .spawn(async move {
+                    let mut results = crate::fetch::run_batch(Some(&dir), fetch_jobs);
+                    let retry_jobs: Vec<crate::fetch::Job> = results
+                        .iter()
+                        .filter(|d| d.image.is_none())
+                        .filter_map(|d| {
+                            let url = fallbacks
+                                .iter()
+                                .find(|(id, _)| *id == d.msg_id)
+                                .map(|(_, u)| u.clone())?;
+                            Some(crate::fetch::Job {
+                                msg_id: d.msg_id,
+                                path: None,
+                                url,
+                                max_edge: 200,
+                            })
+                        })
+                        .collect();
+                    if !retry_jobs.is_empty() {
+                        let retried = crate::fetch::run_batch(Some(&dir), retry_jobs);
+                        for r in retried {
+                            if r.image.is_some() {
+                                if let Some(slot) = results.iter_mut().find(|d| d.msg_id == r.msg_id)
+                                {
+                                    *slot = r;
+                                }
+                            }
+                        }
+                    }
+                    results
+                })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 let mut images = HashMap::new();
@@ -204,7 +244,7 @@ impl ShellView {
                         images.insert(item.msg_id, image);
                     }
                 }
-                for (i, (id, _)) in jobs.iter().enumerate() {
+                for (i, (id, _, _)) in jobs.iter().enumerate() {
                     view.media_shelf.thumb_pending.remove(id);
                     if let Some(image) = images.remove(&(i as u64)) {
                         view.media_shelf.thumbs.insert(id.clone(), image);

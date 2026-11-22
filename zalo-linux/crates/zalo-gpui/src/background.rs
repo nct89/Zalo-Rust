@@ -17,6 +17,7 @@ use crate::realtime::RtEvent;
 
 struct ActiveHub {
     gen: u64,
+    dir: PathBuf,
     stop_tx: tokio::sync::watch::Sender<bool>,
 }
 
@@ -31,6 +32,7 @@ static TOLD_TRAY: AtomicBool = AtomicBool::new(false);
 pub fn stop() {
     let next_gen = SESSION_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     crate::realtime::invalidate_generation(next_gen);
+    crate::ws_rpc::WsRpcHub::global().reset_all();
     if let Ok(mut sink) = SINK.lock() {
         *sink = None;
     }
@@ -44,13 +46,23 @@ pub fn stop() {
 }
 
 /// The shell window receives realtime events through `tx` from now on.
-/// Starts the shared listener if no active session is running.
+/// Starts the shared listener if no active session is running, or restarts it
+/// if `dir` belongs to a different account than the active hub.
 pub fn subscribe(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
+    let same_account = ACTIVE_HUB
+        .lock()
+        .ok()
+        .is_some_and(|hub| hub.as_ref().is_some_and(|active| active.dir == dir));
+    if !same_account {
+        stop();
+    }
     if let Ok(mut sink) = SINK.lock() {
         *sink = Some(tx.clone());
     }
-    if let Some((sync, backup)) = crate::ws_rpc::WsRpcHub::global().remote_configs() {
-        let _ = tx.unbounded_send(RtEvent::RemoteConfigs { sync, backup });
+    if same_account {
+        if let Some((sync, backup)) = crate::ws_rpc::WsRpcHub::global().remote_configs() {
+            let _ = tx.unbounded_send(RtEvent::RemoteConfigs { sync, backup });
+        }
     }
     HIDDEN_UNREAD.store(0, Ordering::Relaxed);
     ensure_started(dir);
@@ -62,12 +74,21 @@ pub fn ensure_started(dir: PathBuf) {
         let Ok(mut hub) = ACTIVE_HUB.lock() else {
             return;
         };
-        if hub.is_some() {
-            return;
+        if let Some(active) = hub.as_ref() {
+            if active.dir == dir {
+                return;
+            }
+            let _ = active.stop_tx.send(true);
+            *hub = None;
+            crate::ws_rpc::WsRpcHub::global().reset_all();
         }
         let gen = SESSION_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        *hub = Some(ActiveHub { gen, stop_tx });
+        *hub = Some(ActiveHub {
+            gen,
+            dir: dir.clone(),
+            stop_tx,
+        });
         (gen, stop_rx)
     };
     let (tx, mut rx) = unbounded::<RtEvent>();
@@ -126,7 +147,10 @@ fn background_event(dir: &std::path::Path, event: RtEvent) {
             zalo_shell::set_unread_badge(i64::from(n));
         }
         RtEvent::Messages(list, true) => {
-            let prefs = crate::prefs::Prefs::load(Some(dir.to_path_buf()));
+            let prefs = crate::prefs::Prefs::load_scoped(
+                crate::data::config_dir(),
+                Some(dir.to_path_buf()),
+            );
             let notify = !prefs.bool("notifyOff", false);
             let sound = prefs.bool("notifySound", true);
             let peek_guard = prefs.bool("peekGuard", false);

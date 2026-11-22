@@ -22,6 +22,7 @@ mod instance;
 mod launcher;
 mod notify;
 mod portal;
+mod screencast;
 mod screenshot;
 mod shortcuts;
 mod tray;
@@ -67,6 +68,11 @@ pub use portal::{
     current_desktop, desktop_shell_status, detect_desktop_from, format_shell_hint, is_flatpak,
     request_background, request_background_async, BackgroundGrant, DesktopEnvironment,
     DesktopShellStatus, PORTAL_BACKGROUND_INTERFACE,
+};
+pub use screencast::{
+    is_wayland_session, portal_screencast_available, start_screencast, ScreenCastSession,
+    ScreenCastStream, CURSOR_MODE_EMBEDDED, PORTAL_SCREENCAST_INTERFACE, SOURCE_TYPE_BOTH,
+    SOURCE_TYPE_MONITOR, SOURCE_TYPE_WINDOW,
 };
 pub use screenshot::{
     capture_fullscreen, capture_interactive, capture_screenshot, parse_file_uri,

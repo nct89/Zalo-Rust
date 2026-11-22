@@ -1,10 +1,11 @@
 # Unified cross-platform Rust workspace for Zalo-Rust.
 #
 # - `core/*` holds OS-independent pure-Rust crates shared across Linux, Windows, and macOS.
-# - `zalo-linux/crates/*` holds Linux desktop integration, audio/video engine, and GPUI UI.
+# - `zalo-linux/crates/*` holds the GPUI client plus Linux desktop, audio, and call integration.
+# - `zalo-macos/crates/*` holds the macOS menu bar, CoreAudio, and call bridge selected by `zalo-gpui`.
 [workspace]
 resolver = "2"
-members = ["core/*", "zalo-linux/crates/*"]
+members = ["core/*", "zalo-linux/crates/*", "zalo-macos/crates/*"]
 default-members = ["zalo-linux/crates/zalo-gpui"]
 
 [workspace.dependencies]
@@ -36,7 +37,7 @@ thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/nct89/Zalo-Rust"

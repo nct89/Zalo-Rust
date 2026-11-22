@@ -119,6 +119,19 @@ impl WsRpcHub {
         }
     }
 
+    /// Immediately clears all active connection state, cached remote configs,
+    /// and session IDs on logout or account switch so a new login never inherits
+    /// stale state from the previous account.
+    pub fn reset_all(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.tx = None;
+        inner.pending.clear();
+        inner.client_id.clear();
+        inner.self_uid.clear();
+        inner.remote_configs = None;
+        self.online.store(false, Ordering::SeqCst);
+    }
+
     /// Caches the latest server-provided `sync_2_pc` and `backup_msg` configs.
     pub fn set_remote_configs(
         &self,

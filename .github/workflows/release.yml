@@ -83,3 +83,32 @@ jobs:
             dist/*.tar.gz
             dist/protocol.json
             dist/SHA256SUMS.txt
+
+  build-macos:
+    name: Build macOS .app
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install cmake nasm pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Zalo.app
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VERSION="${TAG:-0.1.0}"
+          export VERSION
+          bash zalo-macos/packaging/build-app.sh
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

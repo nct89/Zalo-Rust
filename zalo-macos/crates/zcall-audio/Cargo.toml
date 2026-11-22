@@ -1,0 +1,19 @@
+[package]
+name = "zcall-audio-mac"
+description = "CoreAudio capture and playout for the macOS Zalo call engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "zcall_audio"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.15"

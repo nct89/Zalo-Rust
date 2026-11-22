@@ -333,6 +333,30 @@ pub struct MediaSession {
     share_out: VecDeque<(Vec<u8>, Server)>,
     /// Pending keyframe request for the group screen-share encoder (token grant or RTCP PLI).
     share_key_requested: bool,
+    /// Sender-side video RTP retransmission cache for RFC 4585 Generic NACK (`PT=205, FMT=1`).
+    video_rtx: BTreeMap<(u32, u16), CachedVideoPacket>,
+    /// FIFO eviction order for `video_rtx`.
+    video_rtx_order: VecDeque<(u32, u16)>,
+    /// Total video packets retransmitted in response to peer/SFU NACKs.
+    pub video_rtx_sent: u64,
+}
+
+/// Maximum cached outgoing video/share packets kept for NACK retransmission.
+const RTX_CACHE_MAX: usize = 512;
+/// Minimum interval (ms) before retransmitting the same packet again.
+const RTX_MIN_COOLDOWN_MS: u64 = 40;
+/// Maximum NACK retransmissions per packet.
+const RTX_MAX_RESENDS: u8 = 3;
+/// Maximum retransmitted packets per incoming RTCP NACK burst.
+const RTX_MAX_BURST: usize = 24;
+
+#[derive(Clone)]
+struct CachedVideoPacket {
+    relay_pkt: Vec<u8>,
+    p2p_pkt: Option<Vec<u8>>,
+    last_sent_ms: u64,
+    resends: u8,
+    share_sock: bool,
 }
 
 impl Default for MediaSession {
@@ -480,6 +504,9 @@ impl MediaSession {
             share_cfg_logged: false,
             share_out: VecDeque::new(),
             share_key_requested: false,
+            video_rtx: BTreeMap::new(),
+            video_rtx_order: VecDeque::new(),
+            video_rtx_sent: 0,
         }
     }
 
@@ -795,6 +822,7 @@ impl MediaSession {
                 }
                 o += len;
             }
+            self.handle_video_nacks(buf, now_ms());
             return;
         }
         let Some(parsed) = unwrap_packet(packet) else {
@@ -1067,6 +1095,14 @@ impl MediaSession {
             } else {
                 None
             };
+            self.cache_video_packet(
+                ssrc,
+                self.video_seq,
+                packet.clone(),
+                p2p_pkt.as_ref().map(|(w, _)| w.clone()),
+                tx_now,
+                false,
+            );
             if pace {
                 self.v_out.push_back((packet, server, label));
                 if let Some((w, path)) = p2p_pkt {
@@ -1153,6 +1189,14 @@ impl MediaSession {
                 }
             };
             let packet = wrap_media_packet(MsgType::VIDEO_RTP, self.share_token, &rtp);
+            self.cache_video_packet(
+                self.share_id,
+                self.share_seq,
+                packet.clone(),
+                None,
+                now,
+                true,
+            );
             self.share_out.push_back((packet, server.clone()));
             self.share_seq = self.share_seq.wrapping_add(1);
             if self.share_seq == 0 {
@@ -1227,6 +1271,100 @@ impl MediaSession {
             self.rtcp.counters.nack += 1;
             self.send_rtcp(MsgType::VIDEO_FEC, &packet);
         }
+    }
+
+    /// Caches one outgoing protected video/share RTP packet for NACK retransmission.
+    fn cache_video_packet(
+        &mut self,
+        ssrc: u32,
+        seq: u16,
+        relay_pkt: Vec<u8>,
+        p2p_pkt: Option<Vec<u8>>,
+        now: u64,
+        share_sock: bool,
+    ) {
+        let key = (ssrc, seq);
+        if !self.video_rtx.contains_key(&key) {
+            self.video_rtx_order.push_back(key);
+        }
+        self.video_rtx.insert(
+            key,
+            CachedVideoPacket {
+                relay_pkt,
+                p2p_pkt,
+                last_sent_ms: now,
+                resends: 0,
+                share_sock,
+            },
+        );
+        while self.video_rtx_order.len() > RTX_CACHE_MAX {
+            if let Some(old) = self.video_rtx_order.pop_front() {
+                self.video_rtx.remove(&old);
+            }
+        }
+    }
+
+    /// Responds to incoming RFC 4585 Generic NACKs (`PT = 205`, `FMT = 1`) by
+    /// retransmitting matching cached video/share packets with cooldown and burst limits.
+    pub(crate) fn handle_video_nacks(&mut self, rtcp_buf: &[u8], now: u64) -> usize {
+        let Some(server) = self.active_server.clone() else {
+            return 0;
+        };
+        let nacks = crate::rtcp::parse_nacks_in_compound(rtcp_buf);
+        if nacks.is_empty() {
+            return 0;
+        }
+        let p2p_path = if !self.group {
+            self.p2p.as_ref().and_then(|p| p.path().cloned())
+        } else {
+            None
+        };
+        let mut to_send: Vec<(Vec<u8>, Option<Vec<u8>>, bool)> = Vec::new();
+        for req in nacks {
+            let target_ssrc = if req.media_ssrc == self.local_uid
+                || (self.share_id != 0 && req.media_ssrc == self.share_id)
+            {
+                req.media_ssrc
+            } else if req.media_ssrc == 0 {
+                self.local_uid
+            } else {
+                continue;
+            };
+            for seq in req.seqs {
+                if to_send.len() >= RTX_MAX_BURST {
+                    break;
+                }
+                let Some(entry) = self.video_rtx.get_mut(&(target_ssrc, seq)) else {
+                    continue;
+                };
+                if entry.resends >= RTX_MAX_RESENDS
+                    || now.saturating_sub(entry.last_sent_ms) < RTX_MIN_COOLDOWN_MS
+                {
+                    continue;
+                }
+                entry.last_sent_ms = now;
+                entry.resends += 1;
+                to_send.push((entry.relay_pkt.clone(), entry.p2p_pkt.clone(), entry.share_sock));
+            }
+            if to_send.len() >= RTX_MAX_BURST {
+                break;
+            }
+        }
+        let resent = to_send.len();
+        if resent > 0 {
+            self.video_rtx_sent = self.video_rtx_sent.saturating_add(resent as u64);
+            for (relay_pkt, p2p_pkt, share_sock) in to_send {
+                if share_sock {
+                    self.send_share(&relay_pkt, &server, "share video rtx");
+                } else {
+                    self.send(&relay_pkt, &server, "video rtx");
+                    if let (Some(w), Some(path)) = (p2p_pkt, p2p_path.as_ref()) {
+                        self.send(&w, path, "P2P video rtx");
+                    }
+                }
+            }
+        }
+        resent
     }
 
     /// Sends a wrapped RTCP packet over the active relay server (and P2P if up).
@@ -1349,6 +1487,9 @@ impl MediaSession {
         self.last_pli_at = 0;
         self.pli_at.clear();
         self.nack = crate::rtcp::NackTracker::default();
+        self.video_rtx.clear();
+        self.video_rtx_order.clear();
+        self.video_rtx_sent = 0;
         self.sess_id = str(params, "sessId");
         self.servers.clear();
         self.replies.clear();
@@ -1503,10 +1644,12 @@ impl MediaSession {
                 sr.on_rtcp("audio", &parsed.payload);
             }
         } else if parsed.msg_type == MsgType::VIDEO_FEC {
-            self.rtcp.on_rtcp(true, &parsed.payload, now_ms());
+            let now = now_ms();
+            self.rtcp.on_rtcp(true, &parsed.payload, now);
             if let Some(sr) = self.send_rate.as_mut() {
                 sr.on_rtcp("video", &parsed.payload);
             }
+            self.handle_video_nacks(&parsed.payload, now);
         } else if parsed.msg_type == MsgType::SERVER_REPLY
             && (parsed.cmd == Some(Command::INIT_CALL_CALLER)
                 || parsed.cmd == Some(Command::INIT_CALL_CALLEE))
@@ -1590,9 +1733,13 @@ impl MediaSession {
             self.on_video_packet(&rtp);
         }
         for (v, data) in rtcp {
-            self.rtcp.on_rtcp(v, &data, now_ms());
+            let now = now_ms();
+            self.rtcp.on_rtcp(v, &data, now);
             if let Some(sr) = self.send_rate.as_mut() {
                 sr.on_rtcp(if v { "video" } else { "audio" }, &data);
+            }
+            if v {
+                self.handle_video_nacks(&data, now);
             }
         }
     }
@@ -4033,5 +4180,61 @@ mod tests {
         assert_eq!(pkts.len(), 1);
         assert_eq!(pkts[0].1, "share EndCall");
         assert_eq!(unwrap_packet(&pkts[0].0).unwrap().token, Some(9999));
+    }
+
+    #[test]
+    fn nack_responder_retransmits_cached_video_with_cooldown_and_cap() {
+        let mut session = MediaSession::new();
+        session.active = true;
+        session.plain_media = true;
+        session.local_uid = 4242;
+        session.server_token = 777;
+        session.video_seq = 500;
+        session.active_server = Some(Server {
+            host: "192.0.2.10".to_owned(),
+            port: 4200,
+        });
+
+        let sent = Arc::new(Mutex::new(Vec::<(Vec<u8>, String)>::new()));
+        let sent_ref = Arc::clone(&sent);
+        session.set_send(move |pkt, _srv, label| {
+            sent_ref.lock().unwrap().push((pkt.to_vec(), label.to_owned()));
+        });
+
+        // Send a multi-packet keyframe (3 chunks -> seqs 500, 501, 502).
+        let big_frame = vec![0x65_u8; crate::video::MAX_CHUNK * 2 + 200];
+        session.send_video_frame(true, &big_frame, false, 1_000);
+        let original = sent.lock().unwrap().clone();
+        assert_eq!(original.len(), 3);
+        sent.lock().unwrap().clear();
+
+        // NACK for seqs 500 and 502 targeting our local_uid.
+        let nack = crate::rtcp::build_nack(9999, 4242, &[500, 502, 600]);
+        let base_ts = now_ms();
+        // Immediate NACK within cooldown window (< 40 ms) is ignored.
+        assert_eq!(session.handle_video_nacks(&nack, base_ts), 0);
+
+        // After cooldown (>= 40 ms): exact cached packets 500 and 502 are retransmitted.
+        let t1 = base_ts + RTX_MIN_COOLDOWN_MS + 10;
+        assert_eq!(session.handle_video_nacks(&nack, t1), 2);
+        assert_eq!(session.video_rtx_sent, 2);
+        {
+            let rtx = sent.lock().unwrap();
+            assert_eq!(rtx.len(), 2);
+            assert_eq!(rtx[0].0, original[0].0);
+            assert_eq!(rtx[0].1, "video rtx");
+            assert_eq!(rtx[1].0, original[2].0);
+            assert_eq!(rtx[1].1, "video rtx");
+        }
+
+        // Wrong SSRC is ignored.
+        let wrong = crate::rtcp::build_nack(9999, 8888, &[500]);
+        assert_eq!(session.handle_video_nacks(&wrong, t1 + 100), 0);
+
+        // Respects RTX_MAX_RESENDS cap (3 total resends per packet).
+        assert_eq!(session.handle_video_nacks(&nack, t1 + 100), 2);
+        assert_eq!(session.handle_video_nacks(&nack, t1 + 200), 2);
+        assert_eq!(session.handle_video_nacks(&nack, t1 + 300), 0);
+        assert_eq!(session.video_rtx_sent, 6);
     }
 }

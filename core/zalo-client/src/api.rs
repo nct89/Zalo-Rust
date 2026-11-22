@@ -3642,7 +3642,7 @@ impl ZaloApi {
             .profile_host
             .as_deref()
             .or(self.friend_host.as_deref())
-            .unwrap_or("https://tt-profile-wpa.zaloapp.com");
+            .unwrap_or("https://tt-profile-wpa.chat.zalo.me");
         let url = format!("{host}/api/gid/encrypt");
         let mut params = self.common_params();
         let payload = serde_json::json!({ "noiseUids": uids });
@@ -3672,7 +3672,7 @@ impl ZaloApi {
             .profile_host
             .as_deref()
             .or(self.friend_host.as_deref())
-            .unwrap_or("https://tt-profile-wpa.zaloapp.com");
+            .unwrap_or("https://tt-profile-wpa.chat.zalo.me");
         let url = format!("{host}/api/gid/decrypt");
         let mut params = self.common_params();
         let serialized_list = serde_json::to_string(global_uids)?;
