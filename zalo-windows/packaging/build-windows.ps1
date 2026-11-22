@@ -87,6 +87,16 @@ try {
         }
     }
 
+    $EmojiSrc = Join-Path $Root "assets\emoji"
+    if (Test-Path $EmojiSrc) {
+        Copy-Item -Recurse -Force $EmojiSrc (Join-Path $Stage "emoji")
+    }
+
+    $ImagesSrc = Join-Path $Root "assets\images"
+    if (Test-Path $ImagesSrc) {
+        Copy-Item -Recurse -Force $ImagesSrc (Join-Path $Stage "images")
+    }
+
     $ZipPath = Join-Path $DistDir "$StageName.zip"
     if (Test-Path $ZipPath) {
         Remove-Item -Force $ZipPath

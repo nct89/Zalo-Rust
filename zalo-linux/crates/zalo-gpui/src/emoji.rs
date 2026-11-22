@@ -42,23 +42,48 @@ const GROUP_POS: [usize; 9] = [0, 86, 290, 437, 504, 561, 676, 854, 1124];
 
 const HIDDEN: &[&str] = &[":-|", ":+", ";8", "/-jj", "/-JJ"];
 
-const EMOJI_DIR: &str = concat!(
+const DEV_EMOJI_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../assets/emoji"
 );
-const SPRITE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../assets/emoji/emoji.1e7786c93c8a0c1773f165e2de2fd129.png"
-);
+const SPRITE_FILE: &str = "emoji.1e7786c93c8a0c1773f165e2de2fd129.png";
 
 /// Sprite is 51 × 41 cells of 64 px (CSS `background-size: 5100% 4100%`).
 const SPRITE_COLS: u32 = 51;
 const SPRITE_ROWS: u32 = 41;
 
-/// Root of the decoded emoji pack (`emoji-32/`, `emoji-rc.json`).
+/// Root of the decoded emoji pack (`emoji-32/`, `emoji-pos.json`, `emoji-rc.json`, sprite).
+/// Searches runtime install paths (Linux/macOS/Windows) before falling back to the dev tree.
 #[must_use]
 pub fn emoji_dir() -> PathBuf {
-    PathBuf::from(EMOJI_DIR)
+    let mut candidates = Vec::new();
+    if let Ok(custom) = std::env::var("ZALO_EMOJI_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            candidates.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Some(data) = zalo_shell::data_home() {
+        candidates.push(data.join("zalo-rust").join("emoji"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("emoji"));
+            candidates.push(parent.join("assets").join("emoji"));
+            candidates.push(parent.join("../share/zalo-rust/emoji"));
+            #[cfg(target_os = "macos")]
+            candidates.push(parent.join("../Resources/zalo-rust/emoji"));
+        }
+    }
+    candidates.push(PathBuf::from("/app/share/zalo-rust/emoji"));
+    candidates.push(PathBuf::from("/usr/share/zalo-rust/emoji"));
+    candidates.push(PathBuf::from("/usr/local/share/zalo-rust/emoji"));
+    let dev = PathBuf::from(DEV_EMOJI_DIR);
+    candidates.push(dev.clone());
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("emoji-pos.json").is_file())
+        .unwrap_or(dev)
 }
 
 /// Lazy catalogue matching Zalo PC's filtered `emojiObj`.
@@ -237,7 +262,7 @@ fn load_catalog() -> Vec<EmojiItem> {
             cell_to_uni.entry(cell).or_insert_with(|| key.clone());
         }
     }
-    let sprite = image::open(SPRITE).ok();
+    let sprite = image::open(dir.join(SPRITE_FILE)).ok();
     let cache = classic_cache_dir();
     if sprite.is_some() {
         let _ = std::fs::create_dir_all(&cache);

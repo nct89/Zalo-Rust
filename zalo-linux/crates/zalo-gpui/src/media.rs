@@ -1268,6 +1268,42 @@ pub fn rgba_to_bgra(mut img: image::RgbaImage) -> image::RgbaImage {
     img
 }
 
+/// Locate the bundled `assets/images` directory across installed runtime dirs or the dev tree.
+#[must_use]
+pub(crate) fn images_dir() -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Ok(custom) = std::env::var("ZALO_IMAGES_DIR") {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            candidates.push(PathBuf::from(trimmed));
+        }
+    }
+    if let Some(data) = zalo_shell::data_home() {
+        candidates.push(data.join("zalo-rust").join("images"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("images"));
+            candidates.push(parent.join("assets").join("images"));
+            candidates.push(parent.join("../share/zalo-rust/images"));
+            #[cfg(target_os = "macos")]
+            candidates.push(parent.join("../Resources/zalo-rust/images"));
+        }
+    }
+    candidates.push(PathBuf::from("/app/share/zalo-rust/images"));
+    candidates.push(PathBuf::from("/usr/share/zalo-rust/images"));
+    candidates.push(PathBuf::from("/usr/local/share/zalo-rust/images"));
+    let dev = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../assets/images"
+    ));
+    candidates.push(dev.clone());
+    candidates
+        .into_iter()
+        .find(|dir| dir.is_dir())
+        .unwrap_or(dev)
+}
+
 /// PNG from `assets/images/<file>`, decoded once (BGRA).
 #[must_use]
 pub fn png_asset(file: &str, max_edge: u32) -> Option<Arc<RenderImage>> {
@@ -1280,11 +1316,7 @@ pub fn png_asset(file: &str, max_edge: u32) -> Option<Arc<RenderImage>> {
     if let Some(hit) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
         return hit;
     }
-    let path = Path::new(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../assets/images"
-    ))
-    .join(file);
+    let path = images_dir().join(file);
     let image = std::fs::read(path)
         .ok()
         .and_then(|b| decode_rgba(&b, max_edge))
@@ -1295,19 +1327,15 @@ pub fn png_asset(file: &str, max_edge: u32) -> Option<Arc<RenderImage>> {
     image
 }
 
-/// Zalo's yellow `Like_24_emoji` (rasterised PNG under `assets/images`).
+/// Zalo's yellow `Like_24_emoji` (embedded PNG so packaged builds always render it).
 /// GPUI cannot paint COLRv1 Noto emoji directly.
 #[must_use]
 pub fn like_icon() -> Option<Arc<RenderImage>> {
     reaction_icon_by_index(0).or_else(|| {
+        const BYTES: &[u8] = include_bytes!("../../../../assets/images/like-24-emoji@4x.png");
         static LIKE: std::sync::OnceLock<Option<Arc<RenderImage>>> = std::sync::OnceLock::new();
         LIKE.get_or_init(|| {
-            let path = Path::new(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../../assets/images/like-24-emoji@4x.png"
-            ));
-            let bytes = std::fs::read(path).ok()?;
-            let rgba = decode_rgba(&bytes, 96)?;
+            let rgba = decode_rgba(BYTES, 96)?;
             Some(Arc::new(RenderImage::new([Frame::new(rgba_to_bgra(rgba))])))
         })
         .clone()
@@ -1315,23 +1343,22 @@ pub fn like_icon() -> Option<Arc<RenderImage>> {
 }
 
 /// Official Zalo 6-emoji reaction set (`Like`, `Heart`, `Haha`, `Wow`, `Cry`, `Angry`),
-/// rasterised from Zalo PC's `*_24_emoji.svg` under `assets/images/reactions/` and
+/// rasterised from Zalo PC's `*_24_emoji.svg`, embedded in the binary, and
 /// cached once in GPU-ready BGRA [`RenderImage`] form.
 #[must_use]
 pub fn reaction_icon_by_index(index: usize) -> Option<Arc<RenderImage>> {
-    const FILES: [&str; 6] = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/like.png"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/heart.png"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/haha.png"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/wow.png"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/cry.png"),
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/images/reactions/angry.png"),
+    const BYTES: [&[u8]; 6] = [
+        include_bytes!("../../../../assets/images/reactions/like.png"),
+        include_bytes!("../../../../assets/images/reactions/heart.png"),
+        include_bytes!("../../../../assets/images/reactions/haha.png"),
+        include_bytes!("../../../../assets/images/reactions/wow.png"),
+        include_bytes!("../../../../assets/images/reactions/cry.png"),
+        include_bytes!("../../../../assets/images/reactions/angry.png"),
     ];
     static ICONS: std::sync::OnceLock<[Option<Arc<RenderImage>>; 6]> = std::sync::OnceLock::new();
     let table = ICONS.get_or_init(|| {
         std::array::from_fn(|i| {
-            let bytes = std::fs::read(Path::new(FILES[i])).ok()?;
-            let rgba = decode_rgba(&bytes, 96)?;
+            let rgba = decode_rgba(BYTES[i], 96)?;
             Some(Arc::new(RenderImage::new([Frame::new(rgba_to_bgra(rgba))])))
         })
     });
@@ -2017,5 +2044,17 @@ mod tests {
         assert_eq!(lines[0], "# Title");
         assert!(lines.iter().any(|l| l.contains("code")));
         let _ = std::fs::remove_file(dir);
+    }
+
+    #[test]
+    fn embedded_like_and_reaction_icons_decode() {
+        assert!(like_icon().is_some(), "embedded like icon must decode");
+        for idx in 0..6 {
+            assert!(
+                reaction_icon_by_index(idx).is_some(),
+                "embedded reaction icon {idx} must decode"
+            );
+        }
+        assert!(png_asset("zcloud-promo.png", 672).is_some());
     }
 }

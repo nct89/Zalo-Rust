@@ -651,9 +651,19 @@ fn install_user_local(
         &asset_root.join("wasm"),
         "wasm",
         0.70,
-        0.78,
+        0.75,
         on_status,
     )?;
+    let emoji_src = crate::emoji::emoji_dir();
+    if emoji_src.is_dir() && emoji_src != asset_root.join("emoji") {
+        on_status(0.76, "Đang cài: bộ emoji Zalo".to_owned());
+        copy_dir_recursive(&emoji_src, &asset_root.join("emoji"))?;
+    }
+    let images_src = crate::media::images_dir();
+    if images_src.is_dir() && images_src != asset_root.join("images") {
+        on_status(0.78, "Đang cài: ảnh giao diện Zalo".to_owned());
+        copy_dir_recursive(&images_src, &asset_root.join("images"))?;
+    }
 
     on_status(0.80, "Đang cài: icons/zalo-gpui.png & zalo-gpui.desktop".to_owned());
     let apps_dir = data_home.join("applications");
@@ -666,6 +676,23 @@ fn install_user_local(
     refresh_desktop_caches(&data_home, on_status);
     on_status(1.0, format!("Đã cài xong: {}", short_user_path(&target_exe)));
     Ok(target_exe)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("Tạo thư mục {}: {e}", dst.display()))?;
+    for entry in std::fs::read_dir(src).map_err(|e| format!("Đọc thư mục {}: {e}", src.display()))?
+    {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if ty.is_file() {
+            copy_file_atomic(&from, &to, false)?;
+        }
+    }
+    Ok(())
 }
 
 fn refresh_desktop_caches(data_home: &Path, on_status: &mut dyn FnMut(f32, String)) {

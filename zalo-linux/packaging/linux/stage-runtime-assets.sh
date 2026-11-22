@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stage minimal runtime fonts (~1.4 MiB), call ringtones (~72 KiB), and Sync/Backup WASM (~411 KiB) for packages.
+# Stage runtime fonts (~1.5 MiB), call ringtones (~76 KiB), Sync/Backup WASM (~420 KiB),
+# Zalo emoji pack (~10 MiB), and UI images (~420 KiB) for packages.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -7,8 +8,10 @@ DST_DIR="${1:?usage: stage-runtime-assets.sh <dest-zalo-rust-dir>}"
 FONTS_SRC="$ROOT/assets/fonts"
 SOUNDS_SRC="$ROOT/assets/sounds"
 WASM_SRC="$ROOT/assets/wasm"
+EMOJI_SRC="$ROOT/assets/emoji"
+IMAGES_SRC="$ROOT/assets/images"
 
-mkdir -p "$DST_DIR/fonts" "$DST_DIR/zcall-sound" "$DST_DIR/wasm"
+mkdir -p "$DST_DIR/fonts" "$DST_DIR/zcall-sound" "$DST_DIR/wasm" "$DST_DIR/emoji" "$DST_DIR/images"
 
 for f in \
   "Zalo-Segoe-UI.dc1a7d868a0b3a0e2daa8b36567e9ea9.ttf" \
@@ -30,3 +33,13 @@ for w in \
 do
   install -m 644 "$WASM_SRC/$w" "$DST_DIR/wasm/$w"
 done
+
+if [ -d "$EMOJI_SRC" ]; then
+  cp -a "$EMOJI_SRC/." "$DST_DIR/emoji/"
+  chmod -R a+rX "$DST_DIR/emoji"
+fi
+
+if [ -d "$IMAGES_SRC" ]; then
+  cp -a "$IMAGES_SRC/." "$DST_DIR/images/"
+  chmod -R a+rX "$DST_DIR/images"
+fi
