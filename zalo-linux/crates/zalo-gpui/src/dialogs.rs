@@ -2144,7 +2144,108 @@ impl ShellView {
                                             .child(repo_label),
                                     ),
                             ),
-                    ),
+                    )
+                    .when_some(self.update_info.clone(), |el, info| {
+                        let dl_url = info.download_url.clone();
+                        let tag = info.tag.clone();
+                        let summary = info.summary.clone();
+                        el.child(
+                            div()
+                                .w_full()
+                                .rounded(px(8.))
+                                .bg(rgb(badge_bg))
+                                .border_1()
+                                .border_color(crate::color::border_subtle())
+                                .px(px(14.))
+                                .py(px(10.))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(badge_fg))
+                                                .child(format!(
+                                                    "{} {tag}",
+                                                    crate::i18n::t("Có phiên bản mới:")
+                                                )),
+                                        )
+                                        .when(!summary.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(muted))
+                                                    .truncate()
+                                                    .child(summary),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .id("about-download-update-btn")
+                                        .flex_none()
+                                        .px(px(12.))
+                                        .h(px(30.))
+                                        .rounded(px(4.))
+                                        .bg(rgb(primary_bg))
+                                        .hover(move |s| s.bg(rgb(primary_hover)))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(12.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(primary_fg))
+                                        .cursor_pointer()
+                                        .on_click(move |_, _, cx| {
+                                            cx.open_url(&dl_url);
+                                        })
+                                        .child(crate::i18n::t("Tải cập nhật")),
+                                ),
+                        )
+                    })
+                    .when(self.update_info.is_none(), |el| {
+                        let checking = self.update_checking;
+                        let note = self.update_checked_note.clone();
+                        el.child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .text_size(px(12.5))
+                                .child(div().text_color(rgb(muted)).child(if checking {
+                                    crate::i18n::t("Đang kiểm tra cập nhật...")
+                                } else if let Some(msg) = note {
+                                    msg
+                                } else {
+                                    crate::i18n::t("Kiểm tra phiên bản mới từ GitHub Releases")
+                                }))
+                                .when(!checking, |d| {
+                                    d.child(
+                                        div()
+                                            .id("about-check-update-btn")
+                                            .text_color(rgb(link_fg))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .cursor_pointer()
+                                            .hover(|s| s.underline())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.trigger_update_check(true, cx);
+                                            }))
+                                            .child(crate::i18n::t("Kiểm tra cập nhật")),
+                                    )
+                                }),
+                        )
+                    }),
             )
             .child(
                 div()

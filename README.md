@@ -230,9 +230,12 @@ When Zalo updates its desktop `zpw_ver` (`client_version`) or `User-Agent`, you 
 
 ## Automation
 
-- **CI ([ci.yml](.github/workflows/ci.yml))**: Validates `protocol.json`, runs full Linux workspace tests & release build, and tests OS-independent `core/*` crates across Ubuntu, Windows, and macOS on every push and pull request.
-- **Release ([release.yml](.github/workflows/release.yml))**: Triggered on `v*` tags — runs workspace tests, stamps the tag version into the binary, builds Linux `.deb` / portable `.tar.gz` and macOS `Zalo.app` `.zip` bundles, generates `SHA256SUMS.txt`, and publishes a GitHub Release.
-- **Upstream Watcher ([zalo-watcher.yml](.github/workflows/zalo-watcher.yml))**: Checks daily for upstream Zalo Desktop releases and automatically opens a tracking issue with a protocol verification checklist.
+- **CI ([ci.yml](.github/workflows/ci.yml))**: Validates `protocol.json`, runs full Linux workspace tests & release build, tests OS-independent `core/*` crates across Ubuntu/Windows/macOS, and verifies native macOS & Windows GPUI builds on every push and pull request.
+- **Upstream Watcher & PR Analyzer ([zalo-watcher.yml](.github/workflows/zalo-watcher.yml) + [zalo-upstream-diff.py](scripts/zalo-upstream-diff.py))**: Probes official Zalo Windows & macOS download redirects daily, downloads and unpacks `app.asar` when a newer version ships, diffs `zpw_ver` / WASM / `/api/...` endpoints / `STR_*` keys, and automatically opens a labeled Pull Request (`upstream-sync`, `agy-auto`, `release:patch`/`release:minor`).
+- **CodeRabbit Automated Review ([.coderabbit.yaml](.coderabbit.yaml))**: Automatically reviews every PR targeting `main` (and every incremental push) with repository-specific Rust/GPUI rules.
+- **Antigravity CLI PR Worker ([agy-pr-bot.py](scripts/agy-pr-bot.py))**: Local `systemd --user` worker that invokes `agy` in an isolated `git worktree` to implement upstream updates, resolve CodeRabbit review comments & CI failures, run `cargo test --workspace`, push fixes, and notify when ready to merge (see [scripts/README.md](scripts/README.md)).
+- **Auto Tag & Release ([auto-release.yml](.github/workflows/auto-release.yml) + [release.yml](.github/workflows/release.yml))**: Merging a PR labeled `release:patch` / `release:minor` automatically bumps workspace/packaging versions and pushes tag `vX.Y.Z`, triggering cross-platform builds (Linux `.deb` / `.tar.gz`, macOS `Zalo.app` `.zip`, Windows `.zip` / `-setup.exe`).
+- **In-App Update Notifications (`updater.rs`)**: Compares the running `APP_VERSION` against GitHub Releases (`releases/latest`) in the background and alerts the user via OS desktop notification, a titlebar version badge indicator, and a one-click download card inside **About / Version info**.
 
 ## Support & Contact
 

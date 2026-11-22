@@ -101,6 +101,7 @@ mod sidebar;
 mod stickers;
 mod sync_worker;
 mod titlebar;
+mod updater;
 mod video;
 mod viewer;
 mod voice;

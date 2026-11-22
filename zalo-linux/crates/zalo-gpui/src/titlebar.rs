@@ -102,7 +102,7 @@ fn flag_icon(english: bool) -> Option<Arc<RenderImage>> {
 }
 
 /// Main-window caption bar with compact VI/EN flag switch, Light/Dark theme switch,
-/// and clickable build version badge (e.g. `v0.2.1`).
+/// and clickable build version badge (e.g. `v0.2.2`, plus an accent dot when an update is available).
 #[allow(clippy::too_many_arguments)]
 pub fn main_titlebar_with_theme(
     corners: CsdCorners,
@@ -110,6 +110,7 @@ pub fn main_titlebar_with_theme(
     title: String,
     to_tray: bool,
     english: bool,
+    update_tag: Option<&str>,
     on_toggle_lang: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_theme: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_open_about: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -122,7 +123,7 @@ pub fn main_titlebar_with_theme(
         .gap(px(6.))
         .child(lang_switch(english, on_toggle_lang))
         .child(theme_switch(on_toggle_theme))
-        .child(version_badge(on_open_about))
+        .child(version_badge(update_tag, on_open_about))
         .into_any_element();
     caption_bar(
         corners,
@@ -139,12 +140,26 @@ pub fn main_titlebar_with_theme(
 }
 
 fn version_badge(
+    update_tag: Option<&str>,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl gpui::IntoElement {
-    let bg = token_rgb("--layer-background", "#ffffff");
+    let has_update = update_tag.is_some();
+    let bg = if has_update {
+        token_rgb("--accent-blue-bg-subtle", "#f0f7ff")
+    } else {
+        token_rgb("--layer-background", "#ffffff")
+    };
     let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
-    let fg = token_rgb("--text-secondary", "#5a6981");
-    let tip_text = "Thông tin phiên bản";
+    let fg = if has_update {
+        token_rgb("--accent-blue-text", "#005ae0")
+    } else {
+        token_rgb("--text-secondary", "#5a6981")
+    };
+    let dot_bg = token_rgb("--accent-blue-bg", "#0068ff");
+    let tip_text = match update_tag {
+        Some(tag) => format!("{} {tag}", crate::i18n::t("Có bản cập nhật mới:")),
+        None => crate::i18n::t("Thông tin phiên bản"),
+    };
     div()
         .id("caption-version-badge")
         .h(px(20.))
@@ -155,15 +170,20 @@ fn version_badge(
         .border_color(crate::color::border_subtle())
         .hover(move |s| s.bg(rgb(hover_bg)))
         .flex()
+        .flex_row()
         .items_center()
         .justify_center()
+        .gap(px(5.))
         .text_size(px(11.))
         .line_height(px(11.))
         .font_family(crate::fonts::FAMILY_SEMIBOLD)
         .text_color(rgb(fg))
         .cursor_pointer()
-        .tooltip(move |_, cx| crate::widgets::tip(tip_text, cx))
+        .tooltip(move |_, cx| crate::widgets::tip(tip_text.clone(), cx))
         .on_click(on_click)
+        .when(has_update, |el| {
+            el.child(div().size(px(6.)).rounded(px(3.)).bg(rgb(dot_bg)))
+        })
         .child(crate::APP_VERSION_TAG)
 }
 

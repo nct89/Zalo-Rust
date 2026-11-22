@@ -1,0 +1,11 @@
+[Unit]
+Description=Zalo-Rust Antigravity CLI (agy) Autonomous PR Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/zalo-rust-bot/env
+WorkingDirectory=%h/Desktop/Projects/Zalo-Rust
+ExecStart=/usr/bin/flock -n /tmp/zalo-agy-pr-bot.lock /usr/bin/python3 %h/Desktop/Projects/Zalo-Rust/scripts/agy-pr-bot.py --once
+TimeoutStartSec=2400

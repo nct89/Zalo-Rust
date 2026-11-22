@@ -1,0 +1,103 @@
+name: Auto Tag & Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    name: Bump Version & Push Release Tag
+    if: >-
+      github.event.pull_request.merged == true &&
+      (
+        contains(github.event.pull_request.labels.*.name, 'release:patch') ||
+        contains(github.event.pull_request.labels.*.name, 'release:minor') ||
+        contains(github.event.pull_request.labels.*.name, 'release:major')
+      )
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check RELEASE_TOKEN availability
+        id: tok
+        env:
+          HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
+        run: |
+          if [[ "$HAS_RELEASE_TOKEN" == "true" ]]; then
+            echo "use_pat=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "use_pat=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::secrets.RELEASE_TOKEN is not configured. Using GITHUB_TOKEN will push the tag but GitHub Actions will not recursively trigger release.yml. Add a Fine-grained PAT as secret RELEASE_TOKEN (Contents: Read & Write) for full auto-release."
+          fi
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Compute and apply next semantic version
+        id: bump
+        env:
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, pathlib, re
+
+          labels = set(json.loads(os.environ["LABELS_JSON"]))
+          cargo_toml = pathlib.Path("Cargo.toml")
+          text = cargo_toml.read_text(encoding="utf-8")
+          m = re.search(r'(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', text)
+          if not m:
+              raise SystemExit("Could not find [workspace.package] version in Cargo.toml")
+          maj, min_, pat = int(m.group(1)), int(m.group(2)), int(m.group(3))
+          if "release:major" in labels:
+              maj, min_, pat = maj + 1, 0, 0
+          elif "release:minor" in labels:
+              min_, pat = min_ + 1, 0
+          else:
+              pat += 1
+          new_ver = f"{maj}.{min_}.{pat}"
+          old_ver = f"{m.group(1)}.{m.group(2)}.{m.group(3)}"
+          print(f"Bumping {old_ver} -> {new_ver}")
+
+          def replace_once(path_str: str, pattern: str, repl: str) -> None:
+              p = pathlib.Path(path_str)
+              if not p.is_file():
+                  return
+              src = p.read_text(encoding="utf-8")
+              dst, count = re.subn(pattern, repl, src, count=1, flags=re.MULTILINE)
+              if count:
+                  p.write_text(dst, encoding="utf-8")
+
+          replace_once("Cargo.toml", r'^version\s*=\s*"[^"]+"', f'version = "{new_ver}"')
+          replace_once("zalo-linux/packaging/arch/PKGBUILD", r'^pkgver=.*$', f'pkgver={new_ver}')
+          replace_once("zalo-linux/packaging/rpm/zalo-linux.spec", r'^Version:\s*.*$', f'Version:        {new_ver}')
+          replace_once("zalo-linux/packaging/deb/build-deb.sh", r'WORKSPACE_VERSION:-([0-9.]+)', f'WORKSPACE_VERSION:-{new_ver}')
+          replace_once("zalo-macos/packaging/build-app.sh", r'WORKSPACE_VERSION:-([0-9.]+)', f'WORKSPACE_VERSION:-{new_ver}')
+          replace_once("zalo-windows/packaging/build-windows.ps1", r'\$WorkspaceVersion\s*=\s*"[^"]+"', f'$WorkspaceVersion = "{new_ver}"')
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"old_ver={old_ver}\n")
+              out.write(f"new_ver={new_ver}\n")
+              out.write(f"tag=v{new_ver}\n")
+          EOF
+
+      - name: Commit version bump and push tag
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.bump.outputs.tag }}"
+          git config user.name "zalo-rust-bot[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml \
+            zalo-linux/packaging/arch/PKGBUILD \
+            zalo-linux/packaging/rpm/zalo-linux.spec \
+            zalo-linux/packaging/deb/build-deb.sh \
+            zalo-macos/packaging/build-app.sh \
+            zalo-windows/packaging/build-windows.ps1
+          git commit -m "chore(release): ${TAG}"
+          git tag -a "$TAG" -m "Release ${TAG}"
+          git push origin main "$TAG"

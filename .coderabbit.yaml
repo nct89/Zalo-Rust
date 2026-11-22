@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+language: "vi-VN"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    base_branches:
+      - "main"
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "DNM"
+
+  path_filters:
+    - "!assets/**"
+    - "!vendor/**"
+    - "!dist/**"
+    - "!Cargo.lock"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.wasm"
+    - "!**/*.ttf"
+    - "!**/*.mp3"
+
+  path_instructions:
+    - path: "core/**"
+      instructions: |
+        - Các crate trong `core/` bắt buộc giữ `#![forbid(unsafe_code)]` và không phụ thuộc vào API riêng của Linux/macOS/Windows.
+        - Kiểm tra kỹ tính tương thích ngược giao thức Zalo (`zpw_ver`, `ParamCipher`, protobuf `SyncChunk`, WASM exports).
+        - Không ghi cứng thông tin nhạy cảm, cookie, số điện thoại hay UID thật vào test.
+    - path: "zalo-linux/crates/zalo-gpui/**"
+      instructions: |
+        - Giao diện GPUI phải tương thích cả 3 nền tảng Linux, macOS và Windows (`#[cfg(target_os = ...)]`).
+        - Màu sắc UI bắt buộc dùng `token_rgb(...)` từ `zalo-design` (không gán cứng mã màu hex lệch giữa chế độ Sáng và Tối).
+        - Không làm chậm cold startup; mọi tác vụ mạng/I/O nặng phải chạy bất đồng bộ ở nền.
+    - path: "zalo-macos/**"
+      instructions: |
+        - Đảm bảo khớp API công khai với `zalo-linux/crates/zalo-shell`, `zcall-audio`, `zcall-engine` và vẫn biên dịch được trên Linux khi chạy `cargo test --workspace`.
+    - path: "zalo-windows/**"
+      instructions: |
+        - Đảm bảo khớp API công khai với `zalo-linux/crates/zalo-shell`, `zcall-audio`, `zcall-engine` và vẫn biên dịch được trên Linux khi chạy `cargo test --workspace`.
+    - path: "scripts/**"
+      instructions: |
+        - Kiểm tra bảo mật shell/subprocess (tránh shell injection, không chạy lệnh với input chưa kiểm duyệt từ fork ngoài).
+        - Đảm bảo có giới hạn vòng lặp và timeout khi gọi `agy` CLI hoặc HTTP API.
+    - path: "README.md"
+      instructions: |
+        - Xác minh nội dung README khớp với tính năng, cấu trúc crate, cờ CLI và workflow CI/Release thực tế của repo.
+
+chat:
+  auto_reply: true

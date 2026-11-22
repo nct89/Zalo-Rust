@@ -5,104 +5,101 @@ on:
     # Run daily at 02:00 UTC (09:00 UTC+7).
     - cron: "0 2 * * *"
   workflow_dispatch:
+    inputs:
+      force_analyze:
+        description: "Force download, analyze, and open/update PR even if version matches protocol.json"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
   issues: write
 
 jobs:
-  check-upstream:
-    name: Check for new Zalo Desktop releases
+  check-and-pr:
+    name: Detect, Unpack & Open Upstream PR
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Query official Zalo Desktop update feed
+      - name: Install 7z for installer extraction
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends p7zip-full
+
+      - name: Probe official Zalo Windows/macOS feeds & analyze new release
         id: probe
         run: |
-          python3 - <<'EOF'
-          import json, os, re, urllib.request
+          FORCE_FLAG=""
+          if [[ "${{ github.event.inputs.force_analyze }}" == "true" ]]; then
+            FORCE_FLAG="--force"
+          fi
+          python3 scripts/zalo-upstream-diff.py \
+            --download \
+            --analyze \
+            --update-protocol \
+            --report-dir docs/upstream-reports \
+            --json-out /tmp/upstream-diff.json \
+            $FORCE_FLAG
 
-          pinned = json.load(open("protocol.json", encoding="utf-8"))
-          current_ver = pinned.get("zalo_desktop_version", "0.0.0").strip()
-          current_zpw = pinned.get("client_version", "").strip()
+      - name: Create or update upstream sync PR
+        if: steps.probe.outputs.is_newer == 'true' || github.event.inputs.force_analyze == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_VER: ${{ steps.probe.outputs.upstream_ver }}
+          CURRENT_VER: ${{ steps.probe.outputs.current_ver }}
+          CLASSIFICATION: ${{ steps.probe.outputs.classification }}
+          REPORT_PATH: ${{ steps.probe.outputs.report_path }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/upstream-zalo-${UPSTREAM_VER}"
+          git config user.name "zalo-rust-bot[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          feeds = [
-              "https://res-download-pc.zadn.vn/hybrid/latest.yml",
-              "https://res-download-pc.zadn.vn/hybrid/latest-mac.yml",
-          ]
+          git checkout -B "$BRANCH"
+          git add protocol.json "$REPORT_PATH"
+          if git diff --cached --quiet; then
+            echo "No changes to commit for ${UPSTREAM_VER}"
+            exit 0
+          fi
 
-          upstream_ver = ""
-          feed_used = ""
-          raw_snippet = ""
-          for url in feeds:
-              try:
-                  req = urllib.request.Request(url, headers={"User-Agent": "Zalo-Rust-Watcher/1.0"})
-                  with urllib.request.urlopen(req, timeout=20) as resp:
-                      body = resp.read().decode("utf-8", errors="replace")
-                  m = re.search(r"^version:\s*([0-9]+\.[0-9]+\.[0-9]+)", body, re.MULTILINE)
-                  if m:
-                      upstream_ver = m.group(1)
-                      feed_used = url
-                      raw_snippet = "\n".join(body.splitlines()[:10])
-                      break
-              except Exception as exc:
-                  print(f"Feed {url} unavailable: {exc}")
+          git commit -m "chore(upstream): analyze Zalo Desktop ${UPSTREAM_VER} (from ${CURRENT_VER})"
+          git push --force-with-lease origin "$BRANCH"
 
-          def parse_tuple(v):
-              return tuple(int(x) for x in re.findall(r"\d+", v))
+          # Ensure automation labels exist
+          for spec in \
+            "upstream-sync:0068ff:Automated upstream Zalo Desktop update analysis" \
+            "agy-auto:7c3aed:Eligible for Antigravity CLI autonomous PR worker" \
+            "release:patch:0e8a16:Auto-bump patch version and publish release on merge" \
+            "release:minor:1d76db:Auto-bump minor version and publish release on merge" \
+            "ready-to-merge:2ea043:CI green and AI review clean" \
+            "needs-human:d93f0b:Requires manual developer intervention"; do
+            IFS=':' read -r name color desc <<< "$spec"
+            gh label create "$name" --color "$color" --description "$desc" --force || true
+          done
 
-          is_newer = bool(upstream_ver) and parse_tuple(upstream_ver) > parse_tuple(current_ver)
-          print(f"Pinned: {current_ver} (zpw_ver={current_zpw}) | Upstream: {upstream_ver or 'unknown'} | Newer: {is_newer}")
+          RELEASE_LABEL="release:patch"
+          if [[ "$CLASSIFICATION" == "feature-update" ]]; then
+            RELEASE_LABEL="release:minor"
+          fi
 
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
-              out.write(f"current_ver={current_ver}\n")
-              out.write(f"current_zpw={current_zpw}\n")
-              out.write(f"upstream_ver={upstream_ver}\n")
-              out.write(f"feed_used={feed_used}\n")
-              out.write(f"is_newer={'true' if is_newer else 'false'}\n")
-          EOF
-
-      - name: Open tracking issue if upstream version is newer
-        if: steps.probe.outputs.is_newer == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const upstream = '${{ steps.probe.outputs.upstream_ver }}';
-            const current = '${{ steps.probe.outputs.current_ver }}';
-            const zpw = '${{ steps.probe.outputs.current_zpw }}';
-            const feed = '${{ steps.probe.outputs.feed_used }}';
-            const title = `Upstream Zalo Desktop update detected: ${upstream}`;
-
-            const existing = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'all',
-              per_page: 50,
-            });
-            if (existing.data.some((issue) => issue.title === title)) {
-              core.info(`Issue already exists for ${upstream}`);
-              return;
-            }
-
-            const body = [
-              `A newer upstream Zalo Desktop release **${upstream}** was detected (currently pinned: **${current}**, \`zpw_ver=${zpw}\`).`,
-              '',
-              `- Feed: \`${feed}\``,
-              '',
-              '### Verification Checklist',
-              '- [ ] Check if `client_version` (`zpw_ver`) or `User-Agent` changed -> update `protocol.json` and `core/zalo-protocol/src/param_cipher.rs`.',
-              '- [ ] Check `ParamCipher` key & request signing in `core/zalo-protocol`.',
-              '- [ ] Check REST endpoints / WebSocket `cmd` changes in `core/zalo-client`.',
-              '- [ ] Check `libzproto_wasm_bg.*.wasm` hash & exports in `assets/wasm/` and `core/zalo-sync2`.',
-              '- [ ] Check UI assets (`zalo-font`, emoji catalog, `core/zalo-design` tokens & i18n strings).',
-              '- [ ] Run `cargo test --workspace -- --test-threads=1` and tag a new release.',
-            ].join('\n');
-
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body,
-            });
+          PR_TITLE="chore(upstream): sync Zalo Desktop ${UPSTREAM_VER}"
+          EXISTING_PR="$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$EXISTING_PR" ]]; then
+            gh pr edit "$EXISTING_PR" --body-file "$REPORT_PATH"
+            echo "Updated existing PR #${EXISTING_PR}"
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "$PR_TITLE" \
+              --body-file "$REPORT_PATH" \
+              --label "upstream-sync" \
+              --label "agy-auto" \
+              --label "$RELEASE_LABEL"
+          fi

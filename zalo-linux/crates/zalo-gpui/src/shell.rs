@@ -258,6 +258,12 @@ pub struct ShellView {
     pub(crate) capture_busy: bool,
     /// zCloud / Tools / Starred Messages popover next to the rail.
     pub(crate) rail_popup: Option<crate::rail::RailPopup>,
+    /// Newer GitHub Release available, if detected by `updater`.
+    pub(crate) update_info: Option<crate::updater::UpdateInfo>,
+    /// True while a release update check is currently in flight.
+    pub(crate) update_checking: bool,
+    /// Human-readable status note from the last manual update check.
+    pub(crate) update_checked_note: Option<String>,
     /// Bare group ids from `/api/group/getlg/e2ee`. `None` until a live fetch.
     pub(crate) e2ee_groups: Option<Vec<String>>,
     pub(crate) e2ee_busy: bool,
@@ -726,6 +732,9 @@ impl ShellView {
             caption_input,
             capture_busy: false,
             rail_popup: None,
+            update_info: None,
+            update_checking: false,
+            update_checked_note: None,
             e2ee_groups: None,
             e2ee_busy: false,
             e2ee_failed: false,
@@ -926,7 +935,110 @@ impl ShellView {
             _ => {}
         }
         this.apply_profile_aliases();
+        if !cfg!(test) && this.solo.is_none() && this.prefs.bool("checkUpdates", true) {
+            this.start_update_poller(cx);
+        }
         this
+    }
+
+    fn start_update_poller(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            gpui::Timer::after(std::time::Duration::from_secs(5)).await;
+            loop {
+                let alive = this
+                    .update(cx, |view, cx| {
+                        view.trigger_update_check(false, cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+                gpui::Timer::after(std::time::Duration::from_secs(
+                    crate::updater::UPDATE_POLL_INTERVAL_SECS,
+                ))
+                .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Queries GitHub Releases asynchronously for a version newer than `APP_VERSION`.
+    pub(crate) fn trigger_update_check(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update_checking {
+            return;
+        }
+        self.update_checking = true;
+        if manual {
+            self.update_checked_note = None;
+        }
+        let etag = if manual {
+            None
+        } else {
+            let saved = self.prefs.str("updateCheckEtag", "");
+            if saved.is_empty() {
+                None
+            } else {
+                Some(saved)
+            }
+        };
+        cx.notify();
+
+        let (tx, rx) = futures::channel::oneshot::channel();
+        crate::ws_rpc::async_rt().spawn(async move {
+            let res = crate::updater::check_latest_release(crate::APP_VERSION, etag.as_deref()).await;
+            let _ = tx.send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            let Ok((result, next_etag)) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |view, cx| {
+                view.update_checking = false;
+                if let Some(tag) = next_etag {
+                    view.prefs
+                        .set("updateCheckEtag", serde_json::Value::String(tag));
+                }
+                match result {
+                    crate::updater::UpdateCheckResult::Available(info) => {
+                        let already_notified =
+                            view.prefs.str("notifiedUpdateVersion", "") == info.tag;
+                        if !already_notified {
+                            view.prefs.set(
+                                "notifiedUpdateVersion",
+                                serde_json::Value::String(info.tag.clone()),
+                            );
+                            crate::updater::notify_update_available(&info);
+                        }
+                        view.update_info = Some(info);
+                        view.update_checked_note = None;
+                    }
+                    crate::updater::UpdateCheckResult::UpToDate => {
+                        view.update_info = None;
+                        if manual {
+                            view.update_checked_note =
+                                Some(crate::i18n::t("Đang dùng phiên bản mới nhất"));
+                        }
+                    }
+                    crate::updater::UpdateCheckResult::NotModified => {
+                        if manual && view.update_info.is_none() {
+                            view.update_checked_note =
+                                Some(crate::i18n::t("Đang dùng phiên bản mới nhất"));
+                        }
+                    }
+                    crate::updater::UpdateCheckResult::Failed(err) => {
+                        if manual {
+                            view.update_checked_note = Some(format!(
+                                "{} ({err})",
+                                crate::i18n::t("Không kiểm tra được cập nhật")
+                            ));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Queue every photo / sticker / GIF of one thread that has no bitmap
@@ -4958,6 +5070,7 @@ impl Render for ShellView {
                         solo_title,
                         false,
                         self.english,
+                        self.update_info.as_ref().map(|u| u.tag.as_str()),
                         cx.listener(|this, _, window, cx| {
                             let en = !this.english;
                             this.english = en;
@@ -5050,6 +5163,7 @@ impl Render for ShellView {
                             main_title,
                             true,
                             self.english,
+                            self.update_info.as_ref().map(|u| u.tag.as_str()),
                             cx.listener(|this, _, window, cx| {
                                 let en = !this.english;
                                 this.english = en;
