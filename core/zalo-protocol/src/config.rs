@@ -15,20 +15,20 @@ use thiserror::Error;
 /// Default User-Agent string matching the pinned Zalo Desktop release for the target OS.
 #[cfg(target_os = "windows")]
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
+    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.11.12";
 
 /// Default User-Agent string matching the pinned Zalo Desktop release for the target OS.
 #[cfg(target_os = "macos")]
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
-    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
+    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.11.12";
 
 /// Default User-Agent string matching the pinned Zalo Desktop release for the target OS.
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.10.20";
+    (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Zalo/26.11.12";
 
 /// Default pinned Zalo Desktop release version tracked by this repository.
-pub const DEFAULT_ZALO_DESKTOP_VERSION: &str = "26.10.20";
+pub const DEFAULT_ZALO_DESKTOP_VERSION: &str = "26.11.12";
 
 /// File name searched inside the user config directory (`$XDG_CONFIG_HOME/zalo-rust/`).
 pub const PROTOCOL_CONFIG_FILE: &str = "protocol.json";
@@ -63,7 +63,7 @@ impl Default for ProtocolConfig {
 /// Partial JSON overrides loaded from `protocol.json`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProtocolOverrides {
-    /// Override for `client_version` / `zpw_ver` (e.g. `"694"`).
+    /// Override for `client_version` / `zpw_ver` (e.g. `"697"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_version: Option<String>,
     /// Override for `type` / `zpw_type` (default `30`).
@@ -75,7 +75,7 @@ pub struct ProtocolOverrides {
     /// Override for the 32-byte `ParamCipher` key (exact 32 ASCII bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub param_cipher_key: Option<String>,
-    /// Reference Zalo Desktop version string (e.g. `"26.10.20"`).
+    /// Reference Zalo Desktop version string (e.g. `"26.11.12"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zalo_desktop_version: Option<String>,
 }
@@ -308,6 +308,33 @@ mod tests {
         assert_eq!(cfg.api_type, API_TYPE);
         assert_eq!(cfg.user_agent, DEFAULT_USER_AGENT);
         assert_eq!(&cfg.param_cipher_key, PARAM_CIPHER_KEY);
+        assert_eq!(cfg.zalo_desktop_version, DEFAULT_ZALO_DESKTOP_VERSION);
+    }
+
+    #[test]
+    fn compiled_defaults_match_repo_protocol_json() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(PROTOCOL_CONFIG_FILE);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let proto: ProtocolOverrides = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+
+        assert_eq!(proto.client_version.as_deref(), Some(CLIENT_VERSION));
+        assert_eq!(proto.api_type, Some(API_TYPE));
+        assert_eq!(
+            proto.zalo_desktop_version.as_deref(),
+            Some(DEFAULT_ZALO_DESKTOP_VERSION)
+        );
+        let expected_suffix = format!("Zalo/{DEFAULT_ZALO_DESKTOP_VERSION}");
+        assert!(
+            DEFAULT_USER_AGENT.ends_with(&expected_suffix),
+            "DEFAULT_USER_AGENT ({DEFAULT_USER_AGENT}) must end with {expected_suffix}"
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(proto.user_agent.as_deref(), Some(DEFAULT_USER_AGENT));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 pub const PARAM_CIPHER_KEY: &[u8; 32] = b"3FC4F0D2AB50057BCE0D90D9187A22B1";
 
 /// Client version sent as `client_version`.
-pub const CLIENT_VERSION: &str = "694";
+pub const CLIENT_VERSION: &str = "697";
 
 /// Zalo PC/Web API type sent as `type`.
 pub const API_TYPE: u32 = 30;
