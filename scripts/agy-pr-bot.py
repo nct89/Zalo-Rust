@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -163,18 +164,28 @@ def is_eligible_pr(pr: dict[str, Any], repo_slug: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def inspect_pr_signals(gh: GitHubClient, pr: dict[str, Any]) -> dict[str, Any]:
+def inspect_pr_signals(
+    gh: GitHubClient,
+    pr: dict[str, Any],
+    addressed_comment_ids: set[int] | None = None,
+) -> dict[str, Any]:
+    addressed = addressed_comment_ids or set()
     pr_num = int(pr["number"])
     head_sha = pr["head"]["sha"]
     checks = gh.list_check_runs(head_sha)
+    ci_checks_count = 0
     failed_checks = []
     pending_checks = []
+    coderabbit_check_completed = False
     for ck in checks:
         name = ck.get("name", "")
-        if "coderabbit" in name.lower():
-            continue
         status = ck.get("status", "")
         conclusion = ck.get("conclusion")
+        if "coderabbit" in name.lower():
+            if status == "completed" and conclusion in ("success", "neutral", "skipped"):
+                coderabbit_check_completed = True
+            continue
+        ci_checks_count += 1
         if status != "completed":
             pending_checks.append(name)
         elif conclusion not in ("success", "neutral", "skipped"):
@@ -193,7 +204,9 @@ def inspect_pr_signals(gh: GitHubClient, pr: dict[str, Any]) -> dict[str, Any]:
     coderabbit_reviews = [
         r for r in reviews if "coderabbit" in ((r.get("user") or {}).get("login", "").lower())
     ]
-    coderabbit_reviewed_head = any(r.get("commit_id") == head_sha for r in coderabbit_reviews)
+    coderabbit_reviewed_head = coderabbit_check_completed or any(
+        r.get("commit_id") == head_sha for r in coderabbit_reviews
+    )
 
     comments = gh.list_review_comments(pr_num)
     coderabbit_comments = [
@@ -202,15 +215,18 @@ def inspect_pr_signals(gh: GitHubClient, pr: dict[str, Any]) -> dict[str, Any]:
             "path": c.get("path", ""),
             "line": c.get("line") or c.get("original_line"),
             "commit_id": c.get("commit_id", ""),
+            "original_commit_id": c.get("original_commit_id", ""),
             "body": c.get("body", "")[:1800],
         }
         for c in comments
         if "coderabbit" in ((c.get("user") or {}).get("login", "").lower())
         and c.get("commit_id") == head_sha
+        and c.get("id") not in addressed
     ]
 
     return {
         "head_sha": head_sha,
+        "ci_checks_count": ci_checks_count,
         "pending_checks": pending_checks,
         "failed_checks": failed_checks,
         "coderabbit_reviewed_head": coderabbit_reviewed_head,
@@ -326,14 +342,14 @@ def verify_and_push_worktree(
     branch: str,
     commit_msg: str,
     dry_run: bool,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str]:
     if dry_run:
-        return True, "dry-run"
+        return True, "dry-run", ""
     status = subprocess.run(
         ["git", "status", "--porcelain"], cwd=worktree, capture_output=True, text=True, check=True
     ).stdout.strip()
     if not status:
-        return True, "no-changes"
+        return True, "no-changes", ""
 
     env = os.environ.copy()
     cargo_bin = shutil.which("cargo") or os.path.expanduser("~/.cargo/bin/cargo")
@@ -346,13 +362,16 @@ def verify_and_push_worktree(
         check=False,
     )
     if test_proc.returncode != 0:
-        return False, f"cargo test failed:\n{(test_proc.stdout + test_proc.stderr)[-3000:]}"
+        return False, f"cargo test failed:\n{(test_proc.stdout + test_proc.stderr)[-3000:]}", ""
 
     subprocess.run(["git", "add", "-A"], cwd=worktree, check=True)
     subprocess.run(["git", "commit", "-m", commit_msg], cwd=worktree, check=True)
+    new_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=worktree, capture_output=True, text=True, check=True
+    ).stdout.strip()
     extra, remote = git_remote_args(repo_slug, token)
     subprocess.run(["git", *extra, "push", remote, f"HEAD:{branch}"], cwd=worktree, check=True)
-    return True, "pushed"
+    return True, "pushed", new_sha
 
 
 def process_pr(
@@ -369,10 +388,31 @@ def process_pr(
     pr_key = str(pr_num)
     pr_state = state["prs"].setdefault(
         pr_key,
-        {"rounds": 0, "implemented": False, "last_processed_sha": ""},
+        {
+            "rounds": 0,
+            "implemented": False,
+            "last_processed_sha": "",
+            "last_pushed_sha": "",
+            "last_push_ts": 0,
+            "addressed_comment_ids": [],
+        },
     )
+    pr_state.setdefault("addressed_comment_ids", [])
+    pr_state.setdefault("last_pushed_sha", "")
+    pr_state.setdefault("last_push_ts", 0)
 
-    signals = inspect_pr_signals(gh, pr)
+    if (
+        pr_state["last_pushed_sha"] == head_sha
+        and time.time() - float(pr_state["last_push_ts"]) < 90
+    ):
+        print(f"PR #{pr_num}: cooling down after push of {head_sha[:7]}, waiting for CI/CodeRabbit.")
+        return
+
+    addressed_ids = {int(cid) for cid in pr_state["addressed_comment_ids"]}
+    signals = inspect_pr_signals(gh, pr, addressed_comment_ids=addressed_ids)
+    if signals["ci_checks_count"] == 0:
+        print(f"PR #{pr_num}: waiting for CI check-runs to start on {head_sha[:7]}")
+        return
     if signals["pending_checks"]:
         print(f"PR #{pr_num}: waiting for pending CI checks: {signals['pending_checks']}")
         return
@@ -471,13 +511,20 @@ def process_pr(
             if phase == "implement"
             else f"fix(review): address CodeRabbit & CI feedback on PR #{pr_num} via agy"
         )
-        pushed_ok, push_note = verify_and_push_worktree(
+        pushed_ok, push_note, new_sha = verify_and_push_worktree(
             wt_dir, gh.repo_slug, gh.token, branch, msg, dry_run=False
         )
         pr_state["rounds"] += 1
         pr_state["last_processed_sha"] = head_sha
         if phase == "implement":
             pr_state["implemented"] = True
+        for c in signals["coderabbit_comments"]:
+            cid = c.get("id")
+            if cid is not None and cid not in pr_state["addressed_comment_ids"]:
+                pr_state["addressed_comment_ids"].append(cid)
+        if new_sha:
+            pr_state["last_pushed_sha"] = new_sha
+            pr_state["last_push_ts"] = int(time.time())
 
         if not pushed_ok:
             gh.post_issue_comment(
