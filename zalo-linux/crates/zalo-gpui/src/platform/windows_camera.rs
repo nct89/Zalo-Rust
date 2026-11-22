@@ -173,8 +173,8 @@ fn capture_loop(
     let mut force_key = true;
     let mut encoder: Option<Encoder> = None;
     let mut encoded_size = (0_u32, 0_u32);
-    let mut encoded_kbps = 0_u32;
-    let mut encoded_fps = 0_u8;
+    let mut encoded_bitrate = 0_u32;
+    let mut encoded_fps = 0_u32;
     let started = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
@@ -239,18 +239,18 @@ fn capture_loop(
             frame_no = frame_no.wrapping_add(1);
 
             let want_size = (w, h);
-            let want_kbps = profile.kbps.max(120);
+            let want_bitrate = profile.bitrate.max(80_000);
             let want_fps = profile.fps.clamp(10, 30);
             if encoder.is_none()
                 || encoded_size != want_size
-                || encoded_kbps != want_kbps
+                || encoded_bitrate != want_bitrate
                 || encoded_fps != want_fps
             {
-                match open_encoder(want_kbps, want_fps) {
+                match open_encoder(want_bitrate, want_fps) {
                     Ok(enc) => {
                         encoder = Some(enc);
                         encoded_size = want_size;
-                        encoded_kbps = want_kbps;
+                        encoded_bitrate = want_bitrate;
                         encoded_fps = want_fps;
                         force_key = true;
                     }
@@ -291,7 +291,7 @@ fn spawn_ffmpeg(
     device_name: &str,
     w: u32,
     h: u32,
-    fps: u8,
+    fps: u32,
 ) -> Result<(Child, std::process::ChildStdout), std::io::Error> {
     let input = format!("video={device_name}");
     let scale = format!("scale={w}:{h}");
@@ -325,13 +325,13 @@ fn spawn_ffmpeg(
     Ok((child, stdout))
 }
 
-fn open_encoder(kbps: u32, fps: u8) -> Result<Encoder, openh264::Error> {
+fn open_encoder(bitrate: u32, fps: u32) -> Result<Encoder, openh264::Error> {
     let api = OpenH264API::from_source();
     let config = EncoderConfig::new()
         .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
-        .bitrate(BitRate::from_bps(kbps.saturating_mul(1_000)))
-        .max_frame_rate(FrameRate::from_hz(f32::from(fps)))
+        .bitrate(BitRate::from_bps(bitrate))
+        .max_frame_rate(FrameRate::from_hz(fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(0))
         .profile(Profile::Baseline)
         .level(Level::Level_3_1)

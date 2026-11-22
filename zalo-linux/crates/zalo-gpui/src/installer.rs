@@ -892,6 +892,7 @@ fn extract_ustar(
             format!("{prefix}/{raw_name}")
         };
         let size = parse_tar_octal(&hdr[124..136])?;
+        #[cfg(unix)]
         let mode = parse_tar_octal(&hdr[100..108]).unwrap_or(0o644) as u32;
         let typeflag = hdr[156];
 

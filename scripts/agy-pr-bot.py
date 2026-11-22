@@ -88,6 +88,23 @@ class GitHubClient:
         data = self._req("GET", f"/commits/{head_sha}/check-runs?per_page=100")
         return data.get("check_runs", [])
 
+    def get_job_log_tail(self, job_id: int, max_chars: int = 4000) -> str:
+        url = f"https://api.github.com/repos/{self.repo_slug}/actions/jobs/{job_id}/logs"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "zalo-rust-agy-pr-bot/1.0",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            return raw[-max_chars:] if len(raw) > max_chars else raw
+        except Exception:
+            return ""
+
     def post_issue_comment(self, pr_num: int, body: str) -> None:
         self._req("POST", f"/issues/{pr_num}/comments", {"body": body})
 
@@ -161,13 +178,16 @@ def inspect_pr_signals(gh: GitHubClient, pr: dict[str, Any]) -> dict[str, Any]:
         if status != "completed":
             pending_checks.append(name)
         elif conclusion not in ("success", "neutral", "skipped"):
-            failed_checks.append(
-                {
-                    "name": name,
-                    "conclusion": conclusion,
-                    "details_url": ck.get("html_url", ""),
-                }
-            )
+            entry: dict[str, Any] = {
+                "name": name,
+                "conclusion": conclusion,
+                "details_url": ck.get("html_url", ""),
+            }
+            if ck.get("id"):
+                log_tail = gh.get_job_log_tail(int(ck["id"]))
+                if log_tail:
+                    entry["log_tail"] = log_tail
+            failed_checks.append(entry)
 
     reviews = gh.list_reviews(pr_num)
     coderabbit_reviews = [
