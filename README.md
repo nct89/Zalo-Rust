@@ -10,7 +10,7 @@ Instant cold startup, silky-smooth native rendering, and a **~15.9 MB** `.deb` p
 
 <p align="center">
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/written%20in-Rust%201.85%2B-f74c00?style=flat-square" alt="Written in Rust 1.85+" height="20" /></a>
-  <a href="zalo-linux/README.md"><img src="https://img.shields.io/badge/runs%20on-Linux%20%7C%20macOS-0068ff?style=flat-square" alt="Runs on Linux and macOS" height="20" /></a>
+  <a href="zalo-linux/README.md"><img src="https://img.shields.io/badge/runs%20on-Linux%20%7C%20Windows%20%7C%20macOS-0068ff?style=flat-square" alt="Runs on Linux, Windows, and macOS" height="20" /></a>
   <a href="https://github.com/nct89/Zalo-Rust/releases"><img src="https://img.shields.io/badge/.deb%20size-~15.9%20MB-00a86b?style=flat-square" alt="Package size ~15.9 MB" height="20" /></a>
   <a href="https://github.com/nct89/Zalo-Rust/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/nct89/Zalo-Rust/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" height="20" /></a>
   <a href="https://github.com/nct89/Zalo-Rust/releases"><img src="https://img.shields.io/github/v/release/nct89/Zalo-Rust?style=flat-square&label=release&color=0068ff" alt="Release" height="20" /></a>
@@ -43,9 +43,9 @@ Traditional desktop wrappers bundle an entire Chromium browser and Node.js runti
 |---|---|---|
 | **Installer Size (`.deb`)** | **~15.9 MB** *(stripped native binary + fonts & sounds)* | ~150–250+ MB *(bundles Chromium + Node.js)* |
 | **Cold Startup** | **Instant** — preloads SQLite state & renders on first frame | Multi-second Chromium + JS bundle bootstrap |
-| **UI Rendering & Scroll** | **GPU-accelerated (Vulkan / Blade)** — smooth 60–120 FPS, virtualized lists, 60 FPS wave reactions | DOM/CSS layout & JS garbage-collection pauses |
+| **UI Rendering & Scroll** | **GPU-accelerated (Vulkan / DirectX 11 / Metal)** — smooth 60–120 FPS, virtualized lists, 60 FPS wave reactions | DOM/CSS layout & JS garbage-collection pauses |
 | **Memory Footprint** | **Single lightweight native process** + idle OCR memory release | Multiple Chromium processes (main, renderer, GPU, utility) |
-| **Linux Native Integration** | Wayland + X11 CSD, non-focus-stealing notifications, SNI/DBusMenu/XEmbed tray, XDG Portals | Generic browser window & Electron tray shim |
+| **Native OS Integration** | Linux (Wayland/X11 CSD, SNI/DBusMenu/XEmbed, XDG Portals), Windows (DWM, Win32 tray, COM dialogs, WASAPI), macOS (Metal, `NSStatusItem`, CoreAudio) | Generic browser window & Electron tray shim |
 
 ## Visual Showcase
 
@@ -74,24 +74,26 @@ Traditional desktop wrappers bundle an entire Chromium browser and Node.js runti
 
 ## Features
 
-- **Native GPU-Accelerated UI (`zalo-gpui`)**: Instant startup on **Linux (Wayland & X11)** and **macOS (Metal)**, custom client-side window decorations with a live release-version badge in the title bar, Light / Dark / System themes, custom chat wallpapers, Vietnamese / English localization, and built-in **About** & **Contact** dialogs.
+- **Native GPU-Accelerated UI (`zalo-gpui`)**: Instant startup on **Linux (Wayland & X11)**, **Windows (DirectX 11 / Win32)**, and **macOS (Metal)**, custom client-side window decorations with a live release-version badge in the title bar, Light / Dark / System themes, custom chat wallpapers, Vietnamese / English localization, and built-in **About** & **Contact** dialogs.
 - **Complete Messaging Workflow**:
   - QR login with per-account data isolation on switch/logout, resilient WebSocket realtime engine with automatic reconnect, read/typing sync, and multi-window pop-out chats.
   - Official Zalo reaction icons with **press-and-hold + smooth 60 FPS dock-wave picker**, stickers & emoji tiles, replies, forwarding, pinning, starring, full-text local search, hidden conversations, and screen lock.
-  - HD photo/video/voice/file transfers with pending attachment editor, screenshot window capture, link previews, and a native media viewer with **Photo Live-Text OCR**.
+  - HD photo/video/voice/file transfers with pending attachment editor, built-in region/window screenshot overlay (X11 & Windows GDI), link previews, and a native media viewer with **Photo Live-Text OCR**.
 - **Phone ↔ PC Sync & Backup**:
   - **Sync 2 (`zalo-sync`)**: Phone-to-PC message synchronization (`socket 590/591/592`, protobuf `SyncChunk`, `libzproto_wasm_bg`).
   - **Backup (`zalo-backup`)**: PC-to-phone backup pipeline (`socket 630–634`, `/api/backuppc2mb/upload`, `libzproto_backup_wasm_bg`).
-  - Both WASM crypto modules are staged inside release packages (`share/zalo-rust/wasm/`) and also embedded in the binary as an automatic fallback for standalone runs.
-- **Native Voice & Video Calls (`zcall-*`)**: Pure-Rust call state machine (`ZRTP` / `SRTP` / `RTP` / `RTCP`, P2P NAT traversal, adaptive bitrate, WebRTC AEC3 + RNNoise AI noise suppression, Wayland PipeWire & X11 screen sharing) bridged to PulseAudio/PipeWire + V4L2 on Linux and CoreAudio on macOS.
-- **First-Class Desktop Integration (`zalo-shell` / `zalo-shell-mac`)**:
-  - Floating notification popups that never steal keyboard/mouse focus, with configurable timeout (3–15s), countdown bar, and group collage avatars — plus freedesktop D-Bus notifications when minimized.
-  - Linux system tray with StatusNotifierItem + DBusMenu (auto-reconnect) and X11 XEmbed fallback (`tray-xembed`), Unity launcher unread badges, and XDG Portal background support; macOS menu bar (`NSStatusItem`), Dock badges, and LaunchAgent support.
+  - Both WASM crypto modules are staged inside release packages (`share/zalo-rust/wasm/` or `wasm/`) and also embedded in the binary as an automatic fallback for standalone runs.
+- **Native Voice & Video Calls (`zcall-*`)**: Pure-Rust call state machine (`ZRTP` / `SRTP` / `RTP` / `RTCP`, P2P NAT traversal, adaptive bitrate, WebRTC AEC3 + RNNoise AI noise suppression, Wayland PipeWire / X11 / Windows GDI multi-monitor screen sharing) bridged to PulseAudio/PipeWire + V4L2 on Linux, WASAPI + DirectShow on Windows, and CoreAudio on macOS.
+- **First-Class Desktop Integration (`zalo-shell` / `zalo-shell-win` / `zalo-shell-mac`)**:
+  - Floating notification popups that never steal keyboard/mouse focus, with configurable timeout (3–15s), countdown bar, and group collage avatars — plus OS fallback notifications (freedesktop D-Bus on Linux, `Shell_NotifyIconW` `NIF_INFO` on Windows, Notification Center on macOS).
+  - **Linux**: StatusNotifierItem + DBusMenu (auto-reconnect) and X11 XEmbed fallback (`tray-xembed`), Unity launcher unread badges, and XDG Portal background support.
+  - **Windows**: Native Win32 notification-area tray (`Shell_NotifyIconW` with dynamic unread badge `HICON`, native context menu, `WM_TASKBARCREATED` recovery), COM `IFileOpenDialog` file/folder pickers, Named Pipe single-instance IPC, `HKCU\...\Run` autostart, DWM Aero Snap / Win11 caption controls, and `RegisterHotKey` global shortcuts.
+  - **macOS**: Menu bar (`NSStatusItem`), Dock badges, and LaunchAgent support.
 - **Built-in Codecs & Optional On-Device OCR**: Native JPEG XL (`zjxl`), Lanczos3 thumbnails (`zimage`), and optional PP-OCR live-text extraction on dynamically loaded ONNX Runtime (`zocr`) with automatic idle memory release.
 
 ## Installation
 
-### Prebuilt Packages (Linux & macOS)
+### Prebuilt Packages (Linux, Windows & macOS)
 
 Download the latest release from [**GitHub Releases**](https://github.com/nct89/Zalo-Rust/releases):
 
@@ -104,6 +106,9 @@ Download the latest release from [**GitHub Releases**](https://github.com/nct89/
   tar -xzf zalo-linux-<version>-linux-x86_64.tar.gz
   ./zalo-linux-<version>-linux-x86_64/bin/zalo-gpui
   ```
+- **Windows 10/11 (`.zip` Portable & `-setup.exe` Installer)**:
+  - **Installer**: Run `Zalo-<version>-windows-x86_64-setup.exe` (Inno Setup — creates Start Menu / Desktop shortcuts and optional autostart; no Electron or WebView2 required).
+  - **Portable**: Extract `Zalo-<version>-windows-x86_64.zip` and run `zalo-gpui.exe` directly.
 - **macOS App Bundle (`.zip`)**:
   Download `Zalo-<version>-macos-<arch>.zip`, extract `Zalo.app`, and move it to `/Applications` (ad-hoc signed; right-click → Open on first launch if prompted by Gatekeeper).
 - **Interactive Linux Setup Wizard (Desktop Integration & Optional OCR Pack)**:
@@ -116,7 +121,7 @@ Other Linux packaging recipes (`.rpm`, Arch `PKGBUILD`, `AppImage`, `Flatpak`) a
 
 ## Architecture
 
-All OS-independent protocol, sync, backup, storage, media, and call-engine crates live in `core/` inside a single unified Cargo workspace, so upstream Zalo protocol updates only need to be applied **once** across Linux and future Windows/macOS ports.
+All OS-independent protocol, sync, backup, storage, media, and call-engine crates live in `core/` inside a single unified Cargo workspace, so upstream Zalo protocol updates only need to be applied **once** across Linux, Windows, and macOS.
 
 ```text
 Zalo-Rust/
@@ -126,8 +131,8 @@ Zalo-Rust/
 ├── assets/            # Shared fonts, emoji tiles, reaction icons, call sounds, crypto WASM
 ├── vendor/            # Linux libc compatibility patch for xattr 0.2.3
 ├── docs/              # Architecture, sync/backup design notes & UI showcase mockups
-├── zalo-linux/        # Linux platform crates + .deb / .rpm / Arch / AppImage / Flatpak packaging
-├── zalo-windows/      # Target directory for Windows port (Win32/DirectX GPUI, WASAPI, DXGI)
+├── zalo-linux/        # Shared GPUI client + Linux crates & .deb / .rpm / Arch / AppImage / Flatpak packaging
+├── zalo-windows/      # Windows Win32 tray/COM shell, WASAPI call bridge, and .zip / Inno Setup packaging
 └── zalo-macos/        # macOS menu bar, CoreAudio call bridge, and .app packaging
 ```
 
@@ -149,7 +154,10 @@ Zalo-Rust/
 | `zalo-linux/` | `zalo-shell` | Linux (`zbus`, `x11rb`) | System tray (SNI/DBusMenu/XEmbed), freedesktop notifications, single-instance IPC, XDG portals & Wayland screencast |
 | `zalo-linux/` | `zcall-audio` | Linux (PulseAudio/PipeWire) | Call audio capture, playout, and in-process APM (AEC3 + RNNoise) |
 | `zalo-linux/` | `zcall-engine` | Linux (V4L2) | Native call media engine (`zcall-native`) bridging `zcall-core` |
-| `zalo-linux/` | `zalo-gpui` | Linux + macOS (GPUI) | Native GPU desktop client. Linux uses X11/Wayland; macOS uses the Cocoa/Metal GPUI backend |
+| `zalo-linux/` | `zalo-gpui` | Linux + Windows + macOS (GPUI) | Native GPU desktop client (X11/Wayland on Linux, DirectX 11/Win32 on Windows, Cocoa/Metal on macOS) |
+| `zalo-windows/` | `zalo-shell-win` | Windows (Win32 / COM) | System tray (`Shell_NotifyIconW`) + unread badge `HICON`, `NIF_INFO` notifications, `IFileOpenDialog` pickers, Named Pipe single-instance IPC, `HKCU\...\Run` autostart, `RegisterHotKey` |
+| `zalo-windows/` | `zcall-audio-win` | Windows (WASAPI) | Shared-mode WASAPI capture and playback via `cpal`, resampled to 16 kHz mono for calls |
+| `zalo-windows/` | `zcall-engine-win` | Windows | Opus call audio bridge & multi-source jitter mixer on top of WASAPI |
 | `zalo-macos/` | `zalo-shell-mac` | macOS | Menu bar (`NSStatusItem`), Dock badge, notifications, file panels, LaunchAgent |
 | `zalo-macos/` | `zcall-audio-mac` | macOS (CoreAudio) | Call and media playback through CoreAudio |
 | `zalo-macos/` | `zcall-engine-mac` | macOS | Opus call bridge on top of CoreAudio |
@@ -201,6 +209,25 @@ bash zalo-macos/packaging/build-app.sh
 
 Camera and screen share use `ffmpeg` (`brew install ffmpeg`) and need Camera / Screen Recording permission. Details are in [zalo-macos/README.md](zalo-macos/README.md).
 
+### Windows
+
+On Windows 10/11 with **Visual Studio Build Tools** (Desktop development with C++ + Windows 10/11 SDK providing `fxc.exe`), **CMake**, **NASM**, and **Rust 1.85+** (`x86_64-pc-windows-msvc`):
+
+```powershell
+# Optional: install NASM & CMake via winget
+winget install -e --id NASM.NASM
+winget install -e --id Kitware.CMake
+
+# Run Windows platform crate tests
+$env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+cargo test -p zalo-shell-win -p zcall-audio-win -p zcall-engine-win -p zcall-core -- --test-threads=1
+
+# Build release binary, portable .zip, and optional Inno Setup installer (if `ISCC.exe` is installed)
+pwsh zalo-windows/packaging/build-windows.ps1
+```
+
+Built-in screenshot crop/window-snap overlay and multi-monitor screen sharing run natively via Win32 GDI (`BitBlt` + `DwmGetWindowAttribute`) with zero external binaries; webcam video calls use `ffmpeg -f dshow` (`winget install Gyan.FFmpeg`). Details are in [zalo-windows/README.md](zalo-windows/README.md).
+
 ## CLI & Runtime Configuration
 
 ### Command-Line Flags
@@ -217,7 +244,7 @@ Camera and screen share use `ffmpeg` (`brew install ffmpeg`) and need Camera / S
 
 ### Runtime Protocol Overrides (`protocol.json`)
 
-When Zalo updates its desktop `zpw_ver` (`client_version`) or `User-Agent`, you can hot-patch without recompiling by placing a `protocol.json` file at `~/.config/zalo-rust/protocol.json` (see [protocol.json](protocol.json)) or setting environment variables:
+When Zalo updates its desktop `zpw_ver` (`client_version`) or `User-Agent`, you can hot-patch without recompiling by placing a `protocol.json` file at `~/.config/zalo-rust/protocol.json` (Linux), `%APPDATA%\zalo-rust\protocol.json` (Windows), `~/Library/Application Support/zalo-rust/protocol.json` (macOS), or beside the executable (see [protocol.json](protocol.json)), or by setting environment variables:
 
 | Environment Variable | Purpose |
 |---|---|
