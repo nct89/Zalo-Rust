@@ -4971,6 +4971,10 @@ impl Render for ShellView {
                             cx.notify();
                         }),
                         cx.listener(ShellView::open_theme_menu),
+                        cx.listener(|this, _, _, cx| {
+                            this.dialog = Some(crate::dialogs::Dialog::About);
+                            cx.notify();
+                        }),
                     ))
                     .when_some(note, |el, text| el.child(self.session_banner(text, cx)))
                     .child(
@@ -5070,6 +5074,10 @@ impl Render for ShellView {
                                     window,
                                     cx,
                                 );
+                                cx.notify();
+                            }),
+                            cx.listener(|this, _, _, cx| {
+                                this.dialog = Some(crate::dialogs::Dialog::About);
                                 cx.notify();
                             }),
                         ))

@@ -38,7 +38,9 @@ use crate::fonts::FAMILY_SEMIBOLD;
 use crate::noise_id::resolve_pc_to_global;
 use crate::profiles::Profiles;
 use crate::shell::ShellView;
-use crate::ws_rpc::{locate_wasm, unix_now_ms, WsRpcError, WsRpcHub};
+use crate::ws_rpc::{
+    ensure_wasm_path, unix_now_ms, WsRpcError, WsRpcHub, EMBEDDED_BACKUP_WASM,
+};
 
 const BACKUP_STATE_FILE: &str = "backup-msg-state.json";
 
@@ -1265,11 +1267,13 @@ async fn run_backup_pipeline(
 
     // Step 3: Pack messages into `<session_dir>/backup_pc2mb/0` using ONLY libzproto_backup_wasm_bg!
     let wasm_path = if cfg.encryption_enabled {
-        Some(locate_wasm(BACKUP_WASM_FILENAME).ok_or_else(|| {
-            BackupPipelineError::Io(format!(
-                "Không tìm thấy tệp mã hóa sao lưu ({BACKUP_WASM_FILENAME})"
-            ))
-        })?)
+        Some(
+            ensure_wasm_path(BACKUP_WASM_FILENAME, EMBEDDED_BACKUP_WASM).ok_or_else(|| {
+                BackupPipelineError::Io(format!(
+                    "Không tìm thấy tệp mã hóa sao lưu ({BACKUP_WASM_FILENAME})"
+                ))
+            })?,
+        )
     } else {
         None
     };

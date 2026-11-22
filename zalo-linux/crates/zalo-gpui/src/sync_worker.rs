@@ -34,7 +34,9 @@ use crate::fonts::FAMILY_SEMIBOLD;
 use crate::noise_id::resolve_global_to_pc;
 use crate::profiles::Profiles;
 use crate::shell::ShellView;
-use crate::ws_rpc::{async_rt, locate_wasm, unix_now_ms, WsRpcError, WsRpcHub};
+use crate::ws_rpc::{
+    async_rt, locate_wasm, unix_now_ms, WsRpcError, WsRpcHub, EMBEDDED_SYNC_WASM,
+};
 
 /// Session-scoped in-memory Identity Key (`Bw1J` in `compact1016.js`): generated once per login
 /// session and cleared on logout.
@@ -297,16 +299,15 @@ async fn run_sync_job(
         });
     }
 
-    let wasm_path = locate_wasm(SYNC_WASM_FILENAME).ok_or_else(|| SyncRunAbort::Failed {
-        message: format!("Không tìm thấy tệp mã hóa Sync 2 ({SYNC_WASM_FILENAME})"),
+    let sync_wasm = match locate_wasm(SYNC_WASM_FILENAME) {
+        Some(wasm_path) => SyncWasm::from_file(&wasm_path),
+        None => SyncWasm::from_bytes(EMBEDDED_SYNC_WASM),
+    }
+    .map_err(|e| SyncRunAbort::Failed {
+        message: format!("Lỗi khởi tạo Sync 2 WASM: {e}"),
         can_retry: false,
     })?;
-    let wasm = Arc::new(Mutex::new(
-        SyncWasm::from_file(&wasm_path).map_err(|e| SyncRunAbort::Failed {
-            message: format!("Lỗi khởi tạo Sync 2 WASM: {e}"),
-            can_retry: false,
-        })?,
-    ));
+    let wasm = Arc::new(Mutex::new(sync_wasm));
     let ik = get_or_generate_ik(&wasm).map_err(|e| SyncRunAbort::Failed {
         message: e,
         can_retry: false,

@@ -1,5 +1,5 @@
 Name:           zalo-linux
-Version:        0.1.0
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        Native Rust Zalo Desktop client (GPUI)
 License:        MIT
@@ -17,7 +17,7 @@ com.canonical.dbusmenu, X11 XEmbed fallback, Dock Quicklist actions, and XDG
 Background portal support.
 
 %build
-cargo build --release -p zalo-gpui --features tray-xembed
+ZALO_BUILD_VERSION=%{version} cargo build --release -p zalo-gpui --features tray-xembed
 
 %install
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"

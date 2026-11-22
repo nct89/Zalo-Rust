@@ -3,7 +3,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-VERSION="${VERSION:-0.1.0}"
+WORKSPACE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)"
+VERSION="${VERSION:-${WORKSPACE_VERSION:-0.2.1}}"
+export VERSION
+export ZALO_BUILD_VERSION="${ZALO_BUILD_VERSION:-$VERSION}"
 ARCH="$(uname -m)"
 case "$ARCH" in
   arm64) RUST_TARGET="aarch64-apple-darwin" ;;

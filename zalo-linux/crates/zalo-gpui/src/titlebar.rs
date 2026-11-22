@@ -13,7 +13,7 @@ use zalo_shell::{CaptionStyle, WindowButton, WindowControlsLayout};
 use crate::color::token_rgb;
 use crate::window_frame::CsdCorners;
 
-fn zalo_title_icon() -> Option<Arc<RenderImage>> {
+pub(crate) fn zalo_title_icon() -> Option<Arc<RenderImage>> {
     static ICON: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
     ICON.get_or_init(|| {
         let bytes = zalo_shell::ZALO_ICON_PNG?;
@@ -101,7 +101,9 @@ fn flag_icon(english: bool) -> Option<Arc<RenderImage>> {
     }
 }
 
-/// Main-window caption bar with compact VI/EN flag switch and Light/Dark theme switch.
+/// Main-window caption bar with compact VI/EN flag switch, Light/Dark theme switch,
+/// and clickable build version badge (e.g. `v0.2.1`).
+#[allow(clippy::too_many_arguments)]
 pub fn main_titlebar_with_theme(
     corners: CsdCorners,
     window: &Window,
@@ -110,6 +112,7 @@ pub fn main_titlebar_with_theme(
     english: bool,
     on_toggle_lang: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
     on_toggle_theme: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    on_open_about: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl gpui::IntoElement {
     let controls = div()
         .mr(px(8.))
@@ -119,6 +122,7 @@ pub fn main_titlebar_with_theme(
         .gap(px(6.))
         .child(lang_switch(english, on_toggle_lang))
         .child(theme_switch(on_toggle_theme))
+        .child(version_badge(on_open_about))
         .into_any_element();
     caption_bar(
         corners,
@@ -132,6 +136,34 @@ pub fn main_titlebar_with_theme(
         None,
         to_tray,
     )
+}
+
+fn version_badge(
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl gpui::IntoElement {
+    let dark = crate::color::is_dark();
+    let bg = if dark { 0x38_3c_42 } else { 0xd9_dd_e3 };
+    let hover_bg = if dark { 0x45_4a_52 } else { 0xcb_d1_da };
+    let fg = if dark { 0xc8_cf_d8 } else { 0x47_55_69 };
+    let tip_text = "Thông tin phiên bản";
+    div()
+        .id("caption-version-badge")
+        .h(px(20.))
+        .px(px(7.))
+        .rounded(px(10.))
+        .bg(rgb(bg))
+        .hover(move |s| s.bg(rgb(hover_bg)))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(11.))
+        .line_height(px(11.))
+        .font_family(crate::fonts::FAMILY_SEMIBOLD)
+        .text_color(rgb(fg))
+        .cursor_pointer()
+        .tooltip(move |_, cx| crate::widgets::tip(tip_text, cx))
+        .on_click(on_click)
+        .child(crate::APP_VERSION_TAG)
 }
 
 fn lang_switch(

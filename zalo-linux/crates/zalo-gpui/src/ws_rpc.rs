@@ -309,8 +309,20 @@ pub fn unix_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Embedded Sync 2 WASM module used as a fallback when the runtime `wasm/` asset
+/// is not found on disk (e.g. standalone binary moved without `share/zalo-rust`).
+pub const EMBEDDED_SYNC_WASM: &[u8] = include_bytes!(
+    "../../../../assets/wasm/libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm"
+);
+
+/// Embedded Backup WASM module used as a fallback when the runtime `wasm/` asset
+/// is not found on disk.
+pub const EMBEDDED_BACKUP_WASM: &[u8] = include_bytes!(
+    "../../../../assets/wasm/libzproto_backup_wasm_bg.042497d03f0f504b6b1444e25a7db0d9.wasm"
+);
+
 /// Locates one of the bundled Electron WASM binaries (`libzproto_wasm_bg...` or
-/// `libzproto_backup_wasm_bg...`) across dev and installed system locations.
+/// `libzproto_backup_wasm_bg...`) across dev, XDG data, macOS bundle, and installed system locations.
 #[must_use]
 pub fn locate_wasm(filename: &str) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -321,11 +333,16 @@ pub fn locate_wasm(filename: &str) -> Option<PathBuf> {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("assets/wasm").join(filename));
             candidates.push(dir.join("wasm").join(filename));
+            #[cfg(target_os = "macos")]
+            candidates.push(dir.join("../Resources/zalo-rust/wasm").join(filename));
             if let Some(parent) = dir.parent() {
                 candidates.push(parent.join("share/zalo-rust/wasm").join(filename));
                 candidates.push(parent.join("assets/wasm").join(filename));
             }
         }
+    }
+    if let Some(data) = zalo_shell::data_home() {
+        candidates.push(data.join("zalo-rust/wasm").join(filename));
     }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("assets/wasm").join(filename));
@@ -339,4 +356,57 @@ pub fn locate_wasm(filename: &str) -> Option<PathBuf> {
     candidates.push(PathBuf::from("/usr/local/share/zalo-rust/wasm").join(filename));
 
     candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Locates `filename` on disk via [`locate_wasm`], or materializes the embedded
+/// fallback bytes into the user's data/temp directory so callers needing a path
+/// still succeed when running a standalone binary.
+#[must_use]
+pub fn ensure_wasm_path(filename: &str, embedded: &[u8]) -> Option<PathBuf> {
+    if let Some(path) = locate_wasm(filename) {
+        return Some(path);
+    }
+    let base = zalo_shell::data_home()
+        .map(|d| d.join("zalo-rust/wasm"))
+        .unwrap_or_else(|| std::env::temp_dir().join("zalo-rust/wasm"));
+    if std::fs::create_dir_all(&base).is_err() {
+        return None;
+    }
+    let dst = base.join(filename);
+    let needs_write = std::fs::metadata(&dst)
+        .map(|m| m.len() != embedded.len() as u64)
+        .unwrap_or(true);
+    if needs_write {
+        let tmp = base.join(format!(".{filename}.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, embedded).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        if std::fs::rename(&tmp, &dst).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            if !dst.is_file() {
+                return None;
+            }
+        }
+    }
+    dst.is_file().then_some(dst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_sync_and_backup_wasm_instantiate() {
+        zalo_sync::SyncWasm::from_bytes(EMBEDDED_SYNC_WASM)
+            .expect("embedded Sync 2 wasm must instantiate");
+        zalo_backup::BackupWasm::from_bytes(EMBEDDED_BACKUP_WASM)
+            .expect("embedded Backup wasm must instantiate");
+    }
+
+    #[test]
+    fn app_version_tag_matches_version() {
+        assert!(!crate::APP_VERSION.is_empty());
+        assert_eq!(crate::APP_VERSION_TAG, format!("v{}", crate::APP_VERSION));
+    }
 }

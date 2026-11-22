@@ -3,7 +3,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 LINUX_DIR="$ROOT/zalo-linux"
-VERSION="${VERSION:-0.1.0}"
+WORKSPACE_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n1)"
+VERSION="${VERSION:-${WORKSPACE_VERSION:-0.2.1}}"
+export VERSION
+export ZALO_BUILD_VERSION="${ZALO_BUILD_VERSION:-$VERSION}"
 ARCH="${ARCH:-$(dpkg --print-architecture 2>/dev/null || echo amd64)}"
 TARGET_DIR="${CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" | python3 -c 'import sys,json; print(json.load(sys.stdin)["target_directory"])')}"
 STAGE="$TARGET_DIR/deb-pkg"

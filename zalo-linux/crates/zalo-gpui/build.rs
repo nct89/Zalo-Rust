@@ -4,8 +4,46 @@
 
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=../../../Cargo.toml");
+    println!("cargo:rerun-if-env-changed=ZALO_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=VERSION");
+
+    let raw_version = std::env::var("ZALO_BUILD_VERSION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("VERSION")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    let clean_version = raw_version.trim().trim_start_matches(['v', 'V']);
+    let app_version = if clean_version.is_empty() {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        clean_version
+    };
+    println!("cargo:rustc-env=ZALO_APP_VERSION={app_version}");
+    println!("cargo:rustc-env=ZALO_APP_TAG=v{app_version}");
+
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned());
+    println!("cargo:rustc-env=ZALO_BUILD_PROFILE={profile}");
+
+    let git_sha = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=ZALO_GIT_SHA={git_sha}");
+
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let dir = out.join("sys-so");
     std::fs::create_dir_all(&dir).expect("sys-so dir");

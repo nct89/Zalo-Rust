@@ -120,6 +120,21 @@ pub use window_frame::outer_size as window_outer_size;
 /// Caption button width on the Linux `#titleBar` (Zalo wrapper).
 pub const CAPTION_BTN_W: f32 = 46.0;
 
+/// Semantic version of this build (follows `ZALO_BUILD_VERSION` / `VERSION` / workspace `Cargo.toml`).
+pub const APP_VERSION: &str = env!("ZALO_APP_VERSION");
+
+/// Display tag of this build (e.g. `v0.2.1`).
+pub const APP_VERSION_TAG: &str = env!("ZALO_APP_TAG");
+
+/// Short Git commit hash captured at build time, or empty if unavailable.
+pub const APP_GIT_SHA: &str = env!("ZALO_GIT_SHA");
+
+/// Cargo build profile (`release` or `debug`).
+pub const APP_BUILD_PROFILE: &str = env!("ZALO_BUILD_PROFILE");
+
+/// Repository URL for this project.
+pub const APP_REPO_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// Open the login window at the CSS size `LOGIN_WINDOW` (420×644).
 pub fn login_window_size() -> (f32, f32) {
     zalo_design::LOGIN_WINDOW

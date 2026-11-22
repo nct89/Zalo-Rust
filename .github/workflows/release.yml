@@ -53,9 +53,13 @@ jobs:
 
       - name: Build .deb package & portable tarball
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          VERSION="${TAG:-0.1.0}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
           export VERSION
+          export ZALO_BUILD_VERSION="$VERSION"
           bash zalo-linux/packaging/deb/build-deb.sh
 
           STAGE="dist/zalo-linux-${VERSION}-linux-x86_64"
@@ -104,9 +108,13 @@ jobs:
 
       - name: Build Zalo.app
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
-          VERSION="${TAG:-0.1.0}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
           export VERSION
+          export ZALO_BUILD_VERSION="$VERSION"
           bash zalo-macos/packaging/build-app.sh
 
       - name: Publish GitHub Release

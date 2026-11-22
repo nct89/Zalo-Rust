@@ -82,6 +82,8 @@ pub enum Dialog {
     TwoFactorOtp(TwoFactorOtpDlg),
     /// Guide on finding a newly hidden conversation ("Conversation hidden successfully").
     HiddenGuide(String),
+    /// "About / Version info" dialog (from Settings › Help › Version info or titlebar badge).
+    About,
 }
 
 /// Paste Excel table / clipboard content containing both image and text.
@@ -632,6 +634,7 @@ impl ShellView {
             Some(Dialog::RemoveFriend(f)) => self.remove_friend_el(f, cx).into_any_element(),
             Some(Dialog::TwoFactorOtp(t)) => self.two_factor_el(t, cx).into_any_element(),
             Some(Dialog::HiddenGuide(name)) => self.hidden_guide_el(name, cx).into_any_element(),
+            Some(Dialog::About) => self.about_el(cx).into_any_element(),
             None => return div().into_any_element(),
         };
         div()
@@ -1962,6 +1965,264 @@ impl ShellView {
     }
 
     /// "Message Details": sender, full send time, type, size, ids.
+    fn about_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let dark = crate::color::is_dark();
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let blue = token_rgb("--B55", "#0068ff");
+        let blue_hover = token_rgb("--B60", "#005ae0");
+        let panel_bg = token_rgb("--layer-background-subtle", "#f3f5f8");
+        let btn_bg = token_rgb("--button-neutral-normal", "#e5e7eb");
+        let btn_hover = token_rgb("--button-neutral-hover", "#d6dbe1");
+        let badge_bg = if dark { 0x1e_32_52 } else { 0xe5_ef_ff };
+        let badge_fg = if dark { 0x6b_a6_ff } else { blue };
+
+        let proto = zalo_protocol::active_config();
+        let build_info = if crate::APP_GIT_SHA.is_empty() {
+            crate::APP_BUILD_PROFILE.to_owned()
+        } else {
+            format!("{} · {}", crate::APP_BUILD_PROFILE, crate::APP_GIT_SHA)
+        };
+        let os_name = match std::env::consts::OS {
+            "linux" => "Linux",
+            "macos" => "macOS",
+            "windows" => "Windows",
+            other => other,
+        };
+        let platform_info = format!("{os_name} ({})", std::env::consts::ARCH);
+        let protocol_info = format!(
+            "Zalo PC {} (client v{}, type {})",
+            proto.zalo_desktop_version, proto.client_version, proto.api_type
+        );
+        let repo_url = crate::APP_REPO_URL;
+        let repo_label = repo_url
+            .strip_prefix("https://")
+            .or_else(|| repo_url.strip_prefix("http://"))
+            .unwrap_or(repo_url);
+
+        let copy_summary = format!(
+            "Zalo Rust {}\nBuild: {}\nProtocol: {}\nPlatform: {}\nEngine: Rust + GPUI\nLicense: MIT\nRepo: {}",
+            crate::APP_VERSION_TAG,
+            build_info,
+            protocol_info,
+            platform_info,
+            repo_url
+        );
+
+        let info_rows: Vec<(&'static str, String)> = vec![
+            ("Phiên bản", crate::APP_VERSION_TAG.to_owned()),
+            ("Bản dựng", build_info),
+            ("Giao thức", protocol_info),
+            ("Hệ điều hành", platform_info),
+            ("Nền tảng", "Rust + GPUI".to_owned()),
+            ("Giấy phép", "MIT".to_owned()),
+        ];
+
+        let icon = crate::titlebar::zalo_title_icon();
+
+        modal_card(448.)
+            .child(self.dialog_title_bar(
+                crate::color::str_vi("STR_VERSION_INFO", "Thông tin phiên bản"),
+                cx,
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(14.))
+                            .child(
+                                div()
+                                    .size(px(48.))
+                                    .rounded(px(12.))
+                                    .overflow_hidden()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(blue))
+                                    .when_some(icon, |el, bitmap| {
+                                        el.child(
+                                            img(bitmap)
+                                                .size(px(48.))
+                                                .object_fit(gpui::ObjectFit::Cover),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.))
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .text_size(px(17.))
+                                                    .font_family(FAMILY_SEMIBOLD)
+                                                    .text_color(rgb(ink))
+                                                    .child("Zalo Rust"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px(px(8.))
+                                                    .py(px(2.))
+                                                    .rounded(px(10.))
+                                                    .bg(rgb(badge_bg))
+                                                    .text_size(px(12.))
+                                                    .font_family(FAMILY_SEMIBOLD)
+                                                    .text_color(rgb(badge_fg))
+                                                    .child(crate::APP_VERSION_TAG),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(rgb(muted))
+                                            .child(crate::i18n::t(
+                                                "Ứng dụng Zalo gốc viết bằng Rust & GPUI",
+                                            )),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(8.))
+                            .bg(rgb(panel_bg))
+                            .border_1()
+                            .border_color(crate::color::border_subtle())
+                            .px(px(14.))
+                            .py(px(10.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.))
+                            .children(info_rows.into_iter().map(|(label, value)| {
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .text_size(px(13.))
+                                    .child(
+                                        div()
+                                            .w(px(104.))
+                                            .flex_none()
+                                            .text_color(rgb(muted))
+                                            .child(crate::i18n::t(label)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .text_color(rgb(ink))
+                                            .child(value),
+                                    )
+                            }))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .text_size(px(13.))
+                                    .child(
+                                        div()
+                                            .w(px(104.))
+                                            .flex_none()
+                                            .text_color(rgb(muted))
+                                            .child(crate::i18n::t("Mã nguồn")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("about-repo-link")
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .text_color(rgb(blue))
+                                            .cursor_pointer()
+                                            .hover(|s| s.underline())
+                                            .on_click(move |_, _, cx| {
+                                                cx.open_url(repo_url);
+                                            })
+                                            .child(repo_label),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(crate::color::border_subtle())
+                    .child(
+                        div()
+                            .id("about-copy-btn")
+                            .px(px(14.))
+                            .h(px(34.))
+                            .rounded(px(4.))
+                            .bg(rgb(btn_bg))
+                            .hover(move |s| s.bg(rgb(btn_hover)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(ink))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    copy_summary.clone(),
+                                ));
+                                this.set_note(crate::i18n::t("Đã sao chép thông tin phiên bản"));
+                                cx.notify();
+                            }))
+                            .child(crate::i18n::t("Sao chép thông tin")),
+                    )
+                    .child(
+                        div()
+                            .id("about-close-btn")
+                            .px(px(18.))
+                            .h(px(34.))
+                            .rounded(px(4.))
+                            .bg(rgb(blue))
+                            .hover(move |s| s.bg(rgb(blue_hover)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(0xff_ff_ff))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog = None;
+                                cx.notify();
+                            }))
+                            .child(crate::color::str_vi("STR_CLOSE", "Đóng")),
+                    ),
+            )
+    }
+
     fn details_el(&self, m: &crate::data::ChatMsg, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::media::MsgKind;
         let ink = token_rgb("--text-primary", "#081b3a");

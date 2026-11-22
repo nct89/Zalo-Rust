@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# Stage minimal runtime fonts (~1.4 MiB) and call ringtones (~72 KiB) for packages.
+# Stage minimal runtime fonts (~1.4 MiB), call ringtones (~72 KiB), and Sync/Backup WASM (~411 KiB) for packages.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 DST_DIR="${1:?usage: stage-runtime-assets.sh <dest-zalo-rust-dir>}"
 FONTS_SRC="$ROOT/assets/fonts"
 SOUNDS_SRC="$ROOT/assets/sounds"
+WASM_SRC="$ROOT/assets/wasm"
 
-mkdir -p "$DST_DIR/fonts" "$DST_DIR/zcall-sound"
+mkdir -p "$DST_DIR/fonts" "$DST_DIR/zcall-sound" "$DST_DIR/wasm"
 
 for f in \
   "Zalo-Segoe-UI.dc1a7d868a0b3a0e2daa8b36567e9ea9.ttf" \
@@ -21,4 +22,11 @@ done
 
 for s in zalo_ringtone.mp3 zalo_ringback.mp3 endcall.mp3; do
   [ -f "$SOUNDS_SRC/$s" ] && install -m 644 "$SOUNDS_SRC/$s" "$DST_DIR/zcall-sound/$s"
+done
+
+for w in \
+  "libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm" \
+  "libzproto_backup_wasm_bg.042497d03f0f504b6b1444e25a7db0d9.wasm"
+do
+  install -m 644 "$WASM_SRC/$w" "$DST_DIR/wasm/$w"
 done

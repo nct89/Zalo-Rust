@@ -1,6 +1,6 @@
 # Maintainer: Zalo-Rust contributors
 pkgname=zalo-linux
-pkgver=0.1.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc="Native Rust Zalo Desktop client (GPUI) with SNI, DBusMenu, and XEmbed tray fallback"
 arch=('x86_64' 'aarch64')
@@ -14,7 +14,7 @@ optdepends=(
 
 build() {
   cd "${startdir}/../../.."
-  cargo build --release -p zalo-gpui --features tray-xembed
+  ZALO_BUILD_VERSION="${pkgver}" cargo build --release -p zalo-gpui --features tray-xembed
 }
 
 package() {

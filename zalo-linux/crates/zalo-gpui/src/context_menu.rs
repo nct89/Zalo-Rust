@@ -1668,7 +1668,8 @@ impl ShellView {
                 .detach();
             }
             MenuAction::About => {
-                self.set_note("Zalo cho Linux theo Zalo PC 26.10.10");
+                self.dialog = Some(crate::dialogs::Dialog::About);
+                cx.notify();
             }
             MenuAction::OpenPcExport => self.open_pc_export(cx),
             MenuAction::OpenPcImport => self.open_pc_import(cx),
