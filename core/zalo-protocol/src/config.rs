@@ -245,6 +245,13 @@ fn system_protocol_paths() -> Vec<std::path::PathBuf> {
                         .join("zalo-rust")
                         .join(PROTOCOL_CONFIG_FILE),
                 );
+                #[cfg(target_os = "macos")]
+                paths.push(
+                    prefix
+                        .join("Resources")
+                        .join("zalo-rust")
+                        .join(PROTOCOL_CONFIG_FILE),
+                );
             }
             paths.push(bin_dir.join(PROTOCOL_CONFIG_FILE));
         }

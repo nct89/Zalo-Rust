@@ -5437,6 +5437,7 @@ fn bubble_font() -> Font {
         family: FAMILY_TEXT.into(),
         features: FontFeatures::default(),
         fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Apple Color Emoji".into(),
             "Noto Color Emoji".into(),
             "Noto Emoji".into(),
             "Segoe UI Emoji".into(),
@@ -5451,6 +5452,7 @@ fn bubble_semibold_font() -> Font {
         family: FAMILY_SEMIBOLD.into(),
         features: FontFeatures::default(),
         fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Apple Color Emoji".into(),
             "Noto Color Emoji".into(),
             "Noto Emoji".into(),
             "Segoe UI Emoji".into(),

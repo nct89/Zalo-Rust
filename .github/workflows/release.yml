@@ -87,6 +87,8 @@ jobs:
   build-macos:
     name: Build macOS .app
     runs-on: macos-latest
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

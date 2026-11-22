@@ -17,6 +17,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 cd "$ROOT"
+# CMake 4+ (Homebrew on macOS) rejects older cmake_minimum_required(VERSION 3.1)
+# in bundled audiopus_sys unless compatibility floor is raised to 3.5.
+export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
 cargo build --release -p zalo-gpui --features tray-xembed
 
 STAGE="$ROOT/dist/Zalo.app"

@@ -2722,7 +2722,7 @@ impl ShellView {
         self.detached.insert(id);
         let thread = conv.thread_id.clone();
         let outer = crate::window_frame::outer_size(720.0, 640.0);
-        let bounds = crate::bounds_in_work_area(outer);
+        let bounds = crate::bounds_in_work_area(outer, cx);
         crate::x11_frame::anticipate_csd_window();
         let _ = cx.open_window(
             gpui::WindowOptions {

@@ -1,4 +1,5 @@
 //! `NSStatusItem` menu and Dock badge. Compiled only on macOS.
+#![allow(unexpected_cfgs)]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,73 +15,137 @@ use crate::tray::{record_tray_event, TrayEvent};
 
 static STATUS_ITEM: AtomicUsize = AtomicUsize::new(0);
 
-/// Create the menu-bar item. Safe to call once; later calls keep the existing item.
+#[repr(C)]
+struct DispatchQueue {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    static _dispatch_main_q: DispatchQueue;
+    fn dispatch_async_f(
+        queue: *const DispatchQueue,
+        context: *mut c_void,
+        work: extern "C" fn(*mut c_void),
+    );
+}
+
+unsafe fn is_main_thread() -> bool {
+    let flag: BOOL = msg_send![class!(NSThread), isMainThread];
+    flag != NO
+}
+
+/// Create the menu-bar item. Safe to call once from any thread; later calls keep the existing item.
 pub(crate) fn install() {
+    if STATUS_ITEM.load(Ordering::Acquire) != 0 {
+        return;
+    }
     unsafe {
-        if STATUS_ITEM.load(Ordering::Acquire) != 0 {
-            return;
+        if is_main_thread() {
+            install_on_main();
+        } else {
+            dispatch_async_f(&_dispatch_main_q, std::ptr::null_mut(), install_trampoline);
         }
-        let pool = NSAutoreleasePool::new(nil);
-        let target_cls = menu_target_class();
-        let target: id = msg_send![target_cls, new];
-        let _: id = msg_send![target, retain];
+    }
+}
 
-        let bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
-        // `NSSquareStatusItemLength` is -2.
-        let item: id = msg_send![bar, statusItemWithLength: -2.0_f64];
-        let _: id = msg_send![item, retain];
+extern "C" fn install_trampoline(_: *mut c_void) {
+    unsafe {
+        install_on_main();
+    }
+}
 
-        let button: id = msg_send![item, button];
+unsafe fn install_on_main() {
+    if STATUS_ITEM.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let pool = NSAutoreleasePool::new(nil);
+    let target_cls = menu_target_class();
+    let target: id = msg_send![target_cls, new];
+
+    let bar: id = msg_send![class!(NSStatusBar), systemStatusBar];
+    // `NSSquareStatusItemLength` is -2.
+    let item: id = msg_send![bar, statusItemWithLength: -2.0_f64];
+    if item.is_null() {
+        let _: () = msg_send![target, release];
+        let _: () = msg_send![pool, drain];
+        return;
+    }
+    let _: id = msg_send![item, retain];
+
+    let button: id = msg_send![item, button];
+    if !button.is_null() {
         if let Some(png) = ZALO_ICON_PNG {
             if let Some(image) = image_from_png(png) {
                 let _: () = msg_send![button, setImage: image];
             }
         }
         let tip: id = NSString::alloc(nil).init_str("Zalo");
+        let _: id = msg_send![tip, autorelease];
         let _: () = msg_send![button, setToolTip: tip];
+    }
 
-        let menu: id = msg_send![class!(NSMenu), new];
-        let _: id = msg_send![menu, retain];
-        add_item(menu, target, "Mở Zalo", sel!(onOpen:));
-        add_item(menu, target, "Ẩn Zalo", sel!(onHide:));
-        add_item(menu, target, "Tắt/Bật thông báo", sel!(onMute:));
-        let separator: id = msg_send![class!(NSMenuItem), separatorItem];
-        let _: () = msg_send![menu, addItem: separator];
-        add_item(menu, target, "Thoát Zalo", sel!(onQuit:));
-        let _: () = msg_send![item, setMenu: menu];
+    let menu: id = msg_send![class!(NSMenu), new];
+    add_item(menu, target, "Mở Zalo", sel!(onOpen:));
+    add_item(menu, target, "Ẩn Zalo", sel!(onHide:));
+    add_item(menu, target, "Tắt/Bật thông báo", sel!(onMute:));
+    let separator: id = msg_send![class!(NSMenuItem), separatorItem];
+    let _: () = msg_send![menu, addItem: separator];
+    add_item(menu, target, "Thoát Zalo", sel!(onQuit:));
+    let _: () = msg_send![item, setMenu: menu];
 
-        STATUS_ITEM.store(item as usize, Ordering::Release);
-        std::mem::forget(pool);
+    STATUS_ITEM.store(item as usize, Ordering::Release);
+    let _: () = msg_send![pool, drain];
+}
+
+/// Set the Dock badge. An empty label clears it. Safe to call from any thread.
+pub(crate) fn set_badge(label: &str) {
+    unsafe {
+        if is_main_thread() {
+            apply_badge_label(label);
+        } else {
+            let boxed = Box::into_raw(Box::new(label.to_owned())).cast::<c_void>();
+            dispatch_async_f(&_dispatch_main_q, boxed, set_badge_trampoline);
+        }
     }
 }
 
-/// Set the Dock badge. An empty label clears it.
-pub(crate) fn set_badge(label: &str) {
+extern "C" fn set_badge_trampoline(ctx: *mut c_void) {
     unsafe {
-        apply_badge_label(label);
+        let label = Box::from_raw(ctx.cast::<String>());
+        apply_badge_label(&label);
     }
 }
 
 unsafe fn apply_badge_label(label: &str) {
-        let app: id = msg_send![class!(NSApplication), sharedApplication];
+    let pool = NSAutoreleasePool::new(nil);
+    let app: id = msg_send![class!(NSApplication), sharedApplication];
+    if !app.is_null() {
         let dock: id = msg_send![app, dockTile];
-        if label.is_empty() {
-            let _: () = msg_send![dock, setBadgeLabel: nil];
-        } else {
-            let text: id = NSString::alloc(nil).init_str(&label);
-            let _: () = msg_send![dock, setBadgeLabel: text];
+        if !dock.is_null() {
+            if label.is_empty() {
+                let _: () = msg_send![dock, setBadgeLabel: nil];
+            } else {
+                let text: id = NSString::alloc(nil).init_str(label);
+                let _: id = msg_send![text, autorelease];
+                let _: () = msg_send![dock, setBadgeLabel: text];
+            }
         }
-        let item = STATUS_ITEM.load(Ordering::Acquire) as id;
-        if !item.is_null() {
-            let button: id = msg_send![item, button];
+    }
+    let item = STATUS_ITEM.load(Ordering::Acquire) as id;
+    if !item.is_null() {
+        let button: id = msg_send![item, button];
+        if !button.is_null() {
             let tip = if label.is_empty() {
                 "Zalo".to_owned()
             } else {
                 format!("Zalo ({label})")
             };
             let text: id = NSString::alloc(nil).init_str(&tip);
+            let _: id = msg_send![text, autorelease];
             let _: () = msg_send![button, setToolTip: text];
         }
+    }
+    let _: () = msg_send![pool, drain];
 }
 
 unsafe fn image_from_png(png: &[u8]) -> Option<id> {
@@ -97,6 +162,7 @@ unsafe fn image_from_png(png: &[u8]) -> Option<id> {
     if image.is_null() {
         return None;
     }
+    let _: id = msg_send![image, autorelease];
     let template: BOOL = NO;
     let _: () = msg_send![image, setTemplate: template];
     let size = cocoa::foundation::NSSize::new(18.0, 18.0);
@@ -106,9 +172,12 @@ unsafe fn image_from_png(png: &[u8]) -> Option<id> {
 
 unsafe fn add_item(menu: id, target: id, title: &str, action: objc::runtime::Sel) {
     let label: id = NSString::alloc(nil).init_str(title);
+    let _: id = msg_send![label, autorelease];
     let empty: id = NSString::alloc(nil).init_str("");
+    let _: id = msg_send![empty, autorelease];
     let item: id = msg_send![class!(NSMenuItem), alloc];
     let item: id = msg_send![item, initWithTitle: label action: action keyEquivalent: empty];
+    let _: id = msg_send![item, autorelease];
     let _: () = msg_send![item, setTarget: target];
     let _: () = msg_send![menu, addItem: item];
 }

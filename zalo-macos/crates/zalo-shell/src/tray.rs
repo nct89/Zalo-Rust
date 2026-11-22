@@ -101,7 +101,9 @@ pub fn install_desktop_shell_for(app_id: &str) {
         guard.ready = true;
     }
     #[cfg(target_os = "macos")]
-    crate::status_item::install();
+    if !cfg!(test) {
+        crate::status_item::install();
+    }
 }
 
 /// Remember mute so a later menu refresh can show it. The GUI stores the pref itself.
@@ -150,7 +152,9 @@ pub fn set_unread_badge(raw_count: i64) {
     }
     let label = badge_label(count);
     #[cfg(target_os = "macos")]
-    crate::status_item::set_badge(&label);
+    if !cfg!(test) {
+        crate::status_item::set_badge(&label);
+    }
     #[cfg(not(target_os = "macos"))]
     let _ = label;
 }

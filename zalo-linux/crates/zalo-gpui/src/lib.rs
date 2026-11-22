@@ -175,7 +175,7 @@ pub fn open_login_window(cx: &mut App) {
     }
     let (width, height) = crate::login_window_size();
     let outer = crate::window_frame::outer_size(width, height);
-    let bounds = bounds_in_work_area(outer);
+    let bounds = bounds_in_work_area(outer, cx);
     crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
@@ -385,18 +385,40 @@ fn saved_shell_bounds(_cx: &App) -> (gpui::Size<gpui::Pixels>, bool) {
     (size, max)
 }
 
-/// Center `size` in the first `_NET_WORKAREA` rectangle (the primary
-/// monitor minus the panel). Falls back to the top-left if that rectangle
-/// is missing.
-pub(crate) fn bounds_in_work_area(size: gpui::Size<gpui::Pixels>) -> Bounds<gpui::Pixels> {
-    let (wx, wy, ww, wh) = crate::notice::work_area(1.0, (0.0, 0.0, 1920.0, 1080.0));
-    let w = f32::from(size.width);
-    let h = f32::from(size.height);
-    let x = if w < ww { wx + (ww - w) * 0.5 } else { wx };
-    let y = if h < wh { wy + (wh - h) * 0.5 } else { wy };
-    Bounds {
-        origin: point(px(x), px(y)),
-        size,
+/// Center `size` on the primary display work area.
+///
+/// On macOS, GPUI's `Bounds::centered` already uses the primary `NSScreen`.
+/// On Linux/X11, `Bounds::centered` spans the full virtual multi-monitor
+/// desktop, so we center inside `_NET_WORKAREA` (with `primary_display` as
+/// fallback).
+pub(crate) fn bounds_in_work_area(size: gpui::Size<gpui::Pixels>, cx: &App) -> Bounds<gpui::Pixels> {
+    #[cfg(target_os = "macos")]
+    {
+        Bounds::centered(None, size, cx)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let fallback = cx
+            .primary_display()
+            .map(|display| {
+                let b = display.bounds();
+                (
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.y),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height),
+                )
+            })
+            .unwrap_or((0.0, 0.0, 1920.0, 1080.0));
+        let (wx, wy, ww, wh) = crate::notice::work_area(1.0, fallback);
+        let w = f32::from(size.width);
+        let h = f32::from(size.height);
+        let x = if w < ww { wx + (ww - w) * 0.5 } else { wx };
+        let y = if h < wh { wy + (wh - h) * 0.5 } else { wy };
+        Bounds {
+            origin: point(px(x), px(y)),
+            size,
+        }
     }
 }
 
@@ -416,7 +438,7 @@ pub fn open_shell_window(cx: &mut App) {
     let bounds = if maximized {
         Bounds::centered(None, size, cx)
     } else {
-        bounds_in_work_area(size)
+        bounds_in_work_area(size, cx)
     };
     let window_bounds = if maximized {
         WindowBounds::Maximized(bounds)
@@ -444,7 +466,7 @@ pub fn open_shell_window(cx: &mut App) {
 /// Open the native Linux Distro Scanner & OCR Installer window (`--install`).
 pub fn open_installer_window(cx: &mut App) {
     let outer = crate::window_frame::outer_size(440.0, 214.0);
-    let bounds = bounds_in_work_area(outer);
+    let bounds = bounds_in_work_area(outer, cx);
     crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {

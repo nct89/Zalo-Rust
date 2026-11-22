@@ -103,7 +103,7 @@ pub(crate) fn open(
         return false;
     }
     let title = photo_window_title(&conv_name);
-    let bounds = crate::bounds_in_work_area(size(px(1140.), px(740.)));
+    let bounds = crate::bounds_in_work_area(size(px(1140.), px(740.)), cx);
     crate::x11_frame::anticipate_csd_window();
     cx.open_window(
         WindowOptions {
