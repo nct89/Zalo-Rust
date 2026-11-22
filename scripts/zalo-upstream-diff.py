@@ -237,11 +237,19 @@ def collect_repo_baseline(repo: pathlib.Path) -> dict[str, Any]:
             text = rs.read_text(encoding="utf-8", errors="ignore")
             known_str_keys.update(str_re.findall(text))
 
+    param_cipher_key = ""
+    cipher_rs = repo / "core" / "zalo-protocol" / "src" / "param_cipher.rs"
+    if cipher_rs.is_file():
+        m_key = re.search(r'PARAM_CIPHER_KEY[^=]*=\s*b"([^"]+)"', cipher_rs.read_text(encoding="utf-8", errors="ignore"))
+        if m_key:
+            param_cipher_key = m_key.group(1)
+
     return {
         "protocol": protocol,
         "wasm_files": wasm_files,
         "known_endpoints": known_endpoints,
         "known_str_keys": known_str_keys,
+        "param_cipher_key": param_cipher_key,
     }
 
 
@@ -266,14 +274,18 @@ def analyze_unpacked(unpacked_root: pathlib.Path, baseline: dict[str, Any]) -> d
 
     wasm_changed = upstream_wasm != baseline["wasm_files"] and bool(upstream_wasm)
 
-    # Scan JS bundles for zpw_ver / client_version, endpoints, and new STR_* keys
+    # Scan JS bundles for apiVersion/zpw_ver, ParamCipher key, endpoints, and new STR_* keys
     zpw_candidates: dict[str, int] = {}
     upstream_endpoints: set[str] = set()
-    upstream_str_keys: set[str] = set()
+    upstream_str_map: dict[str, str] = {}
     js_files_scanned = 0
+    param_cipher_key = baseline.get("param_cipher_key", "")
+    param_cipher_key_matched = False
 
-    zpw_re = re.compile(r"(?:zpw_ver|CLIENT_VERSION|client_version)\s*[:=]\s*['\"]?(\d{3,4})['\"]?")
+    api_ver_re = re.compile(r"apiVersion\s*:\s*(\d{3,4})\s*,\s*apiType")
+    zpw_fallback_re = re.compile(r"(?:zpw_ver|CLIENT_VERSION|client_version)\s*[:=]\s*['\"]?(\d{3,4})['\"]?")
     ep_re = re.compile(r"/api/[a-zA-Z0-9_./-]{3,80}")
+    str_kv_re = re.compile(r"""\b(STR_[A-Z0-9_]{3,80})["']?\s*:\s*["']([^"'\n]{1,120})["']""")
     str_re = re.compile(r"\bSTR_[A-Z0-9_]{3,80}\b")
 
     for js in unpacked_root.rglob("*.js"):
@@ -281,9 +293,20 @@ def analyze_unpacked(unpacked_root: pathlib.Path, baseline: dict[str, Any]) -> d
             continue
         js_files_scanned += 1
         text = js.read_text(encoding="utf-8", errors="ignore")
-        for m in zpw_re.findall(text):
+        if param_cipher_key and not param_cipher_key_matched and param_cipher_key in text:
+            param_cipher_key_matched = True
+        for m in api_ver_re.findall(text):
+            zpw_candidates[m] = zpw_candidates.get(m, 0) + 10
+        for m in zpw_fallback_re.findall(text):
             zpw_candidates[m] = zpw_candidates.get(m, 0) + 1
         upstream_endpoints.update(ep_re.findall(text))
+        name_l = js.name.lower()
+        if name_l.startswith("lang-vi.") or name_l.startswith("lang-en."):
+            for k, v in str_kv_re.findall(text):
+                if name_l.startswith("lang-vi.") or k not in upstream_str_map:
+                    upstream_str_map[k] = v
+            for k in str_re.findall(text):
+                upstream_str_map.setdefault(k, "")
 
     for jf in unpacked_root.rglob("*.json"):
         name_l = jf.name.lower()
@@ -291,14 +314,19 @@ def analyze_unpacked(unpacked_root: pathlib.Path, baseline: dict[str, Any]) -> d
             continue
         if "lang" in name_l or "vi" in name_l or "en" in name_l:
             text = jf.read_text(encoding="utf-8", errors="ignore")
-            upstream_str_keys.update(str_re.findall(text))
+            for k in str_re.findall(text):
+                upstream_str_map.setdefault(k, "")
 
     detected_zpw = ""
     if zpw_candidates:
         detected_zpw = max(zpw_candidates.items(), key=lambda kv: (kv[1], int(kv[0])))[0]
 
     new_endpoints = sorted(upstream_endpoints - baseline["known_endpoints"])
-    new_str_keys = sorted(upstream_str_keys - baseline["known_str_keys"])
+    new_str_keys = sorted(set(upstream_str_map.keys()) - baseline["known_str_keys"])
+    new_str_samples = [
+        f"{k}: {upstream_str_map[k]}" if upstream_str_map.get(k) else k
+        for k in new_str_keys[:80]
+    ]
 
     pinned_zpw = str(baseline["protocol"].get("client_version", "")).strip()
     zpw_changed = bool(detected_zpw) and detected_zpw != pinned_zpw
@@ -310,13 +338,14 @@ def analyze_unpacked(unpacked_root: pathlib.Path, baseline: dict[str, Any]) -> d
         "detected_zpw_ver": detected_zpw,
         "pinned_zpw_ver": pinned_zpw,
         "zpw_changed": zpw_changed,
+        "param_cipher_key_matched": param_cipher_key_matched if param_cipher_key else None,
         "upstream_wasm": upstream_wasm,
         "baseline_wasm": baseline["wasm_files"],
         "wasm_changed": wasm_changed,
         "new_endpoints_count": len(new_endpoints),
         "new_endpoints_sample": new_endpoints[:40],
         "new_str_keys_count": len(new_str_keys),
-        "new_str_keys_sample": new_str_keys[:60],
+        "new_str_keys_sample": new_str_samples,
         "classification": "feature-update" if has_feature_changes else "protocol-only",
     }
 
@@ -338,6 +367,7 @@ def render_markdown_report(probe: dict[str, Any], analysis: dict[str, Any] | Non
             "",
             f"- **Classification**: `{analysis['classification']}`",
             f"- **`client_version` (`zpw_ver`)**: pinned `{analysis['pinned_zpw_ver']}` → detected `{analysis['detected_zpw_ver'] or 'unchanged/not-found'}` (changed: `{analysis['zpw_changed']}`)",
+            f"- **`ParamCipher` key unchanged**: `{analysis.get('param_cipher_key_matched')}`",
             f"- **WASM crypto modules changed**: `{analysis['wasm_changed']}`",
             f"- **New `/api/...` endpoints not in `core/zalo-client`**: `{analysis['new_endpoints_count']}`",
             f"- **New `STR_*` UI keys not in `core/zalo-design`**: `{analysis['new_str_keys_count']}`",
