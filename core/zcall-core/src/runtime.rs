@@ -292,9 +292,10 @@ mod tests {
         let parsed = unwrap_packet(&buf[..n]).expect("parsed init");
         assert_eq!(parsed.cmd, Some(Command::INIT_CALL_CALLER));
 
-        // Server answers with a token.
+        // Server answers with a token. Reply to `from` (127.0.0.1:<port>)
+        // because Winsock2 rejects `send_to(0.0.0.0:<port>)` with WSAEADDRNOTAVAIL (10049).
         let reply = reply_packet(0xABCD, 1, "127.0.0.1|40000");
-        server.send_to(&reply, driver_addr).expect("server reply");
+        server.send_to(&reply, from).expect("server reply");
 
         driver.poll_until_ready(Duration::from_millis(500));
         assert_eq!(driver.media.server_token, 0xABCD);
