@@ -72,6 +72,7 @@ pub fn cloud_of_mine_id() -> u64 {
 }
 
 /// Look up a preview row.
+#[allow(dead_code)]
 pub fn conv(id: u64) -> Option<&'static PreviewConv> {
     PREVIEW.iter().find(|row| row.id == id)
 }
@@ -127,6 +128,7 @@ pub fn people(groups: bool) -> &'static [PreviewPerson] {
 }
 
 /// Open the matching preview thread, if any.
+#[allow(dead_code)]
 pub fn conv_id_by_name(name: &str) -> Option<u64> {
     PREVIEW
         .iter()
@@ -204,6 +206,7 @@ pub const PREVIEW_MSGS: &[PreviewMsg] = &[
 ];
 
 /// Bubbles of one preview conversation, oldest first.
+#[allow(dead_code)]
 pub fn messages(conv: u64) -> impl Iterator<Item = &'static PreviewMsg> {
     PREVIEW_MSGS.iter().filter(move |msg| msg.conv == conv)
 }

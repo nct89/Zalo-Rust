@@ -19,6 +19,7 @@ use crate::window_frame::CsdCorners;
 /// Clipboard pastes are stored as `zalo-gpui-paste-<ms>.<ext>`. The chip shows
 /// the picture, not that temporary name.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn pending_chip_label(file_name: &str) -> String {
     if file_name.starts_with("zalo-gpui-paste-") {
         "Ảnh".to_owned()

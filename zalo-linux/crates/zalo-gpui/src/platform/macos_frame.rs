@@ -21,6 +21,7 @@ pub fn reset_settle() {}
 pub fn anticipate_csd_window() {}
 
 /// Nothing to sync.
+#[allow(dead_code)]
 pub fn sync(_scale: f32) {}
 
 /// The window server owns the frame, so the client buffer did not change shape.

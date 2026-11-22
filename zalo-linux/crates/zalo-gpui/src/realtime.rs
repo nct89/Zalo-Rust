@@ -225,13 +225,6 @@ pub fn start_with_shutdown(
         });
 }
 
-/// Start the listener thread. It stops when the receiver is dropped.
-pub fn start(dir: PathBuf, tx: UnboundedSender<RtEvent>) {
-    let gen = ACTIVE_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    start_with_shutdown(dir, tx, gen, stop_rx);
-}
-
 async fn wait_stopped(stop_rx: &mut tokio::sync::watch::Receiver<bool>) {
     if *stop_rx.borrow() {
         return;

@@ -2687,6 +2687,7 @@ fn select_display_label(options: &[(String, String)], current: &str) -> String {
 }
 
 /// Local JSON used only by the unit test. Not the PC → phone backup.
+#[cfg(test)]
 fn build_chat_backup_json(
     convs: &[crate::data::ChatConv],
     messages: &HashMap<u64, Vec<crate::data::ChatMsg>>,

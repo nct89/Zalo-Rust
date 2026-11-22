@@ -1117,12 +1117,6 @@ impl ZaloApi {
             .await
     }
 
-    fn message_file_host(&self) -> String {
-        self.file_host
-            .clone()
-            .unwrap_or_else(|| "https://tt-files-wpa.chat.zalo.me".to_owned())
-    }
-
     fn catalog_host(&self) -> String {
         self.service_base("catalog", "https://tt-catalog-wpa.chat.zalo.me")
             .to_owned()

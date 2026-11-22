@@ -431,6 +431,7 @@ pub fn detach_account(session_dir: &std::path::Path) {
 ///
 /// Called on explicit user logout and whenever QR login authenticates a different account
 /// than the previous one, so chats/groups/cursors/profiles from the old account never leak.
+#[cfg(test)]
 pub fn wipe_account_data(dir: &std::path::Path) {
     wipe_session_file(dir);
     for name in [
@@ -983,12 +984,6 @@ pub fn search_thread_messages_filtered(
     }
 }
 
-/// Full-text search inside `thread_id`'s persisted `store.db` message history (chronological).
-#[must_use]
-pub fn search_thread_messages(thread_id: &str, query: &str, limit: usize) -> Vec<ChatMsg> {
-    search_thread_messages_filtered(thread_id, query, None, None, limit)
-}
-
 #[cfg(not(test))]
 fn map_store(store: &LocalStore, self_uids: &HashSet<String>) -> Snapshot {
     let users: HashMap<String, String> = store
@@ -1267,6 +1262,7 @@ mod tests {
         assert_eq!(photo_album_end(&split, 2), 3);
     }
 
+    #[test]
     fn hash_id_skips_preview_range() {
         let id = hash_id("g_200000000000000002");
         assert_ne!(id, 0);

@@ -8795,7 +8795,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-backup"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -8811,7 +8811,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-client"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -8833,15 +8833,15 @@ dependencies = [
 
 [[package]]
 name = "zalo-core"
-version = "0.2.2"
+version = "0.3.0"
 
 [[package]]
 name = "zalo-design"
-version = "0.2.2"
+version = "0.3.0"
 
 [[package]]
 name = "zalo-gpui"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "embed-resource",
@@ -8891,7 +8891,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-protocol"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -8907,7 +8907,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-shell"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "image",
  "thiserror 1.0.69",
@@ -8917,7 +8917,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-shell-mac"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "cocoa 0.26.0",
  "image",
@@ -8927,7 +8927,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-shell-win"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "image",
  "thiserror 1.0.69",
@@ -8938,7 +8938,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-storage"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "aes",
  "cbc",
@@ -8950,7 +8950,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-sync"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "rand 0.8.8",
@@ -9087,7 +9087,7 @@ dependencies = [
 
 [[package]]
 name = "zcall-audio"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "libpulse-binding",
  "libpulse-simple-binding",
@@ -9098,21 +9098,21 @@ dependencies = [
 
 [[package]]
 name = "zcall-audio-mac"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "cpal",
 ]
 
 [[package]]
 name = "zcall-audio-win"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "cpal",
 ]
 
 [[package]]
 name = "zcall-core"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -9127,7 +9127,7 @@ dependencies = [
 
 [[package]]
 name = "zcall-engine"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "zalo-protocol",
@@ -9137,7 +9137,7 @@ dependencies = [
 
 [[package]]
 name = "zcall-engine-mac"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "zcall-audio-mac",
@@ -9146,7 +9146,7 @@ dependencies = [
 
 [[package]]
 name = "zcall-engine-win"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "zcall-audio-win",
@@ -9389,7 +9389,7 @@ dependencies = [
 
 [[package]]
 name = "zimage"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "image",
  "thiserror 1.0.69",
@@ -9397,7 +9397,7 @@ dependencies = [
 
 [[package]]
 name = "zjxl"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "fast_image_resize",
  "jpeg-encoder",
@@ -9421,7 +9421,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zocr"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "clipper2-rust",
  "image",

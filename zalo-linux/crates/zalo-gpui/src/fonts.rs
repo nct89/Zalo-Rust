@@ -33,34 +33,48 @@ pub const FA_SUN: char = '\u{F185}';
 /// `fa-solid fa-moon` (U+F186).
 pub const FA_MOON: char = '\u{F186}';
 /// `fa-solid fa-gear` (U+F013).
+#[allow(dead_code)]
 pub const FA_GEAR: char = '\u{F013}';
 /// `fa-solid fa-globe` (U+F0AC).
+#[allow(dead_code)]
 pub const FA_GLOBE: char = '\u{F0AC}';
 /// `fa-solid fa-trash` (U+F1F8).
+#[allow(dead_code)]
 pub const FA_TRASH: char = '\u{F1F8}';
 /// `fa-solid fa-rotate` (U+F2F1).
+#[allow(dead_code)]
 pub const FA_ROTATE: char = '\u{F2F1}';
 /// `fa-solid fa-xmark` (U+F00D).
+#[allow(dead_code)]
 pub const FA_XMARK: char = '\u{F00D}';
 /// `fa-solid fa-plus` (U+F067).
+#[allow(dead_code)]
 pub const FA_PLUS: char = '\u{F067}';
 /// `fa-solid fa-paper-plane` (U+F1D8). Composer send arrow.
 pub const FA_PAPER_PLANE: char = '\u{F1D8}';
 /// `fa-solid fa-folder-open` (U+F07C).
+#[allow(dead_code)]
 pub const FA_FOLDER_OPEN: char = '\u{F07C}';
 /// `fa-solid fa-right-from-bracket` (U+F2F5).
+#[allow(dead_code)]
 pub const FA_RIGHT_FROM_BRACKET: char = '\u{F2F5}';
 /// `fa-solid fa-cart-shopping` (U+F07A).
+#[allow(dead_code)]
 pub const FA_CART_SHOPPING: char = '\u{F07A}';
 /// `fa-solid fa-crown` (U+F521).
+#[allow(dead_code)]
 pub const FA_CROWN: char = '\u{F521}';
 /// `fa-solid fa-play` (U+F04B).
+#[allow(dead_code)]
 pub const FA_PLAY: char = '\u{F04B}';
 /// `fa-solid fa-stop` (U+F04D).
+#[allow(dead_code)]
 pub const FA_STOP: char = '\u{F04D}';
 /// `fa-solid fa-check` (U+F00C).
+#[allow(dead_code)]
 pub const FA_CHECK: char = '\u{F00C}';
 /// `fa-solid fa-arrow-up-right-from-square` (U+F08E).
+#[allow(dead_code)]
 pub const FA_EXTERNAL_LINK: char = '\u{F08E}';
 
 /// Render a Font Awesome 6 Free Solid glyph (weight 900) with a Unicode fallback.

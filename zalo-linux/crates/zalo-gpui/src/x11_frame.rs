@@ -497,6 +497,7 @@ pub fn anticipate_csd_window() {
 /// Apply the OS frame for every Zalo window of this process.
 ///
 /// Throttled: `wrap_csd` runs on every frame. Unit tests never open a display.
+#[allow(dead_code)]
 pub fn sync(scale: f32) {
     let _ = sync_window(0, 0, false, scale);
 }
@@ -576,6 +577,7 @@ pub fn rounded_rows(width: u16, height: u16, radius: u16) -> Vec<Rectangle> {
 /// A compositor blends the buffer's antialiased fringe. This cover keeps
 /// that fringe and still clips the square plate outside it.
 #[must_use]
+#[cfg(test)]
 pub fn rounded_rows_cover(width: u16, height: u16, radius: u16) -> Vec<Rectangle> {
     rounded_rows_inset(width, height, radius, round_inset_cover)
 }
@@ -638,6 +640,7 @@ fn round_inset(y: i32, radius: i32) -> i32 {
 }
 
 /// Inset that still includes every pixel the disk touches.
+#[cfg(test)]
 fn round_inset_cover(y: i32, radius: i32) -> i32 {
     if radius <= 0 || y < 0 || y >= radius {
         return 0;

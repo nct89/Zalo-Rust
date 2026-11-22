@@ -403,6 +403,7 @@ pub fn reaction_preset_index(r_icon: &str, r_type: i64) -> usize {
 
 /// Maps Zalo's reaction icon / type to a compact display emoji.
 #[must_use]
+#[cfg(test)]
 pub fn reaction_emoji(r_icon: &str, r_type: i64) -> &'static str {
     REACTION_PRESETS[reaction_preset_index(r_icon, r_type)].0
 }

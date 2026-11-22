@@ -142,6 +142,7 @@ impl SystemScan {
 #[derive(Clone, Debug)]
 pub struct OcrManifest {
     /// Version tag.
+    #[allow(dead_code)]
     pub version: String,
     /// Target platform (`linux-x86_64`).
     pub platform: String,

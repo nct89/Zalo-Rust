@@ -82,6 +82,7 @@ pub fn thumb_key(item: &EmojiItem) -> String {
 
 /// True when `text` contains a classic shortcode or a catalogued Unicode emoji.
 #[must_use]
+#[cfg(test)]
 pub fn contains_pictogram(text: &str) -> bool {
     if text.is_empty() {
         return false;

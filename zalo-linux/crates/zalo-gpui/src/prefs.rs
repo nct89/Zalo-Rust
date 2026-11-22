@@ -180,6 +180,7 @@ impl Prefs {
 
     /// Removes account-scoped keys from `ui-state.json` and `gpui-prefs.json`
     /// while preserving device/app settings (theme, language, window size, audio devices).
+    #[cfg(test)]
     pub fn reset_account_keys(&mut self) {
         for k in ACCOUNT_SHARED {
             self.shared.remove(k);
