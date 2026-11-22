@@ -740,7 +740,7 @@ def watch_upstream_and_open_pr(
             print(f"Upstream watcher check failed (rc={proc.returncode}): {(proc.stderr or proc.stdout)[-400:]}")
             return False
         summary = json.loads(tmp_json.read_text(encoding="utf-8"))
-        upstream_ver = summary.get("upstream_ver", "")
+        upstream_ver = summary.get("upstream_ver") or (summary.get("probe") or {}).get("latest_version", "")
         current_ver = summary.get("current_ver", "")
         is_newer = bool(summary.get("is_newer"))
         print(f"Upstream check: pinned={current_ver}, latest={upstream_ver}, newer={is_newer}")
@@ -781,8 +781,9 @@ def watch_upstream_and_open_pr(
         )
         for name, color, desc in AUTOMATION_LABELS:
             gh.ensure_label(name, color, desc)
+        classification = summary.get("classification") or (summary.get("analysis") or {}).get("classification", "")
         release_label = (
-            "release:minor" if summary.get("classification") == "feature-update" else "release:patch"
+            "release:minor" if classification == "feature-update" else "release:patch"
         )
         body = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
         pr = gh.create_pr(
