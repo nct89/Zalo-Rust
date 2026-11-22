@@ -44,10 +44,26 @@ DEFAULT_STATE_FILE = pathlib.Path(
 )
 MAX_AGY_ROUNDS = int(os.environ.get("MAX_AGY_ROUNDS", "3"))
 AUTO_MERGE = os.environ.get("AUTO_MERGE", "false").strip().lower() in ("1", "true", "yes")
+AUTO_WATCH_UPSTREAM = os.environ.get("AUTO_WATCH_UPSTREAM", "true").strip().lower() in ("1", "true", "yes")
+AUTO_TAG_RELEASE = os.environ.get("AUTO_TAG_RELEASE", "true").strip().lower() in ("1", "true", "yes")
+AUTO_SYNC_LOCAL = os.environ.get("AUTO_SYNC_LOCAL", "true").strip().lower() in ("1", "true", "yes")
+NOTIFY_RELEASES = os.environ.get("NOTIFY_RELEASES", "true").strip().lower() in ("1", "true", "yes")
+DELETE_MERGED_BRANCH = os.environ.get("DELETE_MERGED_BRANCH", "true").strip().lower() in ("1", "true", "yes")
+UPSTREAM_CHECK_INTERVAL_SEC = int(os.environ.get("UPSTREAM_CHECK_INTERVAL_SEC", "21600"))
+RELEASE_CHECK_INTERVAL_SEC = int(os.environ.get("RELEASE_CHECK_INTERVAL_SEC", "900"))
 AGY_TIMEOUT = os.environ.get("AGY_TIMEOUT", "30m")
 AGY_EFFORT = os.environ.get("AGY_EFFORT", "high")
 ELIGIBLE_LABELS = {"upstream-sync", "agy-auto"}
 BLOCKING_LABELS = {"needs-human", "ready-to-merge"}
+RELEASE_LABELS = {"release:patch", "release:minor", "release:major"}
+AUTOMATION_LABELS = [
+    ("upstream-sync", "0068ff", "Automated upstream Zalo Desktop update analysis"),
+    ("agy-auto", "7c3aed", "Eligible for Antigravity CLI autonomous PR worker"),
+    ("release:patch", "0e8a16", "Auto-bump patch version and publish release on merge"),
+    ("release:minor", "1d76db", "Auto-bump minor version and publish release on merge"),
+    ("ready-to-merge", "2ea043", "CI green and AI review clean"),
+    ("needs-human", "d93f0b", "Requires manual developer intervention"),
+]
 
 
 class GitHubClient:
@@ -122,6 +138,50 @@ class GitHubClient:
                 "merge_method": "squash",
             },
         )
+
+    def delete_ref(self, ref: str) -> None:
+        try:
+            self._req("DELETE", f"/git/refs/{ref}")
+        except urllib.error.HTTPError as err:
+            if err.code not in (404, 422):
+                raise
+
+    def ensure_label(self, name: str, color: str, description: str) -> None:
+        try:
+            self._req("POST", "/labels", {"name": name, "color": color, "description": description})
+        except urllib.error.HTTPError as err:
+            if err.code != 422:
+                raise
+
+    def list_open_prs_by_head(self, branch: str) -> list[dict[str, Any]]:
+        owner = self.repo_slug.split("/", 1)[0]
+        return self._req("GET", f"/pulls?state=open&head={owner}:{branch}&per_page=10")
+
+    def create_pr(self, title: str, head: str, base: str, body: str) -> dict[str, Any]:
+        return self._req("POST", "/pulls", {"title": title, "head": head, "base": base, "body": body})
+
+    def list_tags(self, per_page: int = 10) -> list[dict[str, Any]]:
+        return self._req("GET", f"/tags?per_page={per_page}")
+
+    def get_latest_release(self) -> dict[str, Any] | None:
+        try:
+            return self._req("GET", "/releases/latest")
+        except urllib.error.HTTPError as err:
+            if err.code == 404:
+                return None
+            raise
+
+    def get_release_by_tag(self, tag: str) -> dict[str, Any] | None:
+        try:
+            return self._req("GET", f"/releases/tags/{tag}")
+        except urllib.error.HTTPError as err:
+            if err.code == 404:
+                return None
+            raise
+
+    def list_workflow_runs(self, per_page: int = 20) -> list[dict[str, Any]]:
+        data = self._req("GET", f"/actions/runs?per_page={per_page}")
+        return data.get("workflow_runs", [])
 
 
 def notify_desktop(summary: str, body: str) -> None:
@@ -432,7 +492,13 @@ def process_pr(
             return
         if AUTO_MERGE:
             gh.squash_merge(pr_num, head_sha, f"{pr['title']} (#{pr_num})")
-            notify_desktop(f"Zalo-Rust PR #{pr_num} đã tự Merge", f"{pr['title']} — đang chờ auto-release.")
+            print(f"PR #{pr_num}: squash-merged into main.")
+            if DELETE_MERGED_BRANCH and branch and branch != "main":
+                gh.delete_ref(f"heads/{branch}")
+                print(f"PR #{pr_num}: deleted remote branch {branch}.")
+            notify_desktop(f"Zalo-Rust PR #{pr_num} đã tự Merge", f"{pr['title']} — đang tạo bản phát hành.")
+            if AUTO_TAG_RELEASE and (labels & RELEASE_LABELS):
+                bump_and_push_release_tag(gh, repo, labels, state, dry_run=dry_run)
         else:
             gh.add_labels(pr_num, ["ready-to-merge"])
             gh.post_issue_comment(
@@ -549,12 +615,405 @@ def process_pr(
             shutil.rmtree(unpacked_dir, ignore_errors=True)
 
 
+def _replace_once(path: pathlib.Path, pattern: str, repl: str) -> None:
+    if not path.is_file():
+        return
+    src = path.read_text(encoding="utf-8")
+    dst, count = re.subn(pattern, repl, src, count=1, flags=re.MULTILINE)
+    if count:
+        path.write_text(dst, encoding="utf-8")
+
+
+def sync_local_main(gh: GitHubClient, repo: pathlib.Path, dry_run: bool) -> None:
+    if not AUTO_SYNC_LOCAL or dry_run:
+        return
+    extra, remote = git_remote_args(gh.repo_slug, gh.token)
+    fetch = subprocess.run(
+        ["git", *extra, "fetch", remote, "main:refs/remotes/origin/main", "--tags"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if fetch.returncode != 0:
+        return
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if branch != "main":
+        return
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if dirty:
+        return
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=False
+    ).stdout.strip()
+    remote_head = subprocess.run(
+        ["git", "rev-parse", "refs/remotes/origin/main"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    if not head or not remote_head or head == remote_head:
+        return
+    is_anc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", head, remote_head],
+        cwd=repo,
+        check=False,
+    )
+    if is_anc.returncode == 0:
+        ff = subprocess.run(
+            ["git", "merge", "--ff-only", remote_head],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ff.returncode == 0:
+            print(f"Local main fast-forwarded: {head[:7]} -> {remote_head[:7]}")
+
+
+def watch_upstream_and_open_pr(
+    gh: GitHubClient,
+    repo: pathlib.Path,
+    state: dict[str, Any],
+    dry_run: bool,
+    force: bool = False,
+) -> bool:
+    if not AUTO_WATCH_UPSTREAM and not force:
+        return False
+    now = int(time.time())
+    last_check = int(state.get("last_upstream_check_ts", 0))
+    if not force and (now - last_check) < UPSTREAM_CHECK_INTERVAL_SEC:
+        return False
+
+    extra, remote = git_remote_args(gh.repo_slug, gh.token)
+    subprocess.run(
+        ["git", *extra, "fetch", remote, "main:refs/remotes/origin/main"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    wt_dir = pathlib.Path(tempfile.mkdtemp(prefix="zalo-rust-watch-"))
+    tmp_json = pathlib.Path(tempfile.mktemp(prefix="zalo-upstream-diff-", suffix=".json"))
+    try:
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(wt_dir), "refs/remotes/origin/main"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(wt_dir / "scripts" / "zalo-upstream-diff.py"),
+                "--repo",
+                str(wt_dir),
+                "--download",
+                "--analyze",
+                "--update-protocol",
+                "--report-dir",
+                "docs/upstream-reports",
+                "--json-out",
+                str(tmp_json),
+            ],
+            cwd=wt_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        state["last_upstream_check_ts"] = now
+        if proc.returncode != 0 or not tmp_json.is_file():
+            print(f"Upstream watcher check failed (rc={proc.returncode}): {(proc.stderr or proc.stdout)[-400:]}")
+            return False
+        summary = json.loads(tmp_json.read_text(encoding="utf-8"))
+        upstream_ver = summary.get("upstream_ver", "")
+        current_ver = summary.get("current_ver", "")
+        is_newer = bool(summary.get("is_newer"))
+        print(f"Upstream check: pinned={current_ver}, latest={upstream_ver}, newer={is_newer}")
+        if not is_newer or not upstream_ver:
+            return False
+
+        branch = f"chore/upstream-zalo-{upstream_ver}"
+        existing = gh.list_open_prs_by_head(branch)
+        if existing:
+            print(f"Upstream PR #{existing[0]['number']} already open for {branch}; skipping.")
+            return False
+
+        if dry_run:
+            print(f"[DRY-RUN] Would open PR {branch} for Zalo Desktop {upstream_ver}")
+            return False
+
+        report_path = wt_dir / "docs" / "upstream-reports" / f"zalo-{upstream_ver}.md"
+        subprocess.run(["git", "checkout", "-B", branch], cwd=wt_dir, check=True)
+        subprocess.run(
+            ["git", "add", "protocol.json", str(report_path.relative_to(wt_dir))],
+            cwd=wt_dir,
+            check=True,
+        )
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"], cwd=wt_dir, check=False
+        )
+        if staged.returncode == 0:
+            return False
+        subprocess.run(
+            ["git", "commit", "-m", f"chore(upstream): analyze Zalo Desktop {upstream_ver} (from {current_ver})"],
+            cwd=wt_dir,
+            check=True,
+        )
+        subprocess.run(
+            ["git", *extra, "push", "--force-with-lease", remote, f"HEAD:{branch}"],
+            cwd=wt_dir,
+            check=True,
+        )
+        for name, color, desc in AUTOMATION_LABELS:
+            gh.ensure_label(name, color, desc)
+        release_label = (
+            "release:minor" if summary.get("classification") == "feature-update" else "release:patch"
+        )
+        body = report_path.read_text(encoding="utf-8") if report_path.is_file() else ""
+        pr = gh.create_pr(
+            title=f"chore(upstream): sync Zalo Desktop {upstream_ver}",
+            head=branch,
+            base="main",
+            body=body,
+        )
+        pr_num = int(pr["number"])
+        gh.add_labels(pr_num, ["upstream-sync", "agy-auto", release_label])
+        print(f"Opened upstream PR #{pr_num}: {pr.get('html_url', '')}")
+        notify_desktop(
+            f"Zalo Desktop có bản mới {upstream_ver}",
+            f"Đã tự tạo PR #{pr_num} để agy & CodeRabbit xử lý.",
+        )
+        return True
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt_dir)],
+            cwd=repo,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        shutil.rmtree(wt_dir, ignore_errors=True)
+        tmp_json.unlink(missing_ok=True)
+
+
+def bump_and_push_release_tag(
+    gh: GitHubClient,
+    repo: pathlib.Path,
+    labels: set[str],
+    state: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        print("[DRY-RUN] Would bump version and push release tag via PAT.")
+        return
+    extra, remote = git_remote_args(gh.repo_slug, gh.token)
+    subprocess.run(
+        ["git", *extra, "fetch", remote, "main:refs/remotes/origin/main", "--tags"],
+        cwd=repo,
+        check=True,
+    )
+    wt_dir = pathlib.Path(tempfile.mkdtemp(prefix="zalo-rust-rel-"))
+    try:
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(wt_dir), "refs/remotes/origin/main"],
+            cwd=repo,
+            check=True,
+        )
+        cargo_toml = wt_dir / "Cargo.toml"
+        text = cargo_toml.read_text(encoding="utf-8")
+        m = re.search(r'(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', text)
+        if not m:
+            print("bump_and_push_release_tag: version not found in Cargo.toml")
+            return
+        maj, min_, pat = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if "release:major" in labels:
+            maj, min_, pat = maj + 1, 0, 0
+        elif "release:minor" in labels:
+            min_, pat = min_ + 1, 0
+        else:
+            pat += 1
+        new_ver = f"{maj}.{min_}.{pat}"
+        tag = f"v{new_ver}"
+
+        existing_tags = {t.get("name", "") for t in gh.list_tags(per_page=15)}
+        if tag in existing_tags:
+            print(f"Release tag {tag} already exists on remote; skipping local bump.")
+            return
+
+        _replace_once(wt_dir / "Cargo.toml", r'^version\s*=\s*"[^"]+"', f'version = "{new_ver}"')
+        _replace_once(wt_dir / "zalo-linux/packaging/arch/PKGBUILD", r'^pkgver=.*$', f"pkgver={new_ver}")
+        _replace_once(
+            wt_dir / "zalo-linux/packaging/rpm/zalo-linux.spec",
+            r'^Version:\s*.*$',
+            f"Version:        {new_ver}",
+        )
+        _replace_once(
+            wt_dir / "zalo-linux/packaging/deb/build-deb.sh",
+            r"WORKSPACE_VERSION:-([0-9.]+)",
+            f"WORKSPACE_VERSION:-{new_ver}",
+        )
+        _replace_once(
+            wt_dir / "zalo-macos/packaging/build-app.sh",
+            r"WORKSPACE_VERSION:-([0-9.]+)",
+            f"WORKSPACE_VERSION:-{new_ver}",
+        )
+        _replace_once(
+            wt_dir / "zalo-windows/packaging/build-windows.ps1",
+            r'\$WorkspaceVersion\s*=\s*"[^"]+"',
+            f'$WorkspaceVersion = "{new_ver}"',
+        )
+        subprocess.run(
+            [
+                "git",
+                "add",
+                "Cargo.toml",
+                "zalo-linux/packaging/arch/PKGBUILD",
+                "zalo-linux/packaging/rpm/zalo-linux.spec",
+                "zalo-linux/packaging/deb/build-deb.sh",
+                "zalo-macos/packaging/build-app.sh",
+                "zalo-windows/packaging/build-windows.ps1",
+            ],
+            cwd=wt_dir,
+            check=True,
+        )
+        subprocess.run(["git", "commit", "-m", f"chore(release): {tag}"], cwd=wt_dir, check=True)
+        subprocess.run(["git", "tag", "-a", tag, "-m", f"Release {tag}"], cwd=wt_dir, check=True)
+        push = subprocess.run(
+            ["git", *extra, "push", remote, "HEAD:main", f"refs/tags/{tag}"],
+            cwd=wt_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if push.returncode == 0:
+            retagged = state.setdefault("retagged_tags", [])
+            if tag not in retagged:
+                retagged.append(tag)
+            print(f"Pushed release commit and tag {tag} via PAT (triggering release.yml).")
+            notify_desktop(
+                f"Zalo-Rust đang build bản {tag}",
+                "Đã tự động đẩy tag lên GitHub Actions để đóng gói Linux/macOS/Windows.",
+            )
+        else:
+            print(f"Release bump push skipped/raced ({tag}): {push.stderr.strip()[-300:]}")
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(wt_dir)],
+            cwd=repo,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        shutil.rmtree(wt_dir, ignore_errors=True)
+
+
+def ensure_latest_tag_triggers_release(
+    gh: GitHubClient,
+    repo: pathlib.Path,
+    state: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    """Re-push the latest v* tag using the user's PAT if GITHUB_TOKEN pushed it without triggering release.yml."""
+    if not AUTO_TAG_RELEASE:
+        return
+    now = int(time.time())
+    if (now - int(state.get("last_tag_check_ts", 0))) < 300:
+        return
+    state["last_tag_check_ts"] = now
+
+    tags = [t for t in gh.list_tags(per_page=10) if re.match(r"^v\d+\.\d+\.\d+$", t.get("name", ""))]
+    if not tags:
+        return
+    latest = tags[0]
+    tag = latest["name"]
+    tag_sha = (latest.get("commit") or {}).get("sha", "")
+    retagged = state.setdefault("retagged_tags", [])
+    if tag in retagged:
+        return
+
+    if gh.get_release_by_tag(tag) is not None:
+        retagged.append(tag)
+        return
+
+    runs = gh.list_workflow_runs(per_page=25)
+    for r in runs:
+        if r.get("name") == "Release" and (r.get("head_branch") == tag or r.get("head_sha") == tag_sha):
+            retagged.append(tag)
+            return
+
+    if dry_run:
+        print(f"[DRY-RUN] Tag {tag} has no Release/workflow run; would re-push tag with PAT.")
+        return
+
+    extra, remote = git_remote_args(gh.repo_slug, gh.token)
+    subprocess.run(
+        ["git", *extra, "fetch", remote, f"refs/tags/{tag}:refs/tags/{tag}", "--force"],
+        cwd=repo,
+        check=True,
+    )
+    gh.delete_ref(f"tags/{tag}")
+    subprocess.run(["git", *extra, "push", remote, f"refs/tags/{tag}"], cwd=repo, check=True)
+    retagged.append(tag)
+    print(f"Re-pushed tag {tag} via PAT to trigger GitHub Actions release.yml.")
+    notify_desktop(
+        f"Zalo-Rust đang build Release {tag}",
+        "Đã tự động kích hoạt workflow đóng gói Linux/macOS/Windows trên GitHub.",
+    )
+
+
+def check_new_github_release_and_notify(
+    gh: GitHubClient,
+    repo: pathlib.Path,
+    state: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    if not NOTIFY_RELEASES:
+        return
+    now = int(time.time())
+    if (now - int(state.get("last_release_check_ts", 0))) < RELEASE_CHECK_INTERVAL_SEC:
+        return
+    state["last_release_check_ts"] = now
+
+    rel = gh.get_latest_release()
+    if not rel or rel.get("draft") or rel.get("prerelease"):
+        return
+    tag = rel.get("tag_name", "")
+    if not tag or tag == state.get("last_notified_release"):
+        return
+
+    if not dry_run:
+        url = rel.get("html_url", f"https://github.com/{gh.repo_slug}/releases/latest")
+        assets_count = len(rel.get("assets") or [])
+        notify_desktop(
+            f"Zalo-Rust có phiên bản mới {tag}",
+            f"Đã xuất bản ({assets_count} gói tải về).\n{url}",
+        )
+        state["last_notified_release"] = tag
+    print(f"Detected published GitHub Release {tag}.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Antigravity CLI autonomous PR worker for Zalo-Rust")
     ap.add_argument("--repo", type=pathlib.Path, default=REPO_ROOT)
     ap.add_argument("--repo-slug", default=os.environ.get("ZALO_GITHUB_REPO", DEFAULT_REPO_SLUG))
     ap.add_argument("--agy-bin", default=DEFAULT_AGY_BIN)
     ap.add_argument("--pr", type=int, help="Process only one specific PR number")
+    ap.add_argument("--check-upstream", action="store_true", help="Force immediate upstream Zalo version check")
     ap.add_argument("--dry-run", action="store_true", help="Inspect PRs and print planned actions without modifying anything")
     ap.add_argument("--once", action="store_true", help="Run a single poll pass and exit (default)")
     args = ap.parse_args()
@@ -570,6 +1029,16 @@ def main() -> int:
     gh = GitHubClient(args.repo_slug, token)
     state = load_state(DEFAULT_STATE_FILE)
 
+    # 1. Keep local main fast-forwarded when clean.
+    sync_local_main(gh, args.repo, dry_run=args.dry_run)
+
+    # 2. Periodically check official Zalo Desktop Windows/macOS feeds and open an upstream PR if newer.
+    if not args.pr:
+        watch_upstream_and_open_pr(
+            gh, args.repo, state, dry_run=args.dry_run, force=args.check_upstream
+        )
+
+    # 3. Process eligible open PRs with agy + CodeRabbit + CI + optional auto-merge/tag.
     try:
         prs = [gh.get_pr(args.pr)] if args.pr else gh.list_open_prs()
     except urllib.error.HTTPError as err:
@@ -587,6 +1056,15 @@ def main() -> int:
 
     if eligible_count == 0:
         print(f"No eligible open PRs found in {args.repo_slug} (checked {len(prs)} open PR(s)).")
+
+    # 4. Ensure latest v* tag triggers GitHub Actions release.yml (even if created by GITHUB_TOKEN).
+    if not args.pr:
+        ensure_latest_tag_triggers_release(gh, args.repo, state, dry_run=args.dry_run)
+
+    # 5. Fast-forward local main again if a merge/tag commit was just pushed, then notify on new Release.
+    sync_local_main(gh, args.repo, dry_run=args.dry_run)
+    if not args.pr:
+        check_new_github_release_and_notify(gh, args.repo, state, dry_run=args.dry_run)
 
     if not args.dry_run:
         save_state(DEFAULT_STATE_FILE, state)

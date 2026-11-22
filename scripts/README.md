@@ -23,9 +23,16 @@ Workflow `.github/workflows/zalo-watcher.yml` tự động chạy script này h�
 
 ---
 
-## 3. Antigravity CLI (`agy`) PR Worker (`agy-pr-bot.py`)
+## 3. Antigravity CLI (`agy`) Full Zero-Touch Worker (`agy-pr-bot.py`)
 
-Daemon cục bộ trên máy Linux nơi bạn đã đăng nhập sẵn Antigravity CLI (`/home/nct89/.local/bin/agy`).
+Daemon cục bộ trên máy Linux nơi bạn đã đăng nhập sẵn Antigravity CLI (`/home/nct89/.local/bin/agy`). Khi bật đủ cờ, daemon tự động hóa **100% toàn trình** ngay trên máy bạn:
+
+1. **Đồng bộ `main` local (`AUTO_SYNC_LOCAL=true`)**: tự `git fetch --tags` và `git merge --ff-only` khi nhánh `main` local sạch.
+2. **Dò bản Zalo Desktop mới (`AUTO_WATCH_UPSTREAM=true`)**: định kỳ mỗi 6 giờ (`UPSTREAM_CHECK_INTERVAL_SEC=21600`) chạy `zalo-upstream-diff.py` trên worktree sạch, thấy bản Windows/macOS mới là tự mở PR `chore/upstream-zalo-<ver>`.
+3. **Tự code & sửa review/CI bằng `agy`**: gọi `agy` trên worktree riêng, tự đọc log lỗi CI & góp ý CodeRabbit, chạy `cargo test --workspace`, commit & push.
+4. **Tự động Merge & dọn nhánh (`AUTO_MERGE=true`, `DELETE_MERGED_BRANCH=true`)**: khi toàn bộ CI xanh và CodeRabbit sạch, bot tự squash-merge PR và xóa nhánh tạm.
+5. **Tự nâng version & đẩy tag kích hoạt `release.yml` (`AUTO_TAG_RELEASE=true`)**: tự bump `Cargo.toml` + 5 file đóng gói và đẩy tag `vX.Y.Z` bằng chính PAT (tự động kích hoạt GitHub Actions build gói Linux/macOS/Windows và đăng GitHub Release mà không cần thêm `RELEASE_TOKEN` trên GitHub).
+6. **Thông báo bản phát hành mới (`NOTIFY_RELEASES=true`)**: kiểm tra `releases/latest` định kỳ và gửi desktop notification (`notify-send`) khi có Release mới.
 
 ### Cài đặt 1 lần
 
@@ -35,14 +42,20 @@ Daemon cục bộ trên máy Linux nơi bạn đã đăng nhập sẵn Antigravi
    cat > ~/.config/zalo-rust-bot/env <<'EOF'
    GITHUB_TOKEN=github_pat_...
    AGY_BIN=/home/nct89/.local/bin/agy
-   AUTO_MERGE=false
+   AUTO_MERGE=true
+   AUTO_WATCH_UPSTREAM=true
+   AUTO_TAG_RELEASE=true
+   AUTO_SYNC_LOCAL=true
+   NOTIFY_RELEASES=true
+   DELETE_MERGED_BRANCH=true
+   UPSTREAM_CHECK_INTERVAL_SEC=21600
+   RELEASE_CHECK_INTERVAL_SEC=900
    MAX_AGY_ROUNDS=3
    AGY_EFFORT=high
    AGY_TIMEOUT=30m
    EOF
    chmod 600 ~/.config/zalo-rust-bot/env
    ```
-   *(Để tự động tạo tag và kích hoạt `release.yml` sau khi PR merge, thêm cùng PAT có quyền `Contents: Read & Write` vào GitHub Repository Secret tên `RELEASE_TOKEN`.)*
 
 2. Chạy thử dry-run:
    ```bash
@@ -50,7 +63,7 @@ Daemon cục bộ trên máy Linux nơi bạn đã đăng nhập sẵn Antigravi
    python3 scripts/agy-pr-bot.py --dry-run
    ```
 
-3. Bật chạy tự động mỗi 10 phút qua `systemd --user`:
+3. Bật chạy tự động mỗi 3 phút qua `systemd --user`:
    ```bash
    mkdir -p ~/.config/systemd/user
    cp scripts/systemd/zalo-agy-pr-bot.service ~/.config/systemd/user/
