@@ -121,14 +121,6 @@ struct Shared {
     speaking_gen: u64,
     /// Peer/engine asked local encoder for a key frame (`Ui::request_key_frame`).
     key_requested: bool,
-    /// Active stereo Ogg Opus call recording state.
-    recording: bool,
-    /// When the current recording started (for the live `REC 00:00` timer).
-    recording_started: Option<Instant>,
-    /// Pending UI toggle for call recording (`Some(true)` start, `Some(false)` stop).
-    recording_req: Option<bool>,
-    /// One-shot toast returned by the worker when recording starts/stops/fails.
-    recording_toast: Option<String>,
     /// Live speaker playout volume, 0..=100 (default 100).
     speaker_volume: u8,
     /// Pending speaker volume update for the worker (`bridge.set_speaker_volume`).
@@ -155,8 +147,6 @@ struct RenderKey {
     mic_volume: u8,
     speaker_volume: u8,
     sharing: bool,
-    recording: bool,
-    rec_sec: Option<u64>,
     mic_dots: u8,
     test_tone_step: u8,
     members_gen: u64,
@@ -256,10 +246,6 @@ pub struct CallView {
     live_mic_level: u8,
     /// Start instant of the active "Test speaker/headphones" test chime (~1.6 s).
     test_tone_at: Option<Instant>,
-    /// Active stereo Ogg Opus call recording state mirrored from `Shared`.
-    recording: bool,
-    /// When the current call recording began.
-    recording_started: Option<Instant>,
 }
 
 /// PulseAudio / V4L2 devices shown in the call window.
@@ -1060,8 +1046,6 @@ fn new_view(
             mic_volume,
             speaker_volume: 100,
             sharing: false,
-            recording: false,
-            rec_sec: None,
             mic_dots: 0,
             test_tone_step: 0,
             members_gen: 0,
@@ -1080,8 +1064,6 @@ fn new_view(
         spk_drag: false,
         live_mic_level: 127,
         test_tone_at: None,
-        recording: false,
-        recording_started: None,
     }
 }
 
@@ -1230,16 +1212,11 @@ impl CallView {
         self.flush_held_pictures(window);
         let pics_changed = self.take_pictures();
         let (state, connected, ended, notice, debug) = self.snapshot();
-        if let Ok(mut s) = self.shared.lock() {
+        if let Ok(s) = self.shared.lock() {
             self.camera_on = s.camera_on;
             self.sharing = s.sharing;
             if s.share_label != self.share_label {
                 self.share_label = s.share_label.clone();
-            }
-            self.recording = s.recording;
-            self.recording_started = s.recording_started;
-            if let Some(toast) = s.recording_toast.take() {
-                self.hint = Some((toast, Instant::now()));
             }
             self.live_mic_level = s.live_mic_level;
             self.local_uid = s.local_uid;
@@ -1275,10 +1252,6 @@ impl CallView {
         self.sync_member_avatars();
         self.report_tile_widths(window);
         let timer_sec = connected.filter(|_| !ended).map(|t| t.elapsed().as_secs());
-        let rec_sec = self
-            .recording_started
-            .filter(|_| self.recording && !ended)
-            .map(|t| t.elapsed().as_secs());
         let mic_dots = if self.device_status_open {
             mic_level_to_dots(self.live_mic_level, self.muted)
         } else {
@@ -1307,8 +1280,6 @@ impl CallView {
             mic_volume: self.audio.mic_volume,
             speaker_volume: self.speaker_volume,
             sharing: self.sharing,
-            recording: self.recording,
-            rec_sec,
             mic_dots,
             test_tone_step,
             members_gen: self.members_gen,
@@ -1743,14 +1714,6 @@ impl CallView {
         if self.device_status_open {
             self.menu = false;
             self.share_modal = false;
-        }
-        cx.notify();
-    }
-
-    fn toggle_recording(&mut self, cx: &mut Context<Self>) {
-        let want = !self.recording;
-        if let Ok(mut s) = self.shared.lock() {
-            s.recording_req = Some(want);
         }
         cx.notify();
     }
@@ -2495,86 +2458,6 @@ impl CallView {
                                 ),
                         )
                     })
-                    .when(self.recording && !ended, |el| {
-                        let rec_secs = self
-                            .recording_started
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        let rec_time = if rec_secs >= 3600 {
-                            format!(
-                                "REC {:02}:{:02}:{:02}",
-                                rec_secs / 3600,
-                                rec_secs / 60 % 60,
-                                rec_secs % 60
-                            )
-                        } else {
-                            format!("REC {:02}:{:02}", rec_secs / 60, rec_secs % 60)
-                        };
-                        let top_y = if self.sharing { 44. } else { 8. };
-                        el.child(
-                            div()
-                                .absolute()
-                                .top(px(top_y))
-                                .left_0()
-                                .right_0()
-                                .flex()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .px(px(12.))
-                                        .py(px(5.))
-                                        .rounded(px(16.))
-                                        .bg(hsla(0., 0., 0., 0.78))
-                                        .border_1()
-                                        .border_color(hsla(0., 0.85, 0.55, 0.55))
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .child(
-                                            div()
-                                                .size(px(8.))
-                                                .rounded(px(4.))
-                                                .bg(rgb(0xef_44_44)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(12.))
-                                                .font_family(FAMILY_SEMIBOLD)
-                                                .text_color(rgb(0xff_ff_ff))
-                                                .child(rec_time),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.))
-                                                .text_color(hsla(0., 0., 1., 0.65))
-                                                .child("Stereo OGG"),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("zcall-rec-stop-banner")
-                                                .px(px(9.))
-                                                .py(px(2.))
-                                                .rounded(px(10.))
-                                                .bg(rgb(0xd9_30_25))
-                                                .hover(|s| s.bg(rgb(0xe5_39_35)))
-                                                .cursor_pointer()
-                                                .text_size(px(11.))
-                                                .font_family(FAMILY_SEMIBOLD)
-                                                .text_color(rgb(0xff_ff_ff))
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                    cx.stop_propagation()
-                                                })
-                                                .on_click(cx.listener(
-                                                    |this, _: &ClickEvent, _, cx| {
-                                                        this.toggle_recording(cx);
-                                                    },
-                                                ))
-                                                .child("Dừng"),
-                                        ),
-                                ),
-                        )
-                    })
                     .when(has_pictures, |el| {
                         el.when_some(audio_err.clone(), |el, text| {
                             el.child(
@@ -2778,71 +2661,6 @@ impl CallView {
                                     },
                                     40.,
                                 )),
-                        )
-                    })
-                    .when(!ended, |el| {
-                        let rec_x = if bar.show_screen { 50. } else { 5. };
-                        let recording = self.recording;
-                        el.child(
-                            div()
-                                .id("zcall-rec")
-                                .absolute()
-                                .left(px(rec_x))
-                                .top(px(5.))
-                                .h(px(40.))
-                                .px(px(9.))
-                                .rounded(px(8.))
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .justify_center()
-                                .gap(px(5.))
-                                .cursor_pointer()
-                                .when(recording, |d| {
-                                    d.bg(hsla(0., 0.78, 0.48, 0.28))
-                                        .border_1()
-                                        .border_color(hsla(0., 0.85, 0.58, 0.65))
-                                })
-                                .hover(|s| s.bg(hsla(0., 0., 1., 0.1)))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.toggle_recording(cx);
-                                }))
-                                .child(
-                                    div()
-                                        .size(px(16.))
-                                        .rounded(px(8.))
-                                        .border(px(1.5))
-                                        .border_color(if recording {
-                                            rgb(0xff_6b_6b)
-                                        } else {
-                                            rgb(0xd8_dc_e2)
-                                        })
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(if recording {
-                                            div()
-                                                .size(px(7.))
-                                                .rounded(px(1.5))
-                                                .bg(rgb(0xef_44_44))
-                                        } else {
-                                            div()
-                                                .size(px(8.))
-                                                .rounded(px(4.))
-                                                .bg(rgb(0xef_44_44))
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .font_family(FAMILY_SEMIBOLD)
-                                        .text_color(if recording {
-                                            rgb(0xff_a3_a3)
-                                        } else {
-                                            rgb(0xd8_dc_e2)
-                                        })
-                                        .child("REC"),
-                                ),
                         )
                     })
                     .child(
@@ -5039,28 +4857,21 @@ fn worker(
             }
             engine.on_zalo_frame(&frame);
         }
-        // Handle local UI-only audio controls (recording, speaker volume, test chime, AEC/NS)
+        // Handle local UI-only audio controls (speaker volume, test chime, AEC/NS)
         // and publish live mic VU level for "Device Status".
         {
-            let (rec_req, spk_vol_req, test_spk, dsp_req, peer_title) = shared
+            let (spk_vol_req, test_spk, dsp_req) = shared
                 .lock()
                 .ok()
                 .map(|mut s| {
                     s.live_mic_level = bridge.live_mic_level();
-                    let title = s
-                        .peer_name_override
-                        .clone()
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| job.peer_name.clone());
                     (
-                        s.recording_req.take(),
                         s.speaker_volume_req.take(),
                         std::mem::take(&mut s.test_speaker_req),
                         s.audio_dsp_req.take(),
-                        title,
                     )
                 })
-                .unwrap_or((None, None, false, None, String::new()));
+                .unwrap_or((None, false, None));
             if let Some(pct) = spk_vol_req {
                 bridge.set_speaker_volume(pct);
             }
@@ -5069,50 +4880,6 @@ fn worker(
             }
             if let Some((aec, ns)) = dsp_req {
                 bridge.set_audio_processing(aec, ns);
-            }
-            if let Some(want_rec) = rec_req {
-                if want_rec {
-                    let path = recording_file_path(&peer_title);
-                    match bridge.start_recording(path.clone(), &peer_title) {
-                        Ok(()) => {
-                            eprintln!("zalo-gpui call: recording started -> {}", path.display());
-                            set(shared, |s| {
-                                s.recording = true;
-                                s.recording_started = Some(Instant::now());
-                                s.recording_toast =
-                                    Some("Đang ghi âm cuộc gọi (Stereo OGG)...".into());
-                            });
-                        }
-                        Err(err) => {
-                            let msg = format!("Không thể ghi âm: {err}");
-                            set(shared, |s| {
-                                s.recording = false;
-                                s.recording_started = None;
-                                s.recording_toast = Some(msg);
-                            });
-                        }
-                    }
-                } else {
-                    let summary = bridge.stop_recording();
-                    set(shared, |s| {
-                        s.recording = false;
-                        s.recording_started = None;
-                        if let Some(info) = summary {
-                            let name = info
-                                .path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| info.path.display().to_string());
-                            eprintln!(
-                                "zalo-gpui call: recording saved -> {} ({} s, {} bytes)",
-                                info.path.display(),
-                                info.duration_secs,
-                                info.bytes
-                            );
-                            s.recording_toast = Some(format!("Đã lưu ghi âm: {name}"));
-                        }
-                    });
-                }
             }
         }
         engine.tick();
@@ -6008,12 +5775,6 @@ fn mic_level_to_dots(level: u8, muted: bool) -> u8 {
     ((inv * 16 + span / 2) / span).clamp(1, 16) as u8
 }
 
-/// Generates a clean local `.ogg` path (`ZaloCall_DDMMYYYY_HHMMSS_<peer>.ogg`)
-/// under `~/Music/ZaloRecordings/`.
-fn recording_file_path(peer_name: &str) -> std::path::PathBuf {
-    crate::recordings::recording_file_path(peer_name)
-}
-
 fn render_video_contain(image: Arc<RenderImage>, box_w: f32, box_h: f32) -> gpui::AnyElement {
     let size = image.size(0);
     let img_w = i32::from(size.width) as f32;
@@ -6431,18 +6192,11 @@ mod tests {
     }
 
     #[test]
-    fn mic_dots_and_recording_path_behave_as_expected() {
+    fn mic_dots_behave_as_expected() {
         assert_eq!(super::mic_level_to_dots(127, false), 0);
         assert_eq!(super::mic_level_to_dots(20, true), 0);
         assert_eq!(super::mic_level_to_dots(10, false), 16);
         let mid = super::mic_level_to_dots(40, false);
         assert!((6..=11).contains(&mid), "expected mid-range dots, got {mid}");
-
-        let path = super::recording_file_path("Trường / Test:01");
-        let name = path.file_name().unwrap().to_string_lossy();
-        assert!(name.starts_with("ZaloCall_"));
-        assert!(name.ends_with(".ogg"));
-        assert!(!name.contains('/'));
-        assert!(!name.contains(':'));
     }
 }

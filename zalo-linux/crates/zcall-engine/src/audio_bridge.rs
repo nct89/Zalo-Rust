@@ -13,7 +13,6 @@
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{self, Read};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -28,7 +27,6 @@ use zcall_audio::capture::{
 use zcall_audio::mixer::Mixer;
 use zcall_audio::pipeline::AudioPipeline;
 use zcall_audio::processing::AudioProcessing;
-use zcall_audio::recorder::{CallRecorder, RecordingSummary};
 use zcall_audio::wsola::FRAME_SAMPLES;
 use zcall_core::audio::OpusEncoderConfig;
 use zcall_core::clip_guard::{db_to_raw, percent_to_raw, ClipGuard, StepKind};
@@ -64,8 +62,6 @@ struct PlayoutShared {
     sink: Arc<Mutex<Option<String>>>,
     sink_epoch: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
-    recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>,
-    recording_active: Arc<AtomicBool>,
 }
 
 /// The audio bridge: mic → DSP → Opus → channel, and jitter → speaker.
@@ -154,10 +150,6 @@ pub struct AudioBridge {
     speaker_volume_pct: Arc<AtomicU8>,
     /// Latest live microphone level (RFC 6464: 0 loudest .. 127 silence).
     live_mic_level: Arc<AtomicU8>,
-    /// Optional dual-channel Ogg Opus call recorder.
-    recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>,
-    /// Fast atomic guard so idle calls pay zero lock overhead.
-    recording_active: Arc<AtomicBool>,
 }
 
 impl Default for AudioBridge {
@@ -218,8 +210,6 @@ impl AudioBridge {
             bt_capture_active: Arc::new(AtomicBool::new(false)),
             speaker_volume_pct: Arc::new(AtomicU8::new(100)),
             live_mic_level: Arc::new(AtomicU8::new(127)),
-            recorder: Arc::new(Mutex::new(None)),
-            recording_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -448,8 +438,6 @@ impl AudioBridge {
             sink: Arc::clone(&self.effective_sink),
             sink_epoch: Arc::clone(&self.sink_epoch),
             stop: Arc::clone(&self.play_stop),
-            recorder: Arc::clone(&self.recorder),
-            recording_active: Arc::clone(&self.recording_active),
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel::<io::Result<()>>(1);
         let handle = std::thread::Builder::new()
@@ -593,8 +581,6 @@ impl AudioBridge {
         let use_in_process_apm = Arc::clone(&self.use_in_process_apm);
         let bt_capture = Arc::clone(&self.bt_capture_active);
         let live_mic_level = Arc::clone(&self.live_mic_level);
-        let rec_slot = Arc::clone(&self.recorder);
-        let rec_active = Arc::clone(&self.recording_active);
         let force_aec = std::env::var("ZCALL_AEC").ok().as_deref() == Some("1");
         let high_pass = self.high_pass;
         let enc_cfg = self.encoder_cfg;
@@ -724,13 +710,6 @@ impl AudioBridge {
                     if let Some((opus, tx_pcm)) = encoded {
                         let level = audio_level(&tx_pcm);
                         live_mic_level.store(level, Ordering::Relaxed);
-                        if rec_active.load(Ordering::Relaxed) {
-                            if let Ok(guard) = rec_slot.lock() {
-                                if let Some(rec) = guard.as_ref() {
-                                    rec.tap_near(&tx_pcm);
-                                }
-                            }
-                        }
                         if tx_out.send(AudioOut { opus, level }).is_err() {
                             break 'run;
                         }
@@ -823,35 +802,6 @@ impl AudioBridge {
     /// Latest live microphone level (RFC 6464: 0 = loudest, 127 = silence).
     pub fn live_mic_level(&self) -> u8 {
         self.live_mic_level.load(Ordering::Relaxed)
-    }
-
-    /// Starts stereo Ogg Opus recording (Left = local mic, Right = remote/group mix).
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the destination file or stereo Opus encoder fails.
-    pub fn start_recording(&mut self, path: PathBuf, title: &str) -> io::Result<()> {
-        let _ = self.stop_recording();
-        let rec = Arc::new(CallRecorder::start(path, title)?);
-        *self.recorder.lock().unwrap_or_else(|e| e.into_inner()) = Some(rec);
-        self.recording_active.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// Stops any active recording, flushes Ogg EOS, and returns its summary.
-    pub fn stop_recording(&mut self) -> Option<RecordingSummary> {
-        self.recording_active.store(false, Ordering::Release);
-        let rec = self
-            .recorder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        rec.and_then(|r| r.finish())
-    }
-
-    /// Whether call recording is currently active.
-    pub fn is_recording(&self) -> bool {
-        self.recording_active.load(Ordering::Acquire)
     }
 
     /// Plays a short pleasant test chime through the currently selected speaker
@@ -972,7 +922,6 @@ impl AudioBridge {
 
     /// Stops capture and playout.
     pub fn stop(&mut self) {
-        let _ = self.stop_recording();
         self.live_mic_level.store(127, Ordering::Relaxed);
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(mut mic) = self.mic.take() {
@@ -1221,13 +1170,6 @@ fn run_playout_loop(shared: PlayoutShared, ready: mpsc::SyncSender<io::Result<()
         let play = {
             let mut mixer = shared.mixer.lock().unwrap_or_else(|e| e.into_inner());
             let mixed = mixer.mix(now_secs);
-            if shared.recording_active.load(Ordering::Relaxed) {
-                if let Ok(guard) = shared.recorder.lock() {
-                    if let Some(rec) = guard.as_ref() {
-                        rec.tap_far(&mixed);
-                    }
-                }
-            }
             let mut play = if speaker_off || spk_vol == 0 {
                 vec![0_i16; FRAME_SAMPLES]
             } else {

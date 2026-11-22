@@ -83,8 +83,7 @@ Traditional desktop wrappers bundle an entire Chromium browser and Node.js runti
   - **Sync 2 (`zalo-sync`)**: Phone-to-PC message synchronization (`socket 590/591/592`, protobuf `SyncChunk`, `libzproto_wasm_bg`).
   - **Backup (`zalo-backup`)**: PC-to-phone backup pipeline (`socket 630–634`, `/api/backuppc2mb/upload`, `libzproto_backup_wasm_bg`).
   - Both WASM crypto modules are staged inside release packages (`share/zalo-rust/wasm/`) and also embedded in the binary as an automatic fallback for standalone runs.
-- **Native Voice & Video Calls (`zcall-*`)**: Pure-Rust call state machine (`ZRTP` / `SRTP` / `RTP` / `RTCP`, P2P NAT traversal, adaptive bitrate, WebRTC AEC3 + RNNoise AI noise suppression, Wayland PipeWire & X11 screen sharing) bridged to PulseAudio/PipeWire + V4L2 on Linux and CoreAudio on macOS, plus **dual-channel stereo Ogg Opus call recording** with a built-in `REC` archive & calendar playback panel.
-- **Multi-Account / Clone Manager (`zalo-multi`)**: Built-in left-rail **ZaloMulti** panel (`--profile <name>`) supporting isolated clone profiles with per-profile XDG storage, optional HTTP/SOCKS5 proxy configuration, live running badges, and one-click launch/focus/stop.
+- **Native Voice & Video Calls (`zcall-*`)**: Pure-Rust call state machine (`ZRTP` / `SRTP` / `RTP` / `RTCP`, P2P NAT traversal, adaptive bitrate, WebRTC AEC3 + RNNoise AI noise suppression, Wayland PipeWire & X11 screen sharing) bridged to PulseAudio/PipeWire + V4L2 on Linux and CoreAudio on macOS.
 - **First-Class Desktop Integration (`zalo-shell` / `zalo-shell-mac`)**:
   - Floating notification popups that never steal keyboard/mouse focus, with configurable timeout (3–15s), countdown bar, and group collage avatars — plus freedesktop D-Bus notifications when minimized.
   - Linux system tray with StatusNotifierItem + DBusMenu (auto-reconnect) and X11 XEmbed fallback (`tray-xembed`), Unity launcher unread badges, and XDG Portal background support; macOS menu bar (`NSStatusItem`), Dock badges, and LaunchAgent support.
@@ -148,13 +147,12 @@ Zalo-Rust/
 | `core/` | `zjxl` | Cross-platform | JPEG XL decode, resize, and lossless encode |
 | `core/` | `zocr` | Cross-platform | PP-OCR text recognition via dynamically loaded ONNX Runtime |
 | `zalo-linux/` | `zalo-shell` | Linux (`zbus`, `x11rb`) | System tray (SNI/DBusMenu/XEmbed), freedesktop notifications, single-instance IPC, XDG portals & Wayland screencast |
-| `zalo-linux/` | `zalo-multi` | Linux + macOS | Multi-account clone manager (`--profile`), isolated XDG storage, proxy support, and `lza.lol` session sync |
-| `zalo-linux/` | `zcall-audio` | Linux (PulseAudio/PipeWire) | Call audio capture, playout, in-process APM (AEC3 + RNNoise), and stereo Ogg Opus call recorder |
-| `zalo-linux/` | `zcall-engine` | Linux (V4L2) | Native call media engine (`zcall-native`) bridging `zcall-core` with live recording hooks |
+| `zalo-linux/` | `zcall-audio` | Linux (PulseAudio/PipeWire) | Call audio capture, playout, and in-process APM (AEC3 + RNNoise) |
+| `zalo-linux/` | `zcall-engine` | Linux (V4L2) | Native call media engine (`zcall-native`) bridging `zcall-core` |
 | `zalo-linux/` | `zalo-gpui` | Linux + macOS (GPUI) | Native GPU desktop client. Linux uses X11/Wayland; macOS uses the Cocoa/Metal GPUI backend |
 | `zalo-macos/` | `zalo-shell-mac` | macOS | Menu bar (`NSStatusItem`), Dock badge, notifications, file panels, LaunchAgent |
-| `zalo-macos/` | `zcall-audio-mac` | macOS (CoreAudio) | Call/media playback through CoreAudio and stereo Ogg Opus call recorder |
-| `zalo-macos/` | `zcall-engine-mac` | macOS | Opus call bridge on top of CoreAudio with live recording hooks |
+| `zalo-macos/` | `zcall-audio-mac` | macOS (CoreAudio) | Call and media playback through CoreAudio |
+| `zalo-macos/` | `zcall-engine-mac` | macOS | Opus call bridge on top of CoreAudio |
 
 ## Build from Source
 
@@ -216,7 +214,6 @@ Camera and screen share use `ffmpeg` (`brew install ffmpeg`) and need Camera / S
 | `--toggle-mute` | Toggle notification mute state on the running instance |
 | `--quit` | Gracefully shut down the running instance |
 | `--allow-multiple` | Allow running multiple instances side by side |
-| `--profile <name>` | Launch or focus an isolated ZaloMulti clone profile |
 
 ### Runtime Protocol Overrides (`protocol.json`)
 

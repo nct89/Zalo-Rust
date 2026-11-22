@@ -12,15 +12,6 @@ fn main() {
         let _ = zalo_protocol::apply_env_overrides();
     }
     let args: Vec<String> = std::env::args().collect();
-    if let Some(profile) = zalo_shell::profile_arg_from_args(&args).or_else(|| {
-        std::env::var("ZALO_PROFILE_NAME")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }) {
-        zalo_gpui::set_active_profile(profile);
-    }
-    let app_id = zalo_gpui::active_app_id();
-
     let installer_mode = args.iter().any(|a| a == "--install" || a == "--setup");
     if installer_mode {
         Application::new().run(move |cx: &mut App| {
@@ -39,7 +30,7 @@ fn main() {
     }
 
     if let Some(cmd) = zalo_shell::instance_command_from_args(&args) {
-        if zalo_shell::try_send_instance_command(&app_id, cmd) {
+        if zalo_shell::try_send_instance_command(zalo_shell::GPUI_APP_ID, cmd) {
             return;
         }
         if cmd == zalo_shell::InstanceCommand::Quit {
@@ -50,9 +41,11 @@ fn main() {
         .any(|a| a == "--login" || a == "--allow-multiple")
         && std::env::var_os("ZALO_MULTI_INSTANCE").is_none()
         && std::env::var_os("ZALO_GPUI_PREVIEW").is_none()
-        && (zalo_gpui::active_profile_name().is_some()
-            || std::env::var_os("ZALO_GPUI_NO_TRAY").is_none())
-        && zalo_shell::try_send_instance_command(&app_id, zalo_shell::InstanceCommand::Show)
+        && std::env::var_os("ZALO_GPUI_NO_TRAY").is_none()
+        && zalo_shell::try_send_instance_command(
+            zalo_shell::GPUI_APP_ID,
+            zalo_shell::InstanceCommand::Show,
+        )
     {
         return;
     }

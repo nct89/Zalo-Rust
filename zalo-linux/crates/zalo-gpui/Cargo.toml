@@ -39,7 +39,6 @@ zalo-protocol = { workspace = true }
 zalo-storage = { workspace = true }
 zalo-sync = { workspace = true }
 zalo-backup = { workspace = true }
-zalo-multi = { path = "../zalo-multi" }
 qrcode = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 serde.workspace = true

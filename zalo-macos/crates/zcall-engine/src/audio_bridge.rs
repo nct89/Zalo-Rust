@@ -7,7 +7,6 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -15,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use serde_json::Value;
-use zcall_audio::{CallRecorder, CardMic, CardSpeaker, RecordingSummary, FRAME_SAMPLES};
+use zcall_audio::{CardMic, CardSpeaker, FRAME_SAMPLES};
 use zcall_core::audio::{OpusDecoder, OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES as OPUS_SAMPLES};
 use zcall_core::zrtc_helpers::{audio_encoder_options, playout_delay_ms};
 
@@ -152,8 +151,6 @@ pub struct AudioBridge {
     jitter_min: usize,
     jitter_max: usize,
     defer_speaker: bool,
-    recorder: Arc<Mutex<Option<Arc<CallRecorder>>>>,
-    recording_active: Arc<AtomicBool>,
 }
 
 impl Default for AudioBridge {
@@ -193,8 +190,6 @@ impl AudioBridge {
             jitter_min: 3,
             jitter_max: 10,
             defer_speaker: false,
-            recorder: Arc::new(Mutex::new(None)),
-            recording_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -384,36 +379,6 @@ impl AudioBridge {
         self.live_mic_level.load(Ordering::Relaxed)
     }
 
-    /// Starts stereo Ogg Opus recording (Left = local mic, Right = remote/group mix).
-    ///
-    /// # Errors
-    ///
-    /// Returns an I/O error if the destination file or stereo Opus encoder fails.
-    pub fn start_recording(&mut self, path: PathBuf, title: &str) -> io::Result<()> {
-        let _ = self.stop_recording();
-        let rec = Arc::new(CallRecorder::start(path, title)?);
-        *self.recorder.lock().unwrap_or_else(|e| e.into_inner()) = Some(rec);
-        self.recording_active.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    /// Stops any active recording, flushes Ogg EOS, and returns its summary.
-    pub fn stop_recording(&mut self) -> Option<RecordingSummary> {
-        self.recording_active.store(false, Ordering::Release);
-        let rec = self
-            .recorder
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        rec.and_then(|r| r.finish())
-    }
-
-    /// Whether call recording is currently active.
-    #[must_use]
-    pub fn is_recording(&self) -> bool {
-        self.recording_active.load(Ordering::Acquire)
-    }
-
     /// Plays a short sine chime on the selected speaker.
     pub fn play_test_tone(&self) {
         if cfg!(test) {
@@ -476,7 +441,6 @@ impl AudioBridge {
 
     /// Stops capture and playout threads.
     pub fn stop(&mut self) {
-        let _ = self.stop_recording();
         self.cap_stop.store(true, Ordering::Release);
         self.play_stop.store(true, Ordering::Release);
         self.speaker_wanted.1.notify_all();
@@ -509,8 +473,6 @@ impl AudioBridge {
         let level = Arc::clone(&self.live_mic_level);
         let pending = Arc::clone(&self.pending_encoder);
         let initial = self.encoder_cfg;
-        let rec_slot = Arc::clone(&self.recorder);
-        let rec_active = Arc::clone(&self.recording_active);
         let handle = std::thread::Builder::new()
             .name("zcall-mic".into())
             .spawn(move || {
@@ -522,9 +484,7 @@ impl AudioBridge {
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
-                capture_loop(
-                    mic, tx, stop, muted, volume, level, pending, initial, rec_slot, rec_active,
-                );
+                capture_loop(mic, tx, stop, muted, volume, level, pending, initial);
             })
             .map_err(|err| io::Error::other(err.to_string()))?;
         match ready_rx.recv() {
@@ -557,22 +517,10 @@ impl AudioBridge {
         let volume = Arc::clone(&self.speaker_volume_pct);
         let fault = Arc::clone(&self.speaker_fault);
         let sink = self.speaker_sink.clone();
-        let rec_slot = Arc::clone(&self.recorder);
-        let rec_active = Arc::clone(&self.recording_active);
         let handle = std::thread::Builder::new()
             .name("zcall-play".into())
             .spawn(move || {
-                playout_loop(
-                    sink,
-                    stop,
-                    wanted,
-                    mixer,
-                    speaker_off,
-                    volume,
-                    fault,
-                    rec_slot,
-                    rec_active,
-                );
+                playout_loop(sink, stop, wanted, mixer, speaker_off, volume, fault);
             });
         self.play_handle = handle.ok();
     }
@@ -585,7 +533,6 @@ fn named(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn capture_loop(
     mic: CardMic,
     tx: std::sync::mpsc::Sender<AudioOut>,
@@ -595,8 +542,6 @@ fn capture_loop(
     level_out: Arc<AtomicU8>,
     pending: Arc<Mutex<Option<OpusEncoderConfig>>>,
     initial: OpusEncoderConfig,
-    rec_slot: Arc<Mutex<Option<Arc<CallRecorder>>>>,
-    rec_active: Arc<AtomicBool>,
 ) {
     let Ok(mut encoder) = OpusEncoder::new() else {
         return;
@@ -621,13 +566,6 @@ fn capture_loop(
         }
         let level = audio_level(&frame);
         level_out.store(level, Ordering::Relaxed);
-        if rec_active.load(Ordering::Relaxed) {
-            if let Ok(guard) = rec_slot.lock() {
-                if let Some(rec) = guard.as_ref() {
-                    rec.tap_near(&frame);
-                }
-            }
-        }
         let Ok(opus) = encoder.encode_frame(&frame) else {
             continue;
         };
@@ -637,7 +575,6 @@ fn capture_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn playout_loop(
     sink: Option<String>,
     stop: Arc<AtomicBool>,
@@ -646,8 +583,6 @@ fn playout_loop(
     speaker_off: Arc<AtomicBool>,
     volume: Arc<AtomicU8>,
     fault: Arc<AtomicBool>,
-    rec_slot: Arc<Mutex<Option<Arc<CallRecorder>>>>,
-    rec_active: Arc<AtomicBool>,
 ) {
     {
         let (lock, cv) = &*wanted;
@@ -669,13 +604,6 @@ fn playout_loop(
             .lock()
             .map(|mut mixer| mixer.mix())
             .unwrap_or_else(|_| vec![0_i16; OPUS_SAMPLES]);
-        if rec_active.load(Ordering::Relaxed) {
-            if let Ok(guard) = rec_slot.lock() {
-                if let Some(rec) = guard.as_ref() {
-                    rec.tap_far(&frame);
-                }
-            }
-        }
         if speaker_off.load(Ordering::Relaxed) {
             frame.fill(0);
         } else {
