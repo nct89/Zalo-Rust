@@ -69,9 +69,9 @@ impl XdgDirs {
         let home = home.into();
         Self {
             config_home: home.join(".config"),
-            data_home: home.join(".local/share"),
+            data_home: home.join(".local").join("share"),
             cache_home: home.join(".cache"),
-            state_home: home.join(".local/state"),
+            state_home: home.join(".local").join("state"),
             runtime_dir: None,
             home,
         }
@@ -363,32 +363,48 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
 
+    fn abs_path(parts: &[&str]) -> PathBuf {
+        #[cfg(windows)]
+        let mut path = PathBuf::from(r"C:\");
+        #[cfg(not(windows))]
+        let mut path = PathBuf::from("/");
+        for part in parts {
+            path.push(part);
+        }
+        path
+    }
+
     #[test]
     fn defaults_follow_the_xdg_specification() {
-        let dirs = XdgDirs::new("/home/ana");
-        assert_eq!(dirs.config_home(), Path::new("/home/ana/.config"));
-        assert_eq!(dirs.data_home(), Path::new("/home/ana/.local/share"));
-        assert_eq!(dirs.cache_home(), Path::new("/home/ana/.cache"));
-        assert_eq!(dirs.state_home(), Path::new("/home/ana/.local/state"));
+        let home = abs_path(&["home", "ana"]);
+        let dirs = XdgDirs::new(&home);
+        assert_eq!(dirs.config_home(), home.join(".config"));
+        assert_eq!(dirs.data_home(), home.join(".local").join("share"));
+        assert_eq!(dirs.cache_home(), home.join(".cache"));
+        assert_eq!(dirs.state_home(), home.join(".local").join("state"));
         assert_eq!(dirs.runtime_dir(), None);
-        assert_eq!(dirs.downloads_dir(), Path::new("/home/ana/Downloads"));
+        assert_eq!(dirs.downloads_dir(), home.join("Downloads"));
     }
 
     #[test]
     fn environment_overrides_must_be_absolute() {
-        let dirs = XdgDirs::from_lookup(PathBuf::from("/home/ana"), |key| match key {
-            "XDG_CONFIG_HOME" => Some(OsString::from("/etc/zalo/config")),
+        let home = abs_path(&["home", "ana"]);
+        let config = abs_path(&["etc", "zalo", "config"]);
+        let state = abs_path(&["var", "state"]);
+        let runtime = abs_path(&["run", "user", "1000"]);
+        let dirs = XdgDirs::from_lookup(home.clone(), |key| match key {
+            "XDG_CONFIG_HOME" => Some(config.clone().into_os_string()),
             "XDG_DATA_HOME" => Some(OsString::from("relative/data")),
             "XDG_CACHE_HOME" => Some(OsString::new()),
-            "XDG_STATE_HOME" => Some(OsString::from("/var/state")),
-            "XDG_RUNTIME_DIR" => Some(OsString::from("/run/user/1000")),
+            "XDG_STATE_HOME" => Some(state.clone().into_os_string()),
+            "XDG_RUNTIME_DIR" => Some(runtime.clone().into_os_string()),
             _ => None,
         });
-        assert_eq!(dirs.config_home(), Path::new("/etc/zalo/config"));
-        assert_eq!(dirs.data_home(), Path::new("/home/ana/.local/share"));
-        assert_eq!(dirs.cache_home(), Path::new("/home/ana/.cache"));
-        assert_eq!(dirs.state_home(), Path::new("/var/state"));
-        assert_eq!(dirs.runtime_dir(), Some(Path::new("/run/user/1000")));
+        assert_eq!(dirs.config_home(), config.as_path());
+        assert_eq!(dirs.data_home(), home.join(".local").join("share"));
+        assert_eq!(dirs.cache_home(), home.join(".cache"));
+        assert_eq!(dirs.state_home(), state.as_path());
+        assert_eq!(dirs.runtime_dir(), Some(runtime.as_path()));
     }
 
     #[test]
@@ -412,14 +428,17 @@ mod tests {
         let mut dirs = XdgDirs::new(temp.path().join("home"));
         dirs.config_home = config;
 
-        assert_eq!(dirs.downloads_dir(), temp.path().join("home/Tải về"));
+        assert_eq!(
+            dirs.downloads_dir(),
+            temp.path().join("home").join("Tải về")
+        );
         assert_eq!(
             dirs.user_dir("XDG_DESKTOP_DIR"),
-            Some(temp.path().join("home/Desktop"))
+            Some(temp.path().join("home").join("Desktop"))
         );
         assert_eq!(
             dirs.user_dir("XDG_MUSIC_DIR"),
-            Some(temp.path().join("home/Music"))
+            Some(temp.path().join("home").join("Music"))
         );
         assert_eq!(dirs.user_dir("XDG_DOCUMENTS_DIR"), None);
         assert_eq!(dirs.user_dir("XDG_VIDEOS_DIR"), None);
@@ -427,39 +446,39 @@ mod tests {
 
     #[test]
     fn app_paths_resolve_macos_layout() {
+        let home = abs_path(&["Users", "ana"]);
         let paths = AppPaths::from_macos_lookup("zalo-rust", |key| match key {
-            "HOME" => Some(OsString::from("/Users/ana")),
+            "HOME" => Some(home.clone().into_os_string()),
             _ => None,
         })
         .expect("macos paths");
         assert_eq!(
             paths.config_dir(),
-            Path::new("/Users/ana/Library/Application Support/zalo-rust")
+            home.join("Library")
+                .join("Application Support")
+                .join("zalo-rust")
         );
         assert_eq!(
             paths.cache_dir(),
-            Path::new("/Users/ana/Library/Caches/zalo-rust")
+            home.join("Library").join("Caches").join("zalo-rust")
         );
-        assert_eq!(paths.downloads_dir(), Path::new("/Users/ana/Downloads"));
+        assert_eq!(paths.downloads_dir(), home.join("Downloads"));
     }
 
     #[test]
     fn app_paths_resolve_windows_layout() {
+        let home = abs_path(&["Users", "ana"]);
+        let roaming = home.join("AppData").join("Roaming");
+        let local = home.join("AppData").join("Local");
         let paths = AppPaths::from_windows_lookup("zalo-rust", |key| match key {
-            "USERPROFILE" => Some(OsString::from("/Users/ana")),
-            "APPDATA" => Some(OsString::from("/Users/ana/AppData/Roaming")),
-            "LOCALAPPDATA" => Some(OsString::from("/Users/ana/AppData/Local")),
+            "USERPROFILE" => Some(home.clone().into_os_string()),
+            "APPDATA" => Some(roaming.clone().into_os_string()),
+            "LOCALAPPDATA" => Some(local.clone().into_os_string()),
             _ => None,
         })
         .expect("windows paths");
-        assert_eq!(
-            paths.config_dir(),
-            Path::new("/Users/ana/AppData/Roaming/zalo-rust")
-        );
-        assert_eq!(
-            paths.cache_dir(),
-            Path::new("/Users/ana/AppData/Local/zalo-rust/Cache")
-        );
-        assert_eq!(paths.downloads_dir(), Path::new("/Users/ana/Downloads"));
+        assert_eq!(paths.config_dir(), roaming.join("zalo-rust"));
+        assert_eq!(paths.cache_dir(), local.join("zalo-rust").join("Cache"));
+        assert_eq!(paths.downloads_dir(), home.join("Downloads"));
     }
 }
