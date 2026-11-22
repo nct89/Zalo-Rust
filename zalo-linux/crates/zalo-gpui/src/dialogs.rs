@@ -84,6 +84,8 @@ pub enum Dialog {
     HiddenGuide(String),
     /// "About / Version info" dialog (from Settings › Help › Version info or titlebar badge).
     About,
+    /// "Contact / Support" dialog (from Settings › Help › Contact).
+    Contact,
 }
 
 /// Paste Excel table / clipboard content containing both image and text.
@@ -635,6 +637,7 @@ impl ShellView {
             Some(Dialog::TwoFactorOtp(t)) => self.two_factor_el(t, cx).into_any_element(),
             Some(Dialog::HiddenGuide(name)) => self.hidden_guide_el(name, cx).into_any_element(),
             Some(Dialog::About) => self.about_el(cx).into_any_element(),
+            Some(Dialog::Contact) => self.contact_el(cx).into_any_element(),
             None => return div().into_any_element(),
         };
         div()
@@ -1966,16 +1969,15 @@ impl ShellView {
 
     /// "Message Details": sender, full send time, type, size, ids.
     fn about_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let dark = crate::color::is_dark();
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let blue = token_rgb("--B55", "#0068ff");
-        let blue_hover = token_rgb("--B60", "#005ae0");
-        let panel_bg = token_rgb("--layer-background-subtle", "#f3f5f8");
-        let btn_bg = token_rgb("--button-neutral-normal", "#e5e7eb");
-        let btn_hover = token_rgb("--button-neutral-hover", "#d6dbe1");
-        let badge_bg = if dark { 0x1e_32_52 } else { 0xe5_ef_ff };
-        let badge_fg = if dark { 0x6b_a6_ff } else { blue };
+        let link_fg = token_rgb("--text-information", "#005ae0");
+        let panel_bg = token_rgb("--layer-background-subtle", "#ebecf0");
+        let badge_bg = token_rgb("--accent-blue-bg-subtle", "#f0f7ff");
+        let badge_fg = token_rgb("--accent-blue-text", "#005ae0");
+        let primary_bg = token_rgb("--button-primary-normal", "#0068ff");
+        let primary_hover = token_rgb("--button-primary-hover", "#0045ad");
+        let primary_fg = token_rgb("--button-primary-text", "#ffffff");
 
         let proto = zalo_protocol::active_config();
         let build_info = if crate::APP_GIT_SHA.is_empty() {
@@ -1999,15 +2001,6 @@ impl ShellView {
             .strip_prefix("https://")
             .or_else(|| repo_url.strip_prefix("http://"))
             .unwrap_or(repo_url);
-
-        let copy_summary = format!(
-            "Zalo Rust {}\nBuild: {}\nProtocol: {}\nPlatform: {}\nEngine: Rust + GPUI\nLicense: MIT\nRepo: {}",
-            crate::APP_VERSION_TAG,
-            build_info,
-            protocol_info,
-            platform_info,
-            repo_url
-        );
 
         let info_rows: Vec<(&'static str, String)> = vec![
             ("Phiên bản", crate::APP_VERSION_TAG.to_owned()),
@@ -2038,24 +2031,14 @@ impl ShellView {
                             .flex_row()
                             .items_center()
                             .gap(px(14.))
-                            .child(
-                                div()
-                                    .size(px(48.))
-                                    .rounded(px(12.))
-                                    .overflow_hidden()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(rgb(blue))
-                                    .when_some(icon, |el, bitmap| {
-                                        el.child(
-                                            img(bitmap)
-                                                .size(px(48.))
-                                                .object_fit(gpui::ObjectFit::Cover),
-                                        )
-                                    }),
-                            )
+                            .when_some(icon, |el, bitmap| {
+                                el.child(
+                                    img(bitmap)
+                                        .size(px(48.))
+                                        .flex_none()
+                                        .object_fit(gpui::ObjectFit::Contain),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -2152,7 +2135,7 @@ impl ShellView {
                                             .id("about-repo-link")
                                             .flex_1()
                                             .min_w(px(0.))
-                                            .text_color(rgb(blue))
+                                            .text_color(rgb(link_fg))
                                             .cursor_pointer()
                                             .hover(|s| s.underline())
                                             .on_click(move |_, _, cx| {
@@ -2170,49 +2153,143 @@ impl ShellView {
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .gap(px(8.))
                     .px(px(16.))
                     .py(px(12.))
                     .border_t_1()
                     .border_color(crate::color::border_subtle())
                     .child(
                         div()
-                            .id("about-copy-btn")
-                            .px(px(14.))
-                            .h(px(34.))
-                            .rounded(px(4.))
-                            .bg(rgb(btn_bg))
-                            .hover(move |s| s.bg(rgb(btn_hover)))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(13.))
-                            .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(ink))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    copy_summary.clone(),
-                                ));
-                                this.set_note(crate::i18n::t("Đã sao chép thông tin phiên bản"));
-                                cx.notify();
-                            }))
-                            .child(crate::i18n::t("Sao chép thông tin")),
-                    )
-                    .child(
-                        div()
                             .id("about-close-btn")
                             .px(px(18.))
                             .h(px(34.))
                             .rounded(px(4.))
-                            .bg(rgb(blue))
-                            .hover(move |s| s.bg(rgb(blue_hover)))
+                            .bg(rgb(primary_bg))
+                            .hover(move |s| s.bg(rgb(primary_hover)))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_size(px(13.))
                             .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(0xff_ff_ff))
+                            .text_color(rgb(primary_fg))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog = None;
+                                cx.notify();
+                            }))
+                            .child(crate::color::str_vi("STR_CLOSE", "Đóng")),
+                    ),
+            )
+    }
+
+    fn contact_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let link_fg = token_rgb("--text-information", "#005ae0");
+        let panel_bg = token_rgb("--layer-background-subtle", "#ebecf0");
+        let primary_bg = token_rgb("--button-primary-normal", "#0068ff");
+        let primary_hover = token_rgb("--button-primary-hover", "#0045ad");
+        let primary_fg = token_rgb("--button-primary-text", "#ffffff");
+
+        let contacts: [(&'static str, &'static str, &'static str); 5] = [
+            ("Email", "lienhe@truong.it", "mailto:lienhe@truong.it"),
+            ("Telegram", "https://t.me/congtruongit", "https://t.me/congtruongit"),
+            ("Facebook", "https://m.me/congtruongit", "https://m.me/congtruongit"),
+            ("Donate", "https://truong.me/donate", "https://truong.me/donate"),
+            ("Website", "https://lza.lol", "https://lza.lol"),
+        ];
+
+        modal_card(448.)
+            .child(self.dialog_title_bar(
+                crate::color::str_vi("STR_FEEDBACK", "Liên hệ"),
+                cx,
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(13.))
+                            .line_height(px(19.))
+                            .text_color(rgb(muted))
+                            .child(crate::i18n::t(
+                                "Liên hệ hỗ trợ, báo lỗi hoặc đóng góp cho dự án Zalo Rust",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(8.))
+                            .bg(rgb(panel_bg))
+                            .border_1()
+                            .border_color(crate::color::border_subtle())
+                            .px(px(14.))
+                            .py(px(10.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .children(contacts.into_iter().enumerate().map(
+                                |(idx, (label, display, url))| {
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(12.))
+                                        .text_size(px(13.))
+                                        .child(
+                                            div()
+                                                .w(px(84.))
+                                                .flex_none()
+                                                .text_color(rgb(muted))
+                                                .child(label),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("contact-link", idx))
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .text_color(rgb(link_fg))
+                                                .cursor_pointer()
+                                                .hover(|s| s.underline())
+                                                .on_click(move |_, _, cx| {
+                                                    cx.open_url(url);
+                                                })
+                                                .child(display),
+                                        )
+                                },
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(crate::color::border_subtle())
+                    .child(
+                        div()
+                            .id("contact-close-btn")
+                            .px(px(18.))
+                            .h(px(34.))
+                            .rounded(px(4.))
+                            .bg(rgb(primary_bg))
+                            .hover(move |s| s.bg(rgb(primary_hover)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(primary_fg))
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.dialog = None;

@@ -66,9 +66,11 @@ const EXTRA: &[(&str, &str)] = &[
     ("Nền tảng", "Engine"),
     ("Giấy phép", "License"),
     ("Mã nguồn", "Source code"),
-    ("Sao chép thông tin", "Copy info"),
-    ("Đã sao chép thông tin phiên bản", "Version info copied"),
     ("Thông tin phiên bản", "Version info"),
+    (
+        "Liên hệ hỗ trợ, báo lỗi hoặc đóng góp cho dự án Zalo Rust",
+        "Contact support, report bugs, or contribute to Zalo Rust",
+    ),
     ("Cuộc gọi nhóm", "Group call"),
     ("Cuộc gọi thoại đi", "Outgoing voice call"),
     ("Cuộc gọi thoại đến", "Incoming voice call"),

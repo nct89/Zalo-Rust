@@ -32,7 +32,11 @@ pub struct LoginView {
 impl LoginView {
     /// Preview QR (no live `request_qr`). Timeout overlay after `qr_timeout` 180 s.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        window.set_window_title("Zalo - Đăng nhập");
+        let title = match crate::active_profile_name() {
+            Some(p) => format!("Zalo - Đăng nhập [{p}]"),
+            None => "Zalo - Đăng nhập".to_owned(),
+        };
+        window.set_window_title(&title);
         cx.observe_window_appearance(window, |_, window, _| {
             window.refresh();
         })
@@ -385,8 +389,30 @@ impl Render for LoginView {
                                 .id("login-drag-strip")
                                 .flex_1()
                                 .h_full()
+                                .flex()
+                                .items_center()
                                 .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                                     window.start_window_move();
+                                })
+                                .when_some(crate::active_profile_name(), |el, profile| {
+                                    el.child(
+                                        div()
+                                            .ml(px(6.))
+                                            .px(px(8.))
+                                            .py(px(2.))
+                                            .rounded(px(10.))
+                                            .bg(rgb(crate::color::token_rgb(
+                                                "--accent-blue-bg-subtle",
+                                                "#f0f7ff",
+                                            )))
+                                            .text_size(px(11.5))
+                                            .font_family(crate::fonts::FAMILY_SEMIBOLD)
+                                            .text_color(rgb(crate::color::token_rgb(
+                                                "--accent-blue-text",
+                                                "#005ae0",
+                                            )))
+                                            .child(format!("Clone: {profile}")),
+                                    )
                                 }),
                         )
                         .child(self.hamburger(cx)),

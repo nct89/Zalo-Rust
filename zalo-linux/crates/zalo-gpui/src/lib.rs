@@ -55,6 +55,7 @@ mod login_flow;
 mod macos_media;
 mod media;
 mod media_store;
+mod multi_ui;
 mod noise_id;
 mod notice;
 mod pc_export;
@@ -70,6 +71,7 @@ mod quick;
 mod rail;
 mod read_sync;
 mod realtime;
+mod recordings;
 mod calendar;
 #[cfg(not(target_os = "macos"))]
 mod screenshot_ui;
@@ -209,17 +211,61 @@ pub fn open_login_window(cx: &mut App) {
     .expect("open login window");
 }
 
+static ACTIVE_PROFILE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the `--profile <name>` clone name for this process (called once from `main`).
+pub fn set_active_profile(name: String) {
+    let trimmed = name.trim();
+    if !trimmed.is_empty() {
+        let _ = ACTIVE_PROFILE.set(trimmed.to_owned());
+    }
+}
+
+/// Active clone profile name when running as a ZaloMulti clone, else `None` (main account).
+#[must_use]
+pub fn active_profile_name() -> Option<String> {
+    if let Some(p) = ACTIVE_PROFILE.get() {
+        return Some(p.clone());
+    }
+    std::env::var("ZALO_PROFILE_NAME")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Active single-instance socket `app_id`: `zalo-gpui` for main, `zalo-gpui-p-<hash>` for clones.
+#[must_use]
+pub fn active_app_id() -> String {
+    if let Some(id) = std::env::var("ZALO_PROFILE_APP_ID")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        return id;
+    }
+    if let Some(profile) = active_profile_name() {
+        return zalo_multi::profile_app_id(&profile);
+    }
+    zalo_shell::GPUI_APP_ID.to_owned()
+}
+
 /// System tray: start StatusNotifierItem (with automatic watcher reconnect +
-/// optional X11 XEmbed fallback) and single-instance IPC for Dock quicklists.
+/// optional X11 XEmbed fallback) and single-instance IPC for Dock quicklists
+/// and ZaloMulti clone `SHOW` / `QUIT` control.
 pub fn start_tray(cx: &mut App) {
-    if std::env::var_os("ZALO_GPUI_NO_TRAY").is_some() {
+    let app_id = active_app_id();
+    let is_clone = active_profile_name().is_some();
+    let no_tray = std::env::var_os("ZALO_GPUI_NO_TRAY").is_some();
+    if no_tray && !is_clone {
         return;
     }
-    let _ = zalo_shell::install_gpui_app_entry();
-    zalo_shell::install_desktop_shell_for(zalo_shell::GPUI_APP_ID);
-    zalo_shell::start_instance_listener(zalo_shell::GPUI_APP_ID);
-    let initial_muted = crate::prefs::Prefs::load(data::config_dir()).bool("notifyOff", false);
-    zalo_shell::set_tray_muted(initial_muted);
+    if !no_tray {
+        let _ = zalo_shell::install_gpui_app_entry();
+        zalo_shell::install_desktop_shell_for(&app_id);
+        let initial_muted = crate::prefs::Prefs::load(data::config_dir()).bool("notifyOff", false);
+        zalo_shell::set_tray_muted(initial_muted);
+    }
+    zalo_shell::start_instance_listener(&app_id);
     cx.spawn(async move |cx| loop {
         gpui::Timer::after(std::time::Duration::from_millis(250)).await;
         let events = zalo_shell::take_tray_events();
@@ -227,7 +273,7 @@ pub fn start_tray(cx: &mut App) {
             continue;
         }
         if events.contains(&zalo_shell::TrayEvent::Quit) {
-            zalo_shell::stop_instance_listener(zalo_shell::GPUI_APP_ID);
+            zalo_shell::stop_instance_listener(&app_id);
             let _ = cx.update(|cx| cx.quit());
             break;
         }
@@ -364,7 +410,8 @@ pub fn on_last_window_closed(cx: &mut App) {
                 data::detach_account(&d);
             }
         }
-        zalo_shell::stop_instance_listener(zalo_shell::GPUI_APP_ID);
+        let app_id = active_app_id();
+        zalo_shell::stop_instance_listener(&app_id);
         cx.quit();
     }
 }

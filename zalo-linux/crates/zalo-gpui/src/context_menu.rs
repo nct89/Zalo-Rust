@@ -340,6 +340,8 @@ enum MenuAction {
     ShotWithZalo(bool),
     /// "Version Info".
     About,
+    /// "Contact / Support".
+    Contact,
     /// Copy a phone number without putting the digits in the toast.
     CopyPhone(String),
     /// Look the number up, then start a 1-1 Zalo call. Does not print it.
@@ -1671,6 +1673,10 @@ impl ShellView {
                 self.dialog = Some(crate::dialogs::Dialog::About);
                 cx.notify();
             }
+            MenuAction::Contact => {
+                self.dialog = Some(crate::dialogs::Dialog::Contact);
+                cx.notify();
+            }
             MenuAction::OpenPcExport => self.open_pc_export(cx),
             MenuAction::OpenPcImport => self.open_pc_import(cx),
         }
@@ -2314,7 +2320,7 @@ fn gear_rows(logged_in: bool, english: bool) -> Vec<Row> {
                 ),
                 item(
                     str_vi("STR_FEEDBACK", "Liên hệ"),
-                    MenuAction::Note("Liên hệ hỗ trợ qua Zalo trên điện thoại."),
+                    MenuAction::Contact,
                 ),
             ],
         ),

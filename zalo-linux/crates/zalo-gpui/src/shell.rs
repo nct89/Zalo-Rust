@@ -258,6 +258,18 @@ pub struct ShellView {
     pub(crate) capture_busy: bool,
     /// zCloud / Tools / Starred Messages popover next to the rail.
     pub(crate) rail_popup: Option<crate::rail::RailPopup>,
+    /// Discovered stereo Ogg Opus call recordings (`~/Music/ZaloRecordings/`).
+    pub(crate) recordings: Vec<crate::recordings::RecordingEntry>,
+    /// Selected `DD/MM/YYYY` date filter in the `REC` panel (`None` = all dates).
+    pub(crate) rec_date_filter: Option<String>,
+    /// Whether the month calendar grid is expanded in the `REC` panel.
+    pub(crate) rec_cal_open: bool,
+    /// Displayed `(year, month)` inside the `REC` panel calendar.
+    pub(crate) rec_cal_ym: (u32, u8),
+    /// Active in-app stereo Ogg Opus playback controller for the `REC` panel.
+    pub(crate) rec_player: crate::recordings::RecordingPlayback,
+    /// ZaloMulti multi-account manager state (`RailPopup::MultiAccount`).
+    pub(crate) multi: crate::multi_ui::MultiAccountState,
     /// Bare group ids from `/api/group/getlg/e2ee`. `None` until a live fetch.
     pub(crate) e2ee_groups: Option<Vec<String>>,
     pub(crate) e2ee_busy: bool,
@@ -726,6 +738,15 @@ impl ShellView {
             caption_input,
             capture_busy: false,
             rail_popup: None,
+            recordings: Vec::new(),
+            rec_date_filter: None,
+            rec_cal_open: true,
+            rec_cal_ym: {
+                let t = crate::recordings::CalDate::today();
+                (t.year, t.month)
+            },
+            rec_player: crate::recordings::RecordingPlayback::default(),
+            multi: crate::multi_ui::MultiAccountState::new(cx),
             e2ee_groups: None,
             e2ee_busy: false,
             e2ee_failed: false,
@@ -887,8 +908,16 @@ impl ShellView {
             Ok("tools") => Some(crate::rail::RailPopup::Tools),
             Ok("starred") => Some(crate::rail::RailPopup::Starred),
             Ok("catalog") => Some(crate::rail::RailPopup::Catalog),
+            Ok("recordings") => {
+                this.recordings = crate::recordings::list_recordings();
+                Some(crate::rail::RailPopup::Recordings)
+            }
+            Ok("multi") => Some(crate::rail::RailPopup::MultiAccount),
             _ => None,
         };
+        if !cfg!(test) && crate::active_profile_name().is_none() {
+            this.multi_reload(true, cx);
+        }
         if std::env::var("ZALO_GPUI_CONTACTS").as_deref() == Ok("groups") {
             this.rail = crate::rail::Rail::Contacts;
             this.contact_tab = ContactTab::Groups;
@@ -4910,7 +4939,7 @@ impl Render for ShellView {
             .map
             .get(crate::profiles::ME)
             .map(|p| p.name.clone());
-        let main_title = match self
+        let base_title = match self
             .display_name
             .clone()
             .or(me_name)
@@ -4918,6 +4947,10 @@ impl Render for ShellView {
         {
             Some(name) => format!("Zalo - {name}"),
             None => "Zalo".to_owned(),
+        };
+        let main_title = match crate::active_profile_name() {
+            Some(profile) => format!("{base_title} [{profile}]"),
+            None => base_title,
         };
         if self.last_window_title != main_title {
             self.last_window_title = main_title.clone();

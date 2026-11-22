@@ -17,7 +17,7 @@ pub(crate) fn zalo_title_icon() -> Option<Arc<RenderImage>> {
     static ICON: OnceLock<Option<Arc<RenderImage>>> = OnceLock::new();
     ICON.get_or_init(|| {
         let bytes = zalo_shell::ZALO_ICON_PNG?;
-        let rgba = crate::media::decode_rgba(bytes, 48)?;
+        let rgba = crate::media::decode_rgba(bytes, 96)?;
         Some(Arc::new(RenderImage::new([image::Frame::new(
             crate::media::rgba_to_bgra(rgba),
         )])))
@@ -141,10 +141,9 @@ pub fn main_titlebar_with_theme(
 fn version_badge(
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl gpui::IntoElement {
-    let dark = crate::color::is_dark();
-    let bg = if dark { 0x38_3c_42 } else { 0xd9_dd_e3 };
-    let hover_bg = if dark { 0x45_4a_52 } else { 0xcb_d1_da };
-    let fg = if dark { 0xc8_cf_d8 } else { 0x47_55_69 };
+    let bg = token_rgb("--layer-background", "#ffffff");
+    let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
+    let fg = token_rgb("--text-secondary", "#5a6981");
     let tip_text = "Thông tin phiên bản";
     div()
         .id("caption-version-badge")
@@ -152,6 +151,8 @@ fn version_badge(
         .px(px(7.))
         .rounded(px(10.))
         .bg(rgb(bg))
+        .border_1()
+        .border_color(crate::color::border_subtle())
         .hover(move |s| s.bg(rgb(hover_bg)))
         .flex()
         .items_center()

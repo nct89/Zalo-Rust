@@ -7,7 +7,7 @@ use gpui::{
 
 use crate::color::{str_vi, token_rgb};
 use crate::context_menu::MenuKind;
-use crate::fonts::{self, ic, FAMILY_SEMIBOLD};
+use crate::fonts::{self, ic, FAMILY_BOLD, FAMILY_SEMIBOLD};
 use crate::shell::ShellView;
 use crate::widgets::tip;
 use crate::window_frame::CsdCorners;
@@ -15,18 +15,18 @@ use crate::window_frame::CsdCorners;
 /// Far-left icon rail. Matches egui `Rail` order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rail {
-    /// Messages — conversation list.
+    /// Tin nhắn — conversation list.
     #[default]
     Chats,
-    /// Contacts — four contact entries.
+    /// Danh bạ — four contact entries.
     Contacts,
-    /// Settings — local placeholder page.
+    /// Cài đặt — local placeholder page.
     Settings,
-    /// Tools — local placeholder page.
+    /// Công cụ — local placeholder page.
     Tools,
     /// zCloud — local placeholder, no live API.
     Cloud,
-    /// My Cloud — selects the preview Cloud thread.
+    /// Cloud của tôi — selects the preview Cloud thread.
     Docs,
 }
 
@@ -35,12 +35,16 @@ pub enum Rail {
 pub enum RailPopup {
     /// `.zcloud-promo-content` 336 × 374.
     ZCloud,
-    /// "zBusiness Tools" 314 × 291, 3-column tiles.
+    /// «Công cụ zBusiness» 314 × 291, 3-column tiles.
     Tools,
-    /// "Starred Messages" list (opened from Tools).
+    /// «Tin đánh dấu» list (opened from Công cụ).
     Starred,
     /// Product catalogs from `/api/prodcatalog/catalog/list`.
     Catalog,
+    /// Call recordings archive (`~/Music/ZaloRecordings/`, filtered by `DD/MM/YYYY`).
+    Recordings,
+    /// Multi-account / Add Clone UI placeholder (ZaloMulti integration pending).
+    MultiAccount,
 }
 
 /// Selected chip: black α 64. Hover: black α 38. Radius 6.
@@ -70,7 +74,7 @@ pub const RAIL_PAD_BOTTOM: f32 = 12.0;
 /// `.z-noti-badge --big`: 16 px circle, `#c31818`, at (+26, +6) of the mark.
 pub const RAIL_BADGE: f32 = 16.0;
 
-/// Conversation list stays visible for every rail except Contacts.
+/// Conversation list stays visible for every rail except Danh bạ.
 pub fn lists_chats(rail: Rail) -> bool {
     !matches!(rail, Rail::Contacts)
 }
@@ -133,6 +137,8 @@ impl ShellView {
                 0,
                 cx,
             ))
+            .child(self.rail_add_clone_tab(cx))
+            .child(self.rail_rec_tab(cx))
             .child(div().flex_1())
             .child(self.rail_bottom_tab(
                 "rail-zcloud",
@@ -155,7 +161,7 @@ impl ShellView {
                     ic::DOCS
                 },
                 "☁",
-                "My Documents",
+                "Cloud của tôi",
                 selected == Rail::Docs,
                 Some(Rail::Docs),
                 cx,
@@ -200,7 +206,7 @@ impl ShellView {
             .child(div().flex_none().h(px(RAIL_PAD_BOTTOM)))
     }
 
-    /// Sum of unread badges for the Messages tab.
+    /// Sum of unread badges for the Tin nhắn tab.
     pub(crate) fn total_unread(&self) -> u32 {
         self.convs
             .iter()
@@ -254,6 +260,173 @@ impl ShellView {
             })
     }
 
+    fn rail_add_clone_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.rail_popup == Some(RailPopup::MultiAccount);
+        let running = self.multi.running_count();
+        let inset = (zalo_design::MAIN_TAB_W - RAIL_MARK_W) / 2.0;
+        let mark = px(RAIL_MARK_W);
+        let radius = px(zalo_design::LEFTBAR_MARK_RADIUS);
+        let mark_on = if crate::color::is_dark() {
+            0xffff_ff1e
+        } else {
+            MARK_ON
+        };
+        let mark_hover = if crate::color::is_dark() {
+            0xffff_ff10
+        } else {
+            MARK_HOVER
+        };
+        let icon_img = add_clone_icon();
+        div()
+            .id("rail-add-clone")
+            .flex()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(RAIL_TAB_H))
+            .px(px(inset))
+            .cursor_pointer()
+            .tooltip(|_, cx| tip("ZaloMulti • Đa tài khoản", cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                this.rec_player.stop();
+                if this.rail_popup == Some(RailPopup::MultiAccount) {
+                    this.rail_popup = None;
+                } else {
+                    this.rail_popup = Some(RailPopup::MultiAccount);
+                    this.multi.error = None;
+                    this.multi.info = None;
+                    this.multi_reload(true, cx);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .relative()
+                    .size(mark)
+                    .rounded(radius)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(on, |el| el.bg(rgba(mark_on)))
+                    .when(!on, |el| el.hover(|style| style.bg(rgba(mark_hover))))
+                    .when_some(icon_img, |el, img_el| {
+                        el.child(
+                            gpui::img(img_el)
+                                .size(px(RAIL_ICON_PX))
+                                .object_fit(gpui::ObjectFit::Contain),
+                        )
+                    })
+                    .when(running > 0, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(4.))
+                                .right(px(4.))
+                                .min_w(px(16.))
+                                .h(px(16.))
+                                .px(px(4.))
+                                .rounded(px(8.))
+                                .bg(rgb(0x22_c5_5e))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(10.))
+                                .font_family(FAMILY_SEMIBOLD)
+                                .text_color(rgb(0xff_ff_ff))
+                                .child(running.to_string()),
+                        )
+                    }),
+            )
+    }
+
+    fn rail_rec_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.rail_popup == Some(RailPopup::Recordings);
+        let inset = (zalo_design::MAIN_TAB_W - RAIL_MARK_W) / 2.0;
+        let mark = px(RAIL_MARK_W);
+        let radius = px(zalo_design::LEFTBAR_MARK_RADIUS);
+        let mark_on = if crate::color::is_dark() {
+            0xffff_ff1e
+        } else {
+            MARK_ON
+        };
+        let mark_hover = if crate::color::is_dark() {
+            0xffff_ff10
+        } else {
+            MARK_HOVER
+        };
+        div()
+            .id("rail-rec")
+            .flex()
+            .flex_none()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .h(px(RAIL_TAB_H))
+            .px(px(inset))
+            .cursor_pointer()
+            .tooltip(|_, cx| tip("Ghi âm cuộc gọi", cx))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.menu = None;
+                if this.rail_popup == Some(RailPopup::Recordings) {
+                    this.rail_popup = None;
+                    this.rec_player.stop();
+                } else {
+                    this.recordings = crate::recordings::list_recordings();
+                    if let Some(sel) = this.rec_date_filter.as_deref() {
+                        if !this.recordings.iter().any(|r| r.date_key == sel) {
+                            this.rec_date_filter = None;
+                        }
+                    }
+                    this.rail_popup = Some(RailPopup::Recordings);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .relative()
+                    .size(mark)
+                    .rounded(radius)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(on, |el| el.bg(rgba(mark_on)))
+                    .when(!on, |el| el.hover(|style| style.bg(rgba(mark_hover))))
+                    .child(
+                        // Square 28×28 REC icon matching the exact footprint of other rail icons.
+                        div()
+                            .size(px(RAIL_ICON_PX))
+                            .rounded(px(6.))
+                            .bg(rgb(0xff_ff_ff))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(2.))
+                            .when(on, |d| {
+                                d.border(px(1.5)).border_color(rgb(0xe5_1c_23))
+                            })
+                            .child(
+                                div()
+                                    .size(px(6.5))
+                                    .rounded(px(3.5))
+                                    .bg(rgb(0xe5_1c_23)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(8.5))
+                                    .line_height(px(9.))
+                                    .font_family(FAMILY_BOLD)
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(0xe5_1c_23))
+                                    .child("REC"),
+                            ),
+                    ),
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn rail_top_tab(
         &self,
         id: &'static str,
@@ -339,6 +512,8 @@ impl ShellView {
             RailPopup::Tools => self.tools_panel(cx).into_any_element(),
             RailPopup::Starred => self.starred_panel(cx).into_any_element(),
             RailPopup::Catalog => self.catalog_panel(cx).into_any_element(),
+            RailPopup::Recordings => self.recordings_panel(cx).into_any_element(),
+            RailPopup::MultiAccount => self.multi_account_panel(cx).into_any_element(),
         };
         let popup_box = div()
             .absolute()
@@ -347,6 +522,8 @@ impl ShellView {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(panel);
         let positioned = match popup {
+            RailPopup::MultiAccount => popup_box.top(px(72.)),
+            RailPopup::Recordings => popup_box.top(px(64.)),
             RailPopup::ZCloud => popup_box.bottom(px(77.)),
             RailPopup::Tools | RailPopup::Starred | RailPopup::Catalog => popup_box.bottom(px(68.)),
         };
@@ -362,11 +539,703 @@ impl ShellView {
                     .occlude()
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.rail_popup = None;
+                        this.rec_player.stop();
                         cx.notify();
                     })),
             )
             .child(positioned)
             .into_any_element()
+    }
+
+    fn recordings_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let subtle = token_rgb("--layer-background-subtle", "#f3f5f8");
+        let hover_bg = token_rgb("--layer-background-hover", "#ebeff5");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let accent = token_rgb("--button-primary-normal", "#0068ff");
+        let accent_hover = token_rgb("--button-primary-hover", "#005ae0");
+
+        let dates = crate::recordings::available_dates(&self.recordings);
+        let rec_date_set: std::collections::HashSet<String> =
+            dates.iter().map(|(d, _)| d.clone()).collect();
+        let selected_date = self.rec_date_filter.clone();
+        let selected_cal = selected_date
+            .as_deref()
+            .and_then(crate::recordings::CalDate::parse_dmy);
+        let playing = self.rec_player.playing_path();
+
+        let visible: Vec<crate::recordings::RecordingEntry> = self
+            .recordings
+            .iter()
+            .filter(|r| {
+                selected_date
+                    .as_deref()
+                    .is_none_or(|d| r.date_key == d)
+            })
+            .cloned()
+            .collect();
+
+        let today = crate::recordings::CalDate::today();
+        let (cal_y, cal_m) = self.rec_cal_ym;
+        let grid = crate::recordings::month_grid(cal_y, cal_m);
+        let weekday_headers = ["CN", "T2", "T3", "T4", "T5", "T6", "T7"];
+        let mut cal_rows: Vec<gpui::AnyElement> = Vec::with_capacity(6);
+        for row_idx in 0..6 {
+            let mut row_cells: Vec<gpui::AnyElement> = Vec::with_capacity(7);
+            for col_idx in 0..7 {
+                let cell = grid[row_idx * 7 + col_idx];
+                let dmy = cell.date.format_dmy();
+                let has_rec = rec_date_set.contains(&dmy);
+                let is_selected = selected_cal == Some(cell.date);
+                let is_today = cell.date == today;
+                let is_future = cell.date > today;
+                let dmy_click = dmy.clone();
+                let cell_date = cell.date;
+                let text_col = if is_selected {
+                    rgb(0xff_ff_ff)
+                } else if !cell.in_month || is_future {
+                    rgb(muted)
+                } else {
+                    rgb(ink)
+                };
+                row_cells.push(
+                    div()
+                        .id(gpui::SharedString::from(format!(
+                            "rec-cal-{}-{}",
+                            row_idx, col_idx
+                        )))
+                        .flex_1()
+                        .h(px(30.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .when(is_selected, |d| d.bg(rgb(accent)))
+                        .when(!is_selected && is_today, |d| {
+                            d.border_1().border_color(rgb(accent))
+                        })
+                        .when(!is_selected, |d| d.hover(move |s| s.bg(rgb(hover_bg))))
+                        .when(!cell.in_month && !is_selected, |d| d.opacity(0.42))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.rec_date_filter.as_deref() == Some(dmy_click.as_str()) {
+                                this.rec_date_filter = None;
+                            } else {
+                                this.rec_date_filter = Some(dmy_click.clone());
+                                this.rec_cal_ym = (cell_date.year, cell_date.month);
+                            }
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .line_height(px(14.))
+                                .when(is_selected || is_today || has_rec, |d| {
+                                    d.font_family(FAMILY_SEMIBOLD)
+                                })
+                                .text_color(text_col)
+                                .child(format!("{}", cell.date.day)),
+                        )
+                        .child(
+                            div()
+                                .mt(px(1.))
+                                .size(px(4.5))
+                                .rounded(px(2.5))
+                                .when(has_rec, |d| {
+                                    d.bg(if is_selected {
+                                        rgb(0xff_d0_d0)
+                                    } else {
+                                        rgb(0xef_23_2a)
+                                    })
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            cal_rows.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .gap(px(2.))
+                    .children(row_cells)
+                    .into_any_element(),
+            );
+        }
+        let date_label = selected_date
+            .clone()
+            .unwrap_or_else(|| format!("Tất cả ({})", self.recordings.len()));
+        let cal_open = self.rec_cal_open;
+
+        let rows: Vec<gpui::AnyElement> = visible
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let is_playing = playing.as_ref() == Some(&entry.path);
+                let play_path = entry.path.clone();
+                let ext_path = entry.path.clone();
+                let del_path = entry.path.clone();
+                let dur_str = entry
+                    .duration_secs
+                    .map(crate::recordings::format_duration)
+                    .unwrap_or_else(|| "--:--".to_owned());
+                let meta_line = format!(
+                    "{} • {} • {} • {}",
+                    entry.date_key,
+                    entry.time_label,
+                    dur_str,
+                    crate::recordings::format_size(entry.bytes),
+                );
+                div()
+                    .id(gpui::SharedString::from(format!("rec-row-{idx}")))
+                    .w_full()
+                    .px(px(10.))
+                    .py(px(8.))
+                    .rounded(px(8.))
+                    .bg(if is_playing {
+                        rgb(hover_bg)
+                    } else {
+                        rgb(subtle)
+                    })
+                    .border_1()
+                    .when(is_playing, |d| d.border_color(rgb(accent)))
+                    .when(!is_playing, |d| {
+                        d.border_color(crate::color::border_subtle())
+                    })
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.))
+                    // Play / Stop button
+                    .child(
+                        div()
+                            .id(gpui::SharedString::from(format!("rec-play-{idx}")))
+                            .flex_none()
+                            .size(px(32.))
+                            .rounded(px(16.))
+                            .bg(if is_playing {
+                                rgb(0xef_23_2a)
+                            } else {
+                                rgb(accent)
+                            })
+                            .hover(move |s| {
+                                s.bg(if is_playing {
+                                    rgb(0xd9_1e_24)
+                                } else {
+                                    rgb(accent_hover)
+                                })
+                            })
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.))
+                            .text_color(rgb(0xff_ff_ff))
+                            .tooltip(move |_, cx| {
+                                tip(
+                                    if is_playing {
+                                        "Dừng phát"
+                                    } else {
+                                        "Nghe lại (Stereo)"
+                                    },
+                                    cx,
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.rec_player.toggle(play_path.clone());
+                                cx.notify();
+                            }))
+                            .child(if is_playing {
+                                crate::fonts::fa_icon(crate::fonts::FA_STOP, "■", 11., 0xff_ff_ff)
+                            } else {
+                                crate::fonts::fa_icon(crate::fonts::FA_PLAY, "▶", 11., 0xff_ff_ff)
+                            }),
+                    )
+                    // Title + DD/MM/YYYY timestamp + duration/size
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(px(13.))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(ink))
+                                            .child(entry.peer.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .px(px(5.))
+                                            .py(px(1.))
+                                            .rounded(px(4.))
+                                            .bg(rgb(paper))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(muted))
+                                            .child("OGG"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(muted))
+                                    .child(meta_line),
+                            ),
+                    )
+                    // External open button
+                    .child(
+                        div()
+                            .id(gpui::SharedString::from(format!("rec-ext-{idx}")))
+                            .flex_none()
+                            .size(px(26.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(hover_bg)))
+                            .text_size(px(13.))
+                            .text_color(rgb(muted))
+                            .tooltip(|_, cx| tip("Mở bằng trình phát ngoài", cx))
+                            .on_click(cx.listener(move |_, _, _, _| {
+                                crate::recordings::open_recording_external(&ext_path);
+                            }))
+                            .child(crate::fonts::fa_icon(
+                                crate::fonts::FA_EXTERNAL_LINK,
+                                "↗",
+                                12.,
+                                muted,
+                            )),
+                    )
+                    // Delete button
+                    .child(
+                        div()
+                            .id(gpui::SharedString::from(format!("rec-del-{idx}")))
+                            .flex_none()
+                            .size(px(26.))
+                            .rounded(px(6.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(hover_bg)))
+                            .text_size(px(13.))
+                            .text_color(rgb(0xdc_26_26))
+                            .tooltip(|_, cx| tip("Xóa bản ghi âm", cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.rec_player.playing_path().as_ref() == Some(&del_path) {
+                                    this.rec_player.stop();
+                                }
+                                let _ = std::fs::remove_file(&del_path);
+                                this.recordings = crate::recordings::list_recordings();
+                                if let Some(sel) = this.rec_date_filter.as_deref() {
+                                    if !this.recordings.iter().any(|r| r.date_key == sel) {
+                                        this.rec_date_filter = None;
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .child(crate::fonts::fa_icon(
+                                crate::fonts::FA_TRASH,
+                                "✕",
+                                12.,
+                                0xdc_26_26,
+                            )),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        div()
+            .id("recordings-panel")
+            .w(px(392.))
+            .max_h(px(620.))
+            .rounded(px(10.))
+            .overflow_hidden()
+            .bg(rgb(paper))
+            .border_1()
+            .border_color(crate::color::border_subtle())
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            // Header bar
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(14.))
+                    .py(px(11.))
+                    .border_b_1()
+                    .border_color(crate::color::border_subtle())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .rounded(px(5.))
+                                    .bg(rgb(0xff_ff_ff))
+                                    .border_1()
+                                    .border_color(rgb(0xe5_1c_23))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .size(px(6.))
+                                            .rounded(px(3.))
+                                            .bg(rgb(0xe5_1c_23)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .font_family(FAMILY_BOLD)
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(0xe5_1c_23))
+                                            .child("REC"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .child("Ghi âm cuộc gọi"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .id("rec-open-folder")
+                                    .h(px(28.))
+                                    .px(px(10.))
+                                    .rounded(px(6.))
+                                    .bg(rgb(subtle))
+                                    .hover(move |s| s.bg(rgb(hover_bg)))
+                                    .border_1()
+                                    .border_color(crate::color::border_subtle())
+                                    .cursor_pointer()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .text_size(px(12.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .on_click(cx.listener(|_, _, _, _| {
+                                        crate::recordings::open_recordings_folder();
+                                    }))
+                                    .child(crate::fonts::fa_icon(
+                                        crate::fonts::FA_FOLDER_OPEN,
+                                        "📁",
+                                        12.,
+                                        ink,
+                                    ))
+                                    .child("Mở thư mục"),
+                            )
+                            .child(
+                                div()
+                                    .id("rec-refresh")
+                                    .size(px(28.))
+                                    .rounded(px(6.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(rgb(hover_bg)))
+                                    .tooltip(|_, cx| tip("Làm mới danh sách", cx))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.recordings = crate::recordings::list_recordings();
+                                        cx.notify();
+                                    }))
+                                    .child(crate::fonts::fa_icon(
+                                        crate::fonts::FA_ROTATE,
+                                        "↻",
+                                        12.5,
+                                        muted,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("rec-close")
+                                    .size(px(28.))
+                                    .rounded(px(6.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(rgb(hover_bg)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rail_popup = None;
+                                        this.rec_player.stop();
+                                        cx.notify();
+                                    }))
+                                    .child(crate::fonts::fa_icon(
+                                        crate::fonts::FA_XMARK,
+                                        "×",
+                                        13.5,
+                                        muted,
+                                    )),
+                            ),
+                    ),
+            )
+            // Calendar date picker section (DD/MM/YYYY) with red dot indicators
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(14.))
+                    .py(px(10.))
+                    .border_b_1()
+                    .border_color(crate::color::border_subtle())
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("rec-cal-toggle")
+                                    .h(px(28.))
+                                    .px(px(10.))
+                                    .rounded(px(6.))
+                                    .bg(rgb(subtle))
+                                    .hover(move |s| s.bg(rgb(hover_bg)))
+                                    .border_1()
+                                    .border_color(crate::color::border_subtle())
+                                    .cursor_pointer()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .text_size(px(12.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.rec_cal_open = !this.rec_cal_open;
+                                        cx.notify();
+                                    }))
+                                    .child("📅")
+                                    .child(date_label)
+                                    .child(if cal_open { "▴" } else { "▾" }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(4.))
+                                            .child(
+                                                div()
+                                                    .size(px(6.))
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(0xef_23_2a)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(rgb(muted))
+                                                    .child("Có ghi âm"),
+                                            ),
+                                    )
+                                    .when(selected_date.is_some(), |d| {
+                                        d.child(
+                                            div()
+                                                .id("rec-date-clear")
+                                                .px(px(8.))
+                                                .py(px(3.))
+                                                .rounded(px(5.))
+                                                .bg(rgb(subtle))
+                                                .hover(move |s| s.bg(rgb(hover_bg)))
+                                                .cursor_pointer()
+                                                .text_size(px(11.5))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(accent))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.rec_date_filter = None;
+                                                    cx.notify();
+                                                }))
+                                                .child("Tất cả"),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .when(cal_open, |d| {
+                        d.child(
+                            div()
+                                .rounded(px(8.))
+                                .bg(rgb(subtle))
+                                .border_1()
+                                .border_color(crate::color::border_subtle())
+                                .px(px(10.))
+                                .py(px(8.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                // Month header: `Tháng 11, 2026`   `<  >`
+                                .child(
+                                    div()
+                                        .pb(px(4.))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(ink))
+                                                .child(format!("Tháng {cal_m}, {cal_y}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(4.))
+                                                .child(
+                                                    div()
+                                                        .id("rec-cal-prev-m")
+                                                        .size(px(24.))
+                                                        .rounded(px(5.))
+                                                        .cursor_pointer()
+                                                        .hover(move |s| s.bg(rgb(hover_bg)))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(14.))
+                                                        .text_color(rgb(ink))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            let (y, m) = this.rec_cal_ym;
+                                                            this.rec_cal_ym =
+                                                                crate::recordings::prev_month(y, m);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("‹"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("rec-cal-next-m")
+                                                        .size(px(24.))
+                                                        .rounded(px(5.))
+                                                        .cursor_pointer()
+                                                        .hover(move |s| s.bg(rgb(hover_bg)))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_size(px(14.))
+                                                        .text_color(rgb(ink))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            let (y, m) = this.rec_cal_ym;
+                                                            this.rec_cal_ym =
+                                                                crate::recordings::next_month(y, m);
+                                                            cx.notify();
+                                                        }))
+                                                        .child("›"),
+                                                ),
+                                        ),
+                                )
+                                // Weekday row: CN T2 T3 T4 T5 T6 T7
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_row()
+                                        .gap(px(2.))
+                                        .children(weekday_headers.into_iter().map(|w| {
+                                            div()
+                                                .flex_1()
+                                                .h(px(20.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(muted))
+                                                .child(w)
+                                        })),
+                                )
+                                // 6×7 month grid with red dot markers
+                                .children(cal_rows),
+                        )
+                    }),
+            )
+            // Recordings list body
+            .child(
+                div()
+                    .id("rec-list-scroll")
+                    .flex_1()
+                    .min_h(px(180.))
+                    .max_h(px(310.))
+                    .overflow_y_scroll()
+                    .p(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .when(rows.is_empty(), |d| {
+                        d.items_center().justify_center().py(px(32.)).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.5))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(ink))
+                                        .child("Chưa có bản ghi âm nào"),
+                                )
+                                .child(
+                                    div()
+                                        .max_w(px(280.))
+                                        .text_size(px(12.))
+                                        .text_color(rgb(muted))
+                                        .child("Bấm nút REC trong cuộc gọi để ghi âm Stereo .ogg (Trái: Bạn, Phải: Đầu kia)."),
+                                ),
+                        )
+                    })
+                    .children(rows),
+            )
     }
 
     fn zcloud_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -393,14 +1262,15 @@ impl ShellView {
                     .relative()
                     .h(px(196.))
                     .bg(rgb(if crate::color::is_dark() {
-                        0x1c_2b_3c
+                        0x1c_28_38
                     } else {
                         0xe5_f8_ff
                     }))
                     .when_some(image, |el, img| {
                         el.child(gpui::img(img).w(px(336.)).h(px(196.)).object_fit(gpui::ObjectFit::Cover))
                     })
-                    .child(
+                    .child({
+                        let dark = crate::color::is_dark();
                         div()
                             .id("zcloud-close")
                             .absolute()
@@ -412,25 +1282,25 @@ impl ShellView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .bg(if crate::color::is_dark() {
-                                hsla(0., 0., 0., 0.55)
+                            .bg(if dark {
+                                hsla(0., 0., 0., 0.45)
                             } else {
-                                hsla(0., 0., 1., 0.65)
+                                hsla(0., 0., 1., 0.55)
                             })
-                            .text_color(rgb(token_rgb("--text-primary", "#081b3a")))
-                            .hover(|st| {
-                                st.bg(if crate::color::is_dark() {
-                                    hsla(0., 0., 0., 0.8)
+                            .text_color(rgb(if dark { 0xff_ff_ff } else { 0x08_1b_3a }))
+                            .hover(move |st| {
+                                st.bg(if dark {
+                                    hsla(0., 0., 0., 0.7)
                                 } else {
-                                    hsla(0., 0., 1., 0.9)
+                                    hsla(0., 0., 1., 0.85)
                                 })
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.rail_popup = None;
                                 cx.notify();
                             }))
-                            .child(fonts::icon_el('\u{EA9F}', "×", 18.)),
-                    ),
+                            .child(fonts::icon_el('\u{EA9F}', "×", 18.))
+                    }),
             )
             .child(
                 div()
@@ -790,6 +1660,22 @@ fn mark_btn(
                 .child(fonts::icon_el(code, fallback, icon_px))
                 .when(badge > 0, |el| el.child(rail_badge(badge))),
         )
+}
+
+/// Cached 64×64 white-on-transparent «Add Clone» rail icon.
+fn add_clone_icon() -> Option<std::sync::Arc<gpui::RenderImage>> {
+    static ICON: std::sync::OnceLock<Option<std::sync::Arc<gpui::RenderImage>>> =
+        std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        let rgba = crate::media::decode_rgba(
+            include_bytes!("../assets/rail-add-clone.png"),
+            64,
+        )?;
+        Some(std::sync::Arc::new(gpui::RenderImage::new([
+            image::Frame::new(crate::media::rgba_to_bgra(rgba)),
+        ])))
+    })
+    .clone()
 }
 
 /// Red unread counter pinned to the mark's top-right (`.z-noti-badge --big`).

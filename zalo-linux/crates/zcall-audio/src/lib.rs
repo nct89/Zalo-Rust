@@ -15,6 +15,7 @@ pub mod jitter;
 pub mod mixer;
 pub mod pipeline;
 pub mod processing;
+pub mod recorder;
 pub mod wsola;
 
 pub use apm::InProcessApm;
@@ -26,3 +27,4 @@ pub use capture::{
 pub use mixer::{playout_step, run_playout, Mixer, PcmSink};
 pub use pipeline::{bytes_to_i16, AudioPipeline};
 pub use processing::AudioProcessing;
+pub use recorder::{ogg_opus_duration_secs, play_ogg_opus, CallRecorder, RecordingSummary};

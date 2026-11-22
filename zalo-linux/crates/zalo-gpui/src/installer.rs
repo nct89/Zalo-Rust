@@ -24,9 +24,9 @@ use crate::color::token_rgb;
 use crate::fonts::FAMILY_SEMIBOLD;
 use crate::window_frame::{wrap_csd, CsdCorners};
 
-/// Default public OCR manifest URL (can be overridden via `ZALO_OCR_MANIFEST_URL`).
-pub const OCR_MANIFEST_URL: &str =
-    "https://github.com/nct89/Zalo-Rust/releases/latest/download/ocr-manifest.json";
+/// Public Cloudflare R2 OCR manifest URL (bucket `zalo` behind `dl.lza.lol`,
+/// overridable via `ZALO_OCR_MANIFEST_URL`).
+pub const OCR_MANIFEST_URL: &str = "https://dl.lza.lol/zalo-linux/ocr/manifest.json";
 
 /// Linux distribution family detected from `/etc/os-release`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +480,18 @@ pub fn scan_system() -> SystemScan {
                 required: true,
             },
         ),
+        check_dep(
+            family,
+            DepSpec {
+                label: "Chuông báo & xem video nội bộ (ffmpeg / ffplay)",
+                deb: "ffmpeg",
+                rpm: "ffmpeg-free",
+                arch: "ffmpeg",
+                fallback_bin: Some("ffplay"),
+                fallback_lib: None,
+                required: false,
+            },
+        ),
     ];
     if desktop.to_ascii_lowercase().contains("gnome") {
         deps.push(check_dep(
@@ -623,7 +635,22 @@ fn install_user_local(
         &asset_root.join("zcall-sound"),
         "zcall-sound",
         0.58,
-        0.74,
+        0.70,
+        on_status,
+    )?;
+    let wasm_files: Vec<PathBuf> = [
+        "libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm",
+        "libzproto_backup_wasm_bg.042497d03f0f504b6b1444e25a7db0d9.wasm",
+    ]
+    .into_iter()
+    .filter_map(crate::ws_rpc::locate_wasm)
+    .collect();
+    copy_asset_group(
+        wasm_files,
+        &asset_root.join("wasm"),
+        "wasm",
+        0.70,
+        0.78,
         on_status,
     )?;
 

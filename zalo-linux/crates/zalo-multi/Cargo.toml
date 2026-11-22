@@ -1,0 +1,30 @@
+[package]
+name = "zalo-multi"
+description = "Lõi quản lý đa tài khoản ZaloMulti (tương thích ngược ZaloMulti-Linux 3.0.5 / lza.lol)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+base64.workspace = true
+hex.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+ring = "0.17"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+zalo-shell = { path = "../zalo-shell" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+zalo-shell-mac = { path = "../../../zalo-macos/crates/zalo-shell" }
