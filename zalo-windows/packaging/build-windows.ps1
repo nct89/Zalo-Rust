@@ -12,7 +12,7 @@ $Root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Push-Location $Root
 try {
     $CargoToml = Get-Content (Join-Path $Root "Cargo.toml") -Raw
-    $WorkspaceVersion = "0.2.2"
+    $WorkspaceVersion = "0.3.0"
     if ($CargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
         $WorkspaceVersion = $Matches[1]
     }

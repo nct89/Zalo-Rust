@@ -1,6 +1,6 @@
 # Maintainer: Zalo-Rust contributors
 pkgname=zalo-linux
-pkgver=0.2.2
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Native Rust Zalo Desktop client (GPUI) with SNI, DBusMenu, and XEmbed tray fallback"
 arch=('x86_64' 'aarch64')
