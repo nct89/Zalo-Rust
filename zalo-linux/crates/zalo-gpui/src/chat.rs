@@ -5513,18 +5513,25 @@ fn pictogram_parts(parts: Vec<crate::emoji::PictogramPart>, color: u32) -> gpui:
             }
             PictogramPart::Tile(item) => {
                 elem_idx += 1;
-                rows.last_mut().unwrap().push(
-                    div()
-                        .id(("emo-tile", elem_idx))
-                        .flex_none()
-                        .mr(px(2.))
-                        .child(
-                            img(item.path.clone())
-                                .size(px(20.))
-                                .object_fit(ObjectFit::Contain),
-                        )
-                        .into_any_element(),
-                );
+                if let Some(tile) = crate::emoji::tile_image(item) {
+                    rows.last_mut().unwrap().push(
+                        div()
+                            .id(("emo-tile", elem_idx))
+                            .flex_none()
+                            .mr(px(2.))
+                            .child(img(tile).size(px(20.)).object_fit(ObjectFit::Contain))
+                            .into_any_element(),
+                    );
+                } else {
+                    rows.last_mut().unwrap().push(
+                        div()
+                            .id(("emo-run", elem_idx))
+                            .whitespace_nowrap()
+                            .min_h(px(22.))
+                            .child(item.insert.clone())
+                            .into_any_element(),
+                    );
+                }
             }
         }
     }

@@ -1281,7 +1281,7 @@ impl ShellView {
                             .children(items.into_iter().map(|item| {
                                 let insert = item.insert.clone();
                                 let tip_s = item.tip.clone();
-                                let path = item.path.clone();
+                                let tile = crate::emoji::tile_image(item);
                                 let cell_id = crate::emoji::thumb_key(item);
                                 div()
                                     .id(gpui::SharedString::from(cell_id))
@@ -1309,11 +1309,11 @@ impl ShellView {
                                         window.focus(&handle);
                                         cx.notify();
                                     }))
-                                    .child(
-                                        img(path)
+                                    .children(tile.map(|img_src| {
+                                        img(img_src)
                                             .size(px(28.))
-                                            .object_fit(ObjectFit::Contain),
-                                    )
+                                            .object_fit(ObjectFit::Contain)
+                                    }))
                             }))
                             .into_any_element()
                     }),

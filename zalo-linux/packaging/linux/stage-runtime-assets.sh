@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage runtime fonts (~1.5 MiB), call ringtones (~76 KiB), Sync/Backup WASM (~420 KiB),
-# Zalo emoji pack (~10 MiB), and UI images (~420 KiB) for packages.
+# single Zalo emoji sprite pack (~1.7 MiB, 3 files), and UI images (~420 KiB) for packages.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -34,10 +34,13 @@ do
   install -m 644 "$WASM_SRC/$w" "$DST_DIR/wasm/$w"
 done
 
-if [ -d "$EMOJI_SRC" ]; then
-  cp -a "$EMOJI_SRC/." "$DST_DIR/emoji/"
-  chmod -R a+rX "$DST_DIR/emoji"
-fi
+for e in \
+  "emoji-pos.json" \
+  "emoji-rc.json" \
+  "emoji.1e7786c93c8a0c1773f165e2de2fd129.png"
+do
+  [ -f "$EMOJI_SRC/$e" ] && install -m 644 "$EMOJI_SRC/$e" "$DST_DIR/emoji/$e"
+done
 
 if [ -d "$IMAGES_SRC" ]; then
   cp -a "$IMAGES_SRC/." "$DST_DIR/images/"

@@ -87,9 +87,18 @@ try {
         }
     }
 
-    $EmojiSrc = Join-Path $Root "assets\emoji"
-    if (Test-Path $EmojiSrc) {
-        Copy-Item -Recurse -Force $EmojiSrc (Join-Path $Stage "emoji")
+    $EmojiDst = Join-Path $Stage "emoji"
+    New-Item -ItemType Directory -Force -Path $EmojiDst | Out-Null
+    $EmojiFiles = @(
+        "emoji-pos.json",
+        "emoji-rc.json",
+        "emoji.1e7786c93c8a0c1773f165e2de2fd129.png"
+    )
+    foreach ($e in $EmojiFiles) {
+        $src = Join-Path $Root "assets\emoji\$e"
+        if (Test-Path $src) {
+            Copy-Item $src (Join-Path $EmojiDst $e)
+        }
     }
 
     $ImagesSrc = Join-Path $Root "assets\images"

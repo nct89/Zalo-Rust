@@ -3,13 +3,17 @@
 //! Electron (`compact2760.js`) walks `emoji-pos.json` in insertion order,
 //! skips indices 87–145 (uppercase duplicates) and a few hidden keys, then
 //! splits the remaining list into nine categories (Zalo, People, …).
-//! Unicode tiles live as PNG under `emoji-32/`. Classic emoticons (`:)`,
-//! `/-heart`, …) sit on the sprite `pc-dist/assets/emoji.*.png` and are
-//! cropped once into the XDG cache.
+//! Both classic emoticons (`:)`, `/-heart`, …) and Unicode emojis live on the
+//! single 51 × 41 sprite sheet (`emoji.1e7786c93c8a0c1773f165e2de2fd129.png`,
+//! 64×64 px per cell) and are cropped lazily in memory into GPU-ready BGRA
+//! [`gpui::RenderImage`] tiles with zero per-tile disk files.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use gpui::RenderImage;
+use image::Frame;
 
 /// One tile in the emoji picker.
 #[derive(Clone, Debug)]
@@ -18,8 +22,10 @@ pub struct EmojiItem {
     pub insert: String,
     /// Tooltip (the original map key).
     pub tip: String,
-    /// Filesystem path of the PNG to paint.
-    pub path: PathBuf,
+    /// Zero-based column on the 51 × 41 sprite sheet.
+    pub col: u16,
+    /// Zero-based row on the 51 × 41 sprite sheet.
+    pub row: u16,
     /// Category index into [`GROUPS`] (0 = Zalo classic).
     pub group: u8,
 }
@@ -42,17 +48,17 @@ const GROUP_POS: [usize; 9] = [0, 86, 290, 437, 504, 561, 676, 854, 1124];
 
 const HIDDEN: &[&str] = &[":-|", ":+", ";8", "/-jj", "/-JJ"];
 
-const DEV_EMOJI_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../../assets/emoji"
-);
-const SPRITE_FILE: &str = "emoji.1e7786c93c8a0c1773f165e2de2fd129.png";
+const DEV_EMOJI_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../assets/emoji");
+/// Single 51 × 41 sprite sheet PNG containing every classic and Unicode emoji.
+pub(crate) const SPRITE_FILE: &str = "emoji.1e7786c93c8a0c1773f165e2de2fd129.png";
+/// Runtime files required in the `emoji/` asset directory.
+pub(crate) const RUNTIME_FILES: [&str; 3] = ["emoji-pos.json", "emoji-rc.json", SPRITE_FILE];
 
 /// Sprite is 51 × 41 cells of 64 px (CSS `background-size: 5100% 4100%`).
 const SPRITE_COLS: u32 = 51;
 const SPRITE_ROWS: u32 = 41;
 
-/// Root of the decoded emoji pack (`emoji-32/`, `emoji-pos.json`, `emoji-rc.json`, sprite).
+/// Root of the emoji asset pack (`emoji-pos.json`, `emoji-rc.json`, sprite sheet).
 /// Searches runtime install paths (Linux/macOS/Windows) before falling back to the dev tree.
 #[must_use]
 pub fn emoji_dir() -> PathBuf {
@@ -82,8 +88,19 @@ pub fn emoji_dir() -> PathBuf {
     candidates.push(dev.clone());
     candidates
         .into_iter()
-        .find(|dir| dir.join("emoji-pos.json").is_file())
+        .find(|dir| dir.join("emoji-pos.json").is_file() && dir.join(SPRITE_FILE).is_file())
         .unwrap_or(dev)
+}
+
+/// Active runtime emoji files (the 3-file sprite pack) to copy during `--install`.
+#[must_use]
+pub(crate) fn runtime_emoji_paths() -> Vec<PathBuf> {
+    let dir = emoji_dir();
+    RUNTIME_FILES
+        .into_iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 /// Lazy catalogue matching Zalo PC's filtered `emojiObj`.
@@ -99,10 +116,51 @@ pub fn group_items(group: u8) -> impl Iterator<Item = &'static EmojiItem> {
     catalog().iter().filter(move |item| item.group == group)
 }
 
-/// Path used as the thumbnail cache key for `item`.
+/// Stable element/cache key for `item`.
 #[must_use]
 pub fn thumb_key(item: &EmojiItem) -> String {
-    item.path.to_string_lossy().into_owned()
+    format!("emoji-{}-{}", item.col, item.row)
+}
+
+/// Lazily crops a 64 × 64 px BGRA [`RenderImage`] tile from the single in-memory
+/// emoji sprite sheet and caches it by `(col, row)`.
+#[must_use]
+pub fn tile_image(item: &EmojiItem) -> Option<Arc<RenderImage>> {
+    static TILES: OnceLock<Mutex<HashMap<(u16, u16), Arc<RenderImage>>>> = OnceLock::new();
+    let cache = TILES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (item.col, item.row);
+    if let Some(hit) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return Some(hit);
+    }
+
+    let sprite = sprite_bgra()?;
+    let cell_w = sprite.width() / SPRITE_COLS;
+    let cell_h = sprite.height() / SPRITE_ROWS;
+    if cell_w == 0 || cell_h == 0 {
+        return None;
+    }
+    let x = u32::from(item.col).saturating_mul(cell_w);
+    let y = u32::from(item.row).saturating_mul(cell_h);
+    if x + cell_w > sprite.width() || y + cell_h > sprite.height() {
+        return None;
+    }
+    let sub = image::imageops::crop_imm(sprite, x, y, cell_w, cell_h).to_image();
+    let image = Arc::new(RenderImage::new([Frame::new(sub)]));
+    if let Ok(mut m) = cache.lock() {
+        m.insert(key, Arc::clone(&image));
+    }
+    Some(image)
+}
+
+fn sprite_bgra() -> Option<&'static image::RgbaImage> {
+    static SPRITE: OnceLock<Option<image::RgbaImage>> = OnceLock::new();
+    SPRITE
+        .get_or_init(|| {
+            let path = emoji_dir().join(SPRITE_FILE);
+            let img = image::open(path).ok()?.into_rgba8();
+            Some(crate::media::rgba_to_bgra(img))
+        })
+        .as_ref()
 }
 
 /// True when `text` contains a classic shortcode or a catalogued Unicode emoji.
@@ -247,12 +305,14 @@ fn by_insert() -> &'static HashMap<&'static str, &'static EmojiItem> {
 
 fn load_catalog() -> Vec<EmojiItem> {
     let dir = emoji_dir();
+    if !dir.join(SPRITE_FILE).is_file() {
+        return Vec::new();
+    }
     let pos_map = load_json_object(&dir.join("emoji-pos.json"));
     let rc_map = load_json_object(&dir.join("emoji-rc.json"));
     if pos_map.is_empty() {
         return Vec::new();
     }
-    let png_dir = dir.join("emoji-32");
     let mut cell_to_uni: HashMap<(u16, u16), String> = HashMap::new();
     for (key, value) in &rc_map {
         if key.is_ascii() {
@@ -261,11 +321,6 @@ fn load_catalog() -> Vec<EmojiItem> {
         if let Some(cell) = parse_cell(value.as_str().unwrap_or("")) {
             cell_to_uni.entry(cell).or_insert_with(|| key.clone());
         }
-    }
-    let sprite = image::open(dir.join(SPRITE_FILE)).ok();
-    let cache = classic_cache_dir();
-    if sprite.is_some() {
-        let _ = std::fs::create_dir_all(&cache);
     }
     let mut out = Vec::new();
     let mut idx = 0usize;
@@ -277,28 +332,26 @@ fn load_catalog() -> Vec<EmojiItem> {
         if idx > 1440 {
             break;
         }
+        let Some((x_pct, y_pct)) = pos_val.as_str().and_then(parse_pos) else {
+            continue;
+        };
+        let col = ((x_pct / 100.0) * (SPRITE_COLS - 1) as f32).round() as u32;
+        let row = ((y_pct / 100.0) * (SPRITE_ROWS - 1) as f32).round() as u32;
+        if col >= SPRITE_COLS || row >= SPRITE_ROWS {
+            continue;
+        }
         let filtered = out.len();
         let group = group_of(filtered);
         let cell = rc_map
             .get(key)
             .and_then(serde_json::Value::as_str)
             .and_then(parse_cell);
-        let png = cell.map(|(row, col)| png_dir.join(format!("row-{row}-column-{col}.png")));
-        let path = match png.filter(|p| p.is_file()) {
-            Some(existing) => existing,
-            None => match (sprite.as_ref(), pos_val.as_str()) {
-                (Some(img), Some(pos)) => match crop_sprite(img, pos, &cache, key) {
-                    Some(p) => p,
-                    None => continue,
-                },
-                _ => continue,
-            },
-        };
         let insert = insert_for(key, cell, &cell_to_uni);
         out.push(EmojiItem {
             insert,
             tip: key.clone(),
-            path,
+            col: col as u16,
+            row: row as u16,
             group,
         });
     }
@@ -353,61 +406,11 @@ fn load_json_object(path: &Path) -> serde_json::Map<String, serde_json::Value> {
         .unwrap_or_default()
 }
 
-fn classic_cache_dir() -> PathBuf {
-    if cfg!(test) {
-        return std::env::temp_dir().join("zalo-gpui-emoji-classic-test");
-    }
-    zalo_core::AppPaths::from_env("zalo-rust")
-        .map(|paths| paths.cache_dir().join("emoji-classic"))
-        .unwrap_or_else(|_| std::env::temp_dir().join("zalo-rust-emoji-classic"))
-}
-
-fn crop_sprite(
-    sprite: &image::DynamicImage,
-    pos: &str,
-    cache: &Path,
-    key: &str,
-) -> Option<PathBuf> {
-    let (x_pct, y_pct) = parse_pos(pos)?;
-    let col = ((x_pct / 100.0) * (SPRITE_COLS - 1) as f32).round() as u32;
-    let row = ((y_pct / 100.0) * (SPRITE_ROWS - 1) as f32).round() as u32;
-    let cell_w = sprite.width() / SPRITE_COLS;
-    let cell_h = sprite.height() / SPRITE_ROWS;
-    let x = col.saturating_mul(cell_w);
-    let y = row.saturating_mul(cell_h);
-    if x + cell_w > sprite.width() || y + cell_h > sprite.height() {
-        return None;
-    }
-    let name = classic_file_name(key);
-    let dest = cache.join(name);
-    if dest.is_file() {
-        return Some(dest);
-    }
-    let tile = sprite.crop_imm(x, y, cell_w, cell_h);
-    tile.save(&dest).ok()?;
-    Some(dest)
-}
-
 fn parse_pos(raw: &str) -> Option<(f32, f32)> {
     let mut parts = raw.split_whitespace();
     let x = parts.next()?.trim_end_matches('%').parse().ok()?;
     let y = parts.next()?.trim_end_matches('%').parse().ok()?;
     Some((x, y))
-}
-
-fn classic_file_name(key: &str) -> String {
-    let mut name = String::with_capacity(key.len() * 2 + 4);
-    for ch in key.chars() {
-        if ch.is_ascii_alphanumeric() {
-            name.push(ch);
-        } else {
-            name.push('_');
-            use std::fmt::Write;
-            let _ = write!(name, "{:x}", ch as u32);
-        }
-    }
-    name.push_str(".png");
-    name
 }
 
 #[cfg(test)]
@@ -420,6 +423,11 @@ mod tests {
         assert!(
             dir.join("emoji-rc.json").is_file(),
             "missing {}",
+            dir.display()
+        );
+        assert!(
+            dir.join(SPRITE_FILE).is_file(),
+            "missing sprite in {}",
             dir.display()
         );
         let all = catalog();
@@ -445,8 +453,14 @@ mod tests {
         let smile = all.iter().find(|i| i.tip == ":)" || i.insert == ":)");
         let smile = smile.expect("classic :) missing");
         assert_eq!(smile.group, 0);
-        assert!(smile.path.is_file(), "{}", smile.path.display());
-        assert_eq!(thumb_key(smile), smile.path.to_string_lossy());
+        assert_eq!((smile.col, smile.row), (41, 7));
+        assert!(tile_image(smile).is_some(), "classic :) tile must crop from sprite");
+        let uni = all
+            .iter()
+            .find(|i| i.group == 1)
+            .expect("unicode emoji missing");
+        assert!(tile_image(uni).is_some(), "unicode emoji tile must crop from sprite");
+        assert_eq!(thumb_key(smile), "emoji-41-7");
     }
 
     #[test]

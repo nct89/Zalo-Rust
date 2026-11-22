@@ -654,14 +654,17 @@ fn install_user_local(
         0.75,
         on_status,
     )?;
-    let emoji_src = crate::emoji::emoji_dir();
-    if emoji_src.is_dir() && emoji_src != asset_root.join("emoji") {
-        on_status(0.76, "Đang cài: bộ emoji Zalo".to_owned());
-        copy_dir_recursive(&emoji_src, &asset_root.join("emoji"))?;
-    }
+    copy_asset_group(
+        crate::emoji::runtime_emoji_paths(),
+        &asset_root.join("emoji"),
+        "emoji",
+        0.75,
+        0.78,
+        on_status,
+    )?;
     let images_src = crate::media::images_dir();
     if images_src.is_dir() && images_src != asset_root.join("images") {
-        on_status(0.78, "Đang cài: ảnh giao diện Zalo".to_owned());
+        on_status(0.79, "Đang cài: ảnh giao diện Zalo".to_owned());
         copy_dir_recursive(&images_src, &asset_root.join("images"))?;
     }
 

@@ -253,7 +253,7 @@ When Zalo updates its desktop `zpw_ver` (`client_version`) or `User-Agent`, you 
 | `ZALO_USER_AGENT` | Overrides HTTP and WebSocket `User-Agent` |
 | `ZALO_PARAM_CIPHER_KEY` | Overrides the 32-byte `ParamCipher` v2 key |
 | `ZALO_WASM_DIR` | Optional custom directory containing `libzproto_*_wasm_bg.*.wasm` |
-| `ZALO_EMOJI_DIR` | Optional custom directory containing `emoji-pos.json`, `emoji-rc.json`, sprite, and `emoji-32/` |
+| `ZALO_EMOJI_DIR` | Optional custom directory containing `emoji-pos.json`, `emoji-rc.json`, and the single emoji sprite PNG |
 | `ZALO_IMAGES_DIR` | Optional custom directory containing bundled UI PNG assets (`zcall/`, `zcloud-promo.png`) |
 | `ZALO_BUILD_VERSION` | Build-time override for the displayed release tag (defaults to workspace `Cargo.toml`) |
 
