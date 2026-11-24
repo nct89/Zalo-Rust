@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Level,
-    Profile, QpRange, RateControlMode, UsageType,
+    Profile, QpRange, RateControlMode, SpsPpsStrategy, UsageType,
 };
 use openh264::formats::YUVBuffer;
 use openh264::{OpenH264API, Timestamp};
@@ -144,6 +144,65 @@ fn kill_child(slot: &Mutex<Option<Child>>) {
     }
 }
 
+const ENCODER_OPTION_FRAME_RATE: i32 = 4;
+const ENCODER_OPTION_BITRATE: i32 = 5;
+const ENCODER_OPTION_MAX_BITRATE: i32 = 6;
+const SPATIAL_LAYER_0: std::os::raw::c_int = 0;
+const SPATIAL_LAYER_ALL: std::os::raw::c_int = 4;
+const LOCAL_PREVIEW_INTERVAL: Duration = Duration::from_millis(66);
+
+#[repr(C)]
+struct OpenH264BitrateInfo {
+    layer: std::os::raw::c_int,
+    bitrate: std::os::raw::c_int,
+}
+
+fn update_encoder_rate(enc: &mut Encoder, bitrate_bps: u32, fps: u32) -> bool {
+    let target_bps = bitrate_bps.clamp(80_000, 4_000_000) as std::os::raw::c_int;
+    let max_bps = (bitrate_bps.saturating_mul(5) / 4).clamp(100_000, 5_000_000) as std::os::raw::c_int;
+    let mut fps_val = fps.clamp(5, 30) as f32;
+    let mut max_all = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_ALL,
+        bitrate: max_bps,
+    };
+    let mut max_l0 = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_0,
+        bitrate: max_bps,
+    };
+    let mut tgt_all = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_ALL,
+        bitrate: target_bps,
+    };
+    let mut tgt_l0 = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_0,
+        bitrate: target_bps,
+    };
+    unsafe {
+        let raw = enc.raw_api();
+        let ok_max = raw.set_option(
+            ENCODER_OPTION_MAX_BITRATE,
+            std::ptr::addr_of_mut!(max_all).cast(),
+        ) == 0;
+        let _ = raw.set_option(
+            ENCODER_OPTION_MAX_BITRATE,
+            std::ptr::addr_of_mut!(max_l0).cast(),
+        );
+        let ok_tgt = raw.set_option(
+            ENCODER_OPTION_BITRATE,
+            std::ptr::addr_of_mut!(tgt_all).cast(),
+        ) == 0;
+        let _ = raw.set_option(
+            ENCODER_OPTION_BITRATE,
+            std::ptr::addr_of_mut!(tgt_l0).cast(),
+        );
+        let ok_fps = raw.set_option(
+            ENCODER_OPTION_FRAME_RATE,
+            std::ptr::addr_of_mut!(fps_val).cast(),
+        ) == 0;
+        ok_max && ok_tgt && ok_fps
+    }
+}
+
 fn capture_loop(
     stop: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
@@ -172,119 +231,150 @@ fn capture_loop(
 
     let mut force_key = true;
     let mut encoder: Option<Encoder> = None;
-    let mut encoded_size = (0_u32, 0_u32);
+    let mut enc_initialized = false;
+    let mut encoded_size = (0_usize, 0_usize);
     let mut encoded_bitrate = 0_u32;
     let mut encoded_fps = 0_u32;
     let started = Instant::now();
+    let mut last_preview = Instant::now() - LOCAL_PREVIEW_INTERVAL;
+    let mut next_due = Instant::now();
 
-    while !stop.load(Ordering::Acquire) {
-        let (w, h) = (even(profile.width), even(profile.height));
-        let fps = profile.fps.clamp(10, 30);
-        let Ok((mut proc_child, mut stdout)) = spawn_ffmpeg(&device, w, h, fps) else {
-            fail("Không mở được camera DirectShow.".into());
+    // Open DirectShow capture once at 720p30 (fallback 360p30) and scale
+    // in-process so SendRate rung switches never kill/respawn ffmpeg.
+    let attempts = [(1280_u32, 720_u32), (640_u32, 360_u32)];
+    let mut opened: Option<(usize, usize, std::process::ChildStdout, Vec<u8>)> = None;
+    for &(cw, ch) in &attempts {
+        if stop.load(Ordering::Acquire) {
             return;
+        }
+        let Ok((proc_child, mut stdout)) = spawn_ffmpeg(&device, cw, ch, 30) else {
+            continue;
         };
         if let Ok(mut guard) = child.lock() {
             *guard = Some(proc_child);
         } else {
-            let _ = proc_child.kill();
             return;
         }
-        let frame_bytes = (w as usize) * (h as usize) * 4;
-        let mut bgra = vec![0_u8; frame_bytes];
-        let mut frame_no = 0_u32;
+        let mut first = vec![0_u8; (cw as usize) * (ch as usize) * 4];
+        if read_exact(&mut stdout, &mut first) {
+            opened = Some((cw as usize, ch as usize, stdout, first));
+            break;
+        }
+        kill_child(&child);
+    }
+    let Some((cap_w, cap_h, mut stdout, mut first_frame)) = opened else {
+        fail("Không mở được camera DirectShow.".into());
+        return;
+    };
 
-        loop {
-            if stop.load(Ordering::Acquire) {
-                kill_child(&child);
-                return;
-            }
-            let mut restart = false;
-            while let Ok(cmd) = ctrl_rx.try_recv() {
-                match cmd {
-                    CamCtrl::ForceKey => force_key = true,
-                    CamCtrl::Profile(next) => {
-                        if even(next.width) != w || even(next.height) != h {
-                            restart = true;
-                        }
-                        profile = next;
-                    }
-                }
-            }
-            if restart {
-                kill_child(&child);
-                break;
-            }
-            if !read_exact(&mut stdout, &mut bgra) {
-                kill_child(&child);
-                if !stop.load(Ordering::Acquire) {
-                    fail(
-                        "Camera đã dừng hoặc đang bị ứng dụng khác sử dụng. Hãy kiểm tra quyền Camera trong Windows Settings."
-                            .into(),
-                    );
-                }
-                return;
-            }
-            if frame_no % 2 == 0 {
-                let (pw, ph) = preview_size(w as usize, h as usize);
-                let small = downscale_bgra(&bgra, w as usize, h as usize, pw, ph);
-                if let Ok(mut slot) = preview.lock() {
-                    *slot = Some(LocalPreview {
-                        w: pw as u32,
-                        h: ph as u32,
-                        bgra: Arc::new(small),
-                    });
-                }
-            }
-            frame_no = frame_no.wrapping_add(1);
-
-            let want_size = (w, h);
-            let want_bitrate = profile.bitrate.max(80_000);
-            let want_fps = profile.fps.clamp(10, 30);
-            if encoder.is_none()
-                || encoded_size != want_size
-                || encoded_bitrate != want_bitrate
-                || encoded_fps != want_fps
-            {
-                match open_encoder(want_bitrate, want_fps) {
-                    Ok(enc) => {
-                        encoder = Some(enc);
-                        encoded_size = want_size;
-                        encoded_bitrate = want_bitrate;
-                        encoded_fps = want_fps;
-                        force_key = true;
-                    }
-                    Err(err) => {
-                        kill_child(&child);
-                        fail(format!("Không khởi tạo được bộ mã hóa H.264: {err}"));
-                        return;
-                    }
-                }
-            }
-            let Some(enc) = encoder.as_mut() else {
-                continue;
-            };
-            if force_key {
-                enc.force_intra_frame();
-                force_key = false;
-            }
-            let i420 = bgra_to_i420(&bgra, w as usize, h as usize);
-            let picture = YUVBuffer::from_vec(i420, w as usize, h as usize);
-            let ts = Timestamp::from_millis(started.elapsed().as_millis() as u64);
-            let Ok(bitstream) = enc.encode_at(&picture, ts) else {
-                continue;
-            };
-            if bitstream.frame_type() == FrameType::Skip || bitstream.to_vec().is_empty() {
-                continue;
-            }
-            let data = bitstream.to_vec();
-            let key = bitstream.frame_type() == FrameType::IDR;
-            if let Err(TrySendError::Disconnected(_)) = tx.try_send(CamEvent::Frame { key, data }) {
-                kill_child(&child);
-                return;
+    let mut bgra = vec![0_u8; cap_w * cap_h * 4];
+    let mut have_first = true;
+    while !stop.load(Ordering::Acquire) {
+        while let Ok(cmd) = ctrl_rx.try_recv() {
+            match cmd {
+                CamCtrl::ForceKey => force_key = true,
+                CamCtrl::Profile(next) => profile = next,
             }
         }
+        if have_first {
+            bgra.copy_from_slice(&first_frame);
+            first_frame.clear();
+            have_first = false;
+        } else if !read_exact(&mut stdout, &mut bgra) {
+            kill_child(&child);
+            if !stop.load(Ordering::Acquire) {
+                fail(
+                    "Camera đã dừng hoặc đang bị ứng dụng khác sử dụng. Hãy kiểm tra quyền Camera trong Windows Settings."
+                        .into(),
+                );
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        let want_fps = profile.fps.clamp(5, 30);
+        let interval = Duration::from_secs_f64(1.0 / f64::from(want_fps));
+        if !force_key && now + interval / 2 < next_due {
+            continue;
+        }
+        next_due = (next_due + interval).max(now - interval / 2);
+
+        if last_preview.elapsed() >= LOCAL_PREVIEW_INTERVAL {
+            let (pw, ph) = preview_size(cap_w, cap_h);
+            let small = downscale_bgra(&bgra, cap_w, cap_h, pw, ph);
+            if let Ok(mut slot) = preview.lock() {
+                *slot = Some(LocalPreview {
+                    w: pw as u32,
+                    h: ph as u32,
+                    bgra: Arc::new(small),
+                });
+            }
+            last_preview = now;
+        }
+
+        let w = (even(profile.width) as usize).min(cap_w);
+        let h = (even(profile.height) as usize).min(cap_h);
+        let want_size = (w, h);
+        let want_bitrate = profile.bitrate.max(150_000);
+        if encoder.is_none() || encoded_size != want_size {
+            match open_encoder(w, h, want_bitrate, want_fps) {
+                Ok(enc) => {
+                    encoder = Some(enc);
+                    enc_initialized = false;
+                    encoded_size = want_size;
+                    encoded_bitrate = want_bitrate;
+                    encoded_fps = want_fps;
+                    force_key = true;
+                }
+                Err(err) => {
+                    kill_child(&child);
+                    fail(format!("Không khởi tạo được bộ mã hóa H.264: {err}"));
+                    return;
+                }
+            }
+        } else if let Some(enc) = encoder.as_mut() {
+            if (encoded_bitrate != want_bitrate || encoded_fps != want_fps)
+                && enc_initialized
+                && update_encoder_rate(enc, want_bitrate, want_fps)
+            {
+                encoded_bitrate = want_bitrate;
+                encoded_fps = want_fps;
+            }
+        }
+
+        let Some(enc) = encoder.as_mut() else {
+            continue;
+        };
+        if force_key {
+            enc.force_intra_frame();
+            force_key = false;
+        }
+        let i420 = if (w, h) == (cap_w, cap_h) {
+            bgra_to_i420(&bgra, cap_w, cap_h)
+        } else {
+            let scaled = downscale_bgra(&bgra, cap_w, cap_h, w, h);
+            bgra_to_i420(&scaled, w, h)
+        };
+        let picture = YUVBuffer::from_vec(i420, w, h);
+        let ts = Timestamp::from_millis(started.elapsed().as_millis() as u64);
+        let Ok(bitstream) = enc.encode_at(&picture, ts) else {
+            continue;
+        };
+        enc_initialized = true;
+        if bitstream.frame_type() == FrameType::Skip {
+            continue;
+        }
+        let data = bitstream.to_vec();
+        if data.is_empty() {
+            continue;
+        }
+        let key = bitstream.frame_type() == FrameType::IDR;
+        if let Err(TrySendError::Disconnected(_)) = tx.try_send(CamEvent::Frame { key, data }) {
+            kill_child(&child);
+            return;
+        }
     }
+    kill_child(&child);
 }
 
 fn spawn_ffmpeg(
@@ -325,8 +415,20 @@ fn spawn_ffmpeg(
     Ok((child, stdout))
 }
 
-fn open_encoder(bitrate: u32, fps: u32) -> Result<Encoder, openh264::Error> {
+fn open_encoder(width: usize, height: usize, bitrate: u32, fps: u32) -> Result<Encoder, openh264::Error> {
     let api = OpenH264API::from_source();
+    let level = if width > 640 || height > 480 {
+        Level::Level_4_0
+    } else {
+        Level::Level_3_1
+    };
+    let qp = if bitrate <= 350_000 {
+        QpRange::new(16, 42)
+    } else if bitrate <= 750_000 {
+        QpRange::new(14, 38)
+    } else {
+        QpRange::new(12, 36)
+    };
     let config = EncoderConfig::new()
         .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
@@ -334,10 +436,16 @@ fn open_encoder(bitrate: u32, fps: u32) -> Result<Encoder, openh264::Error> {
         .max_frame_rate(FrameRate::from_hz(fps as f32))
         .intra_frame_period(IntraFramePeriod::from_num_frames(0))
         .profile(Profile::Baseline)
-        .level(Level::Level_3_1)
-        .complexity(Complexity::Low)
-        .qp(QpRange::new(18, 42))
-        .num_threads(2);
+        .level(level)
+        .complexity(Complexity::Medium)
+        .qp(qp)
+        .sps_pps_strategy(SpsPpsStrategy::ConstantId)
+        .max_slice_len(1060)
+        .adaptive_quantization(true)
+        .background_detection(true)
+        .scene_change_detect(true)
+        .skip_frames(false)
+        .num_threads(if width * height > 640 * 360 { 2 } else { 1 });
     Encoder::with_api_config(api, config)
 }
 

@@ -1,9 +1,9 @@
-//! WASAPI bridge: microphone → Opus, and Opus → speaker.
+//! WASAPI bridge: microphone → WebRTC APM (AEC3 + NS + AGC2) → Opus, and
+//! Opus → WSOLA/FEC/PLC Mixer → speaker.
 //!
-//! Shares the exact `AudioBridge` surface with Linux and macOS so `zalo-gpui`
-//! drives 1-1 and group calls uniformly across platforms.
+//! Shares the exact DSP stack (`zcall-dsp`) and `AudioBridge` surface with
+//! Linux and macOS so 1-1 and group calls sound identical across platforms.
 
-use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -13,8 +13,12 @@ use std::time::Instant;
 
 use serde_json::Value;
 use zcall_audio::{CardMic, CardSpeaker, FRAME_SAMPLES};
-use zcall_core::audio::{OpusDecoder, OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES as OPUS_SAMPLES};
-use zcall_core::zrtc_helpers::{audio_encoder_options, playout_delay_ms};
+use zcall_core::audio::{OpusEncoder, OpusEncoderConfig, FRAME_SAMPLES as OPUS_SAMPLES};
+use zcall_core::zrtc_helpers::{
+    audio_encoder_options, audio_processing_options, playout_delay_ms, AudioProcessingOptions,
+};
+use zcall_dsp::apm::InProcessApm;
+use zcall_dsp::mixer::Mixer;
 
 /// An encoded Opus frame from the capture thread.
 #[derive(Debug)]
@@ -23,108 +27,6 @@ pub struct AudioOut {
     pub opus: Vec<u8>,
     /// RFC 6464 level (0 = loudest, 127 = silence).
     pub level: u8,
-}
-
-struct Source {
-    decoder: OpusDecoder,
-    next_idx: Option<u32>,
-    pending: BTreeMap<u32, Vec<u8>>,
-    pcm: VecDeque<Vec<i16>>,
-    primed: bool,
-}
-
-struct Mixer {
-    sources: BTreeMap<Option<u32>, Source>,
-    min_target: usize,
-    max_target: usize,
-}
-
-impl Mixer {
-    fn new(max_target: usize, min_target: usize) -> Self {
-        Self {
-            sources: BTreeMap::new(),
-            min_target,
-            max_target: max_target.max(min_target),
-        }
-    }
-
-    fn set_limits(&mut self, max_target: usize, min_target: usize) {
-        let min_target = min_target.max(2);
-        self.min_target = min_target;
-        self.max_target = max_target.max(min_target);
-    }
-
-    fn push(&mut self, idx: u32, payload: &[u8], source: Option<u32>) {
-        let max_target = self.max_target;
-        let slot = self.sources.entry(source).or_insert_with(|| Source {
-            decoder: OpusDecoder::new().expect("opus decoder"),
-            next_idx: None,
-            pending: BTreeMap::new(),
-            pcm: VecDeque::new(),
-            primed: false,
-        });
-        if slot.next_idx.is_none() {
-            slot.next_idx = Some(idx);
-        }
-        slot.pending.insert(idx, payload.to_vec());
-        while slot.pending.len() > max_target.saturating_add(4) {
-            if let Some(first) = slot.pending.keys().next().copied() {
-                slot.pending.remove(&first);
-                if slot.next_idx.is_some_and(|next| next < first) {
-                    slot.next_idx = Some(first);
-                }
-            } else {
-                break;
-            }
-        }
-        decode_ready(slot);
-        while slot.pcm.len() > max_target {
-            slot.pcm.pop_front();
-        }
-    }
-
-    fn mix(&mut self) -> Vec<i16> {
-        let mut mixed = vec![0_i32; OPUS_SAMPLES];
-        let min_target = self.min_target;
-        let mut voices = 0_i32;
-        for source in self.sources.values_mut() {
-            if !source.primed {
-                if source.pcm.len() < min_target {
-                    continue;
-                }
-                source.primed = true;
-            }
-            let Some(frame) = source.pcm.pop_front() else {
-                source.primed = false;
-                continue;
-            };
-            voices += 1;
-            for (dst, sample) in mixed.iter_mut().zip(frame.iter()) {
-                *dst += i32::from(*sample);
-            }
-        }
-        if voices == 0 {
-            return vec![0_i16; OPUS_SAMPLES];
-        }
-        mixed
-            .into_iter()
-            .map(|sample| sample.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
-            .collect()
-    }
-}
-
-fn decode_ready(slot: &mut Source) {
-    let Some(mut next) = slot.next_idx else {
-        return;
-    };
-    while let Some(packet) = slot.pending.remove(&next) {
-        let mut pcm = vec![0_i16; OPUS_SAMPLES];
-        if slot.decoder.decode(&packet, &mut pcm).is_ok() {
-            slot.pcm.push_back(pcm);
-        }
-        next = next.wrapping_add(1);
-        slot.next_idx = Some(next);
-    }
 }
 
 /// Microphone and speaker bridge used by the call window.
@@ -143,6 +45,10 @@ pub struct AudioBridge {
     live_mic_level: Arc<AtomicU8>,
     mic_source: Option<String>,
     speaker_sink: Option<String>,
+    apm: Arc<InProcessApm>,
+    proc_opts: AudioProcessingOptions,
+    user_aec: Option<bool>,
+    user_ns: Option<bool>,
     encoder_cfg: OpusEncoderConfig,
     pending_encoder: Arc<Mutex<Option<OpusEncoderConfig>>>,
     mixer: Arc<Mutex<Mixer>>,
@@ -167,6 +73,7 @@ impl AudioBridge {
     /// Builds an inactive bridge.
     #[must_use]
     pub fn new() -> Self {
+        let proc_opts = AudioProcessingOptions::default();
         Self {
             rx_out: None,
             cap_handle: None,
@@ -182,16 +89,20 @@ impl AudioBridge {
             live_mic_level: Arc::new(AtomicU8::new(127)),
             mic_source: None,
             speaker_sink: None,
+            apm: Arc::new(InProcessApm::new(proc_opts)),
+            proc_opts,
+            user_aec: None,
+            user_ns: None,
             encoder_cfg: OpusEncoderConfig::default(),
             pending_encoder: Arc::new(Mutex::new(None)),
-            mixer: Arc::new(Mutex::new(Mixer::new(10, 3))),
+            mixer: Arc::new(Mutex::new(Mixer::new(10, Some(3)))),
             jitter_min: 3,
             jitter_max: 10,
             defer_speaker: false,
         }
     }
 
-    /// Keeps the speaker closed until the first decoded frame.
+    /// Keeps the speaker closed until the first decoded frame when APM is off.
     pub fn defer_speaker(&mut self) {
         self.defer_speaker = true;
     }
@@ -208,16 +119,32 @@ impl AudioBridge {
         }
     }
 
-    /// Updates user-configured AEC and AI Noise Suppression toggles.
-    ///
-    /// Parity placeholder so `call.rs` shares the same `AudioBridge` interface
-    /// across Linux, macOS, and Windows.
-    pub fn set_audio_processing(&mut self, _aec: bool, _noise_suppression: bool) {}
+    /// Updates user-configured AEC and Noise Suppression toggles live.
+    pub fn set_audio_processing(&mut self, aec: bool, noise_suppression: bool) {
+        self.user_aec = Some(aec);
+        self.user_ns = Some(noise_suppression);
+        self.proc_opts.aec = aec && zcall_core::zrtc_helpers::echo_cancellation_requested();
+        self.proc_opts.noise_suppression =
+            noise_suppression && zcall_core::zrtc_helpers::noise_suppression_requested();
+        self.apm.apply_options(self.proc_opts);
+    }
 
-    /// Applies jitter bounds and, for group calls, the Opus bitrate.
+    /// Applies jitter bounds, WebRTC APM options, and (for group calls) Opus bitrate.
     pub fn apply_config(&mut self, group: bool, config: &Value) {
         let (min_ms, max_ms) = playout_delay_ms(config);
         self.set_jitter_ms(min_ms, max_ms);
+
+        let mut proc_opts = audio_processing_options(config);
+        if let Some(aec) = self.user_aec {
+            proc_opts.aec = aec && zcall_core::zrtc_helpers::echo_cancellation_requested();
+        }
+        if let Some(ns) = self.user_ns {
+            proc_opts.noise_suppression =
+                ns && zcall_core::zrtc_helpers::noise_suppression_requested();
+        }
+        self.proc_opts = proc_opts;
+        self.apm.apply_options(proc_opts);
+
         if !group {
             return;
         }
@@ -276,10 +203,11 @@ impl AudioBridge {
         self.cap_stop.store(false, Ordering::Release);
         self.play_stop.store(false, Ordering::Release);
         self.speaker_fault.store(false, Ordering::Release);
+        self.apm.reset(self.proc_opts);
         if let Ok(mut mixer) = self.mixer.lock() {
-            *mixer = Mixer::new(self.jitter_max, self.jitter_min);
+            *mixer = Mixer::new(self.jitter_max, Some(self.jitter_min));
         }
-        let open_now = !self.defer_speaker;
+        let open_now = self.apm.is_enabled() || !self.defer_speaker;
         {
             let (lock, cv) = &*self.speaker_wanted;
             if let Ok(mut guard) = lock.lock() {
@@ -300,6 +228,7 @@ impl AudioBridge {
     pub fn set_source(&mut self, source: Option<&str>) -> io::Result<()> {
         self.mic_source = named(source);
         if self.cap_handle.is_some() {
+            self.apm.reset(self.proc_opts);
             self.spawn_capture()?;
         }
         Ok(())
@@ -313,6 +242,7 @@ impl AudioBridge {
     pub fn set_sink(&mut self, sink: Option<&str>) -> io::Result<()> {
         self.speaker_sink = named(sink);
         if self.play_handle.is_some() {
+            self.apm.reset(self.proc_opts);
             self.spawn_playout();
         }
         Ok(())
@@ -324,9 +254,9 @@ impl AudioBridge {
     }
 
     /// Feeds one decrypted Opus packet into the jitter buffer.
-    pub fn push_audio_in(&mut self, idx: u32, opus: &[u8], source: Option<u32>, _now: f64) {
+    pub fn push_audio_in(&mut self, idx: u32, opus: &[u8], source: Option<u32>, now: f64) {
         if let Ok(mut mixer) = self.mixer.lock() {
-            mixer.push(idx, opus, source);
+            mixer.push(idx, opus, source, now);
         }
         let (lock, cv) = &*self.speaker_wanted;
         if let Ok(mut guard) = lock.lock() {
@@ -422,7 +352,7 @@ impl AudioBridge {
         self.volume_pct.load(Ordering::Relaxed)
     }
 
-    /// Same as [`Self::prepare_os_volume`].
+    /// Same as [`Self::prepare_os_volume`]. WASAPI has no `pactl` source volume.
     pub fn set_os_mic_volume(&mut self, percent: u8) {
         self.prepare_os_volume(percent);
     }
@@ -464,6 +394,7 @@ impl AudioBridge {
         let volume = Arc::clone(&self.volume_pct);
         let level = Arc::clone(&self.live_mic_level);
         let pending = Arc::clone(&self.pending_encoder);
+        let apm = Arc::clone(&self.apm);
         let initial = self.encoder_cfg;
         let handle = std::thread::Builder::new()
             .name("zcall-mic".into())
@@ -476,7 +407,7 @@ impl AudioBridge {
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
-                capture_loop(mic, tx, stop, muted, volume, level, pending, initial);
+                capture_loop(mic, tx, stop, muted, volume, level, pending, apm, initial);
             })
             .map_err(|err| io::Error::other(err.to_string()))?;
         match ready_rx.recv() {
@@ -505,6 +436,7 @@ impl AudioBridge {
         let stop = Arc::clone(&self.play_stop);
         let wanted = Arc::clone(&self.speaker_wanted);
         let mixer = Arc::clone(&self.mixer);
+        let apm = Arc::clone(&self.apm);
         let speaker_off = Arc::clone(&self.speaker_off);
         let volume = Arc::clone(&self.speaker_volume_pct);
         let fault = Arc::clone(&self.speaker_fault);
@@ -512,7 +444,7 @@ impl AudioBridge {
         let handle = std::thread::Builder::new()
             .name("zcall-play".into())
             .spawn(move || {
-                playout_loop(sink, stop, wanted, mixer, speaker_off, volume, fault);
+                playout_loop(sink, stop, wanted, mixer, apm, speaker_off, volume, fault);
             });
         self.play_handle = handle.ok();
     }
@@ -534,6 +466,7 @@ fn capture_loop(
     volume: Arc<AtomicU8>,
     level_out: Arc<AtomicU8>,
     pending: Arc<Mutex<Option<OpusEncoderConfig>>>,
+    apm: Arc<InProcessApm>,
     initial: OpusEncoderConfig,
 ) {
     let Ok(mut encoder) = OpusEncoder::new() else {
@@ -554,6 +487,9 @@ fn capture_loop(
         }
         let gain = volume.load(Ordering::Relaxed);
         apply_gain(&mut frame, gain);
+        if apm.is_enabled() {
+            frame = apm.process_capture(&frame, mic.latency_ms());
+        }
         if muted.load(Ordering::Relaxed) {
             frame.fill(0);
         }
@@ -568,11 +504,13 @@ fn capture_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn playout_loop(
     sink: Option<String>,
     stop: Arc<AtomicBool>,
     wanted: Arc<(Mutex<bool>, Condvar)>,
     mixer: Arc<Mutex<Mixer>>,
+    apm: Arc<InProcessApm>,
     speaker_off: Arc<AtomicBool>,
     volume: Arc<AtomicU8>,
     fault: Arc<AtomicBool>,
@@ -593,14 +531,22 @@ fn playout_loop(
     };
     let _ = speaker.prime_silence(4);
     while !stop.load(Ordering::Acquire) {
-        let mut frame = mixer
+        let now = monotonic_secs();
+        let frame = mixer
             .lock()
-            .map(|mut mixer| mixer.mix())
+            .map(|mut mixer| {
+                let mut pcm = mixer.mix(now);
+                if speaker_off.load(Ordering::Relaxed) {
+                    pcm.fill(0);
+                } else {
+                    apply_gain(&mut pcm, volume.load(Ordering::Relaxed));
+                }
+                mixer.note_played(&pcm, now);
+                pcm
+            })
             .unwrap_or_else(|_| vec![0_i16; OPUS_SAMPLES]);
-        if speaker_off.load(Ordering::Relaxed) {
-            frame.fill(0);
-        } else {
-            apply_gain(&mut frame, volume.load(Ordering::Relaxed));
+        if apm.is_enabled() {
+            apm.feed_render(&frame, speaker.latency_ms());
         }
         if speaker.write(&frame).is_err() {
             fault.store(true, Ordering::Release);
@@ -670,6 +616,8 @@ mod tests {
         assert!(bridge.is_muted());
         bridge.set_os_mic_volume(40);
         assert_eq!(bridge.os_volume_percent(), 40);
+        bridge.set_audio_processing(true, true);
+        assert!(bridge.apm.has_aec());
         bridge.stop();
     }
 }

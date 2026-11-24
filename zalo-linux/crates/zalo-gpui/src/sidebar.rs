@@ -153,9 +153,34 @@ impl ShellView {
                             .flex_1()
                             .min_w(px(0.))
                             .h_full()
-                            .pr(px(12.))
+                            .pr(px(if self.search_query.is_empty() { 12. } else { 4. }))
                             .child(self.search.clone()),
-                    ),
+                    )
+                    .when(!self.search_query.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id("contact-search-clear")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .size(px(22.))
+                                .mr(px(6.))
+                                .rounded(px(11.))
+                                .cursor_pointer()
+                                .text_size(px(12.))
+                                .text_color(rgb(token_rgb("--icon-secondary", "#5a6981")))
+                                .hover(|st| {
+                                    st.bg(rgb(token_rgb("--layer-background-hover", "#e5e7eb")))
+                                })
+                                .tooltip(|_, cx| tip("Xóa tìm kiếm", cx))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_sidebar_search(cx);
+                                    cx.notify();
+                                }))
+                                .child(fonts::icon_el(ic::TEXTBOX_CLEAR, "✕", 14.)),
+                        )
+                    }),
             )
             .child(
                 tool_btn("search-add", ic::ADD_CONTACT, "+", add, 32., 20., 3.).on_click(
@@ -491,7 +516,11 @@ impl ShellView {
         let Some(last) = self.messages_of(row.id).last() else {
             return (None, None, row.preview.clone());
         };
-        let prefix = if last.from_me {
+        let is_1to1_call =
+            matches!(last.kind, MsgKind::Call | MsgKind::MissedCall) && !row.is_group;
+        let prefix = if is_1to1_call {
+            None
+        } else if last.from_me {
             Some(format!("{}:", str_vi("STR_YOU", "Bạn")))
         } else if row.is_group && !last.sender.is_empty() {
             Some(format!("{}:", self.preview_sender(last)))
@@ -506,16 +535,32 @@ impl ShellView {
             MsgKind::Gif => (Some((ic::PICTURE, false)), "GIF".to_owned()),
             MsgKind::Sticker => (Some((ic::STICKER_PREVIEW, false)), "Sticker".to_owned()),
             MsgKind::File => (Some((ic::FILE, false)), last.file_name.clone()),
-            MsgKind::Call => {
-                if crate::media::is_group_call_body(&last.text) {
-                    (Some((ic::CALL_OUT, false)), "Cuộc gọi nhóm".to_owned())
+            MsgKind::Call | MsgKind::MissedCall => {
+                let group = last.file_name == "Cuộc gọi nhóm"
+                    || crate::media::is_group_call_body(&last.text);
+                let video = last.call_video
+                    || crate::media::is_video_call_text(&last.text, &last.file_name);
+                let (_title, _sub, preview, missed_red) = crate::media::call_display_texts(
+                    last.kind,
+                    last.from_me,
+                    video,
+                    group,
+                    last.call_reason,
+                    last.file_size,
+                );
+                let glyph = if group {
+                    ic::HDR_VIDEO
+                } else if video {
+                    ic::CALL_VIDEO
+                } else if missed_red {
+                    ic::CALL_MISS
                 } else if last.from_me {
-                    (Some((ic::CALL_OUT, false)), "Cuộc gọi thoại đi".to_owned())
+                    ic::CALL_OUT
                 } else {
-                    (Some((ic::CALL_IN, false)), "Cuộc gọi thoại đến".to_owned())
-                }
+                    ic::CALL_IN
+                };
+                (Some((glyph, missed_red)), preview)
             }
-            MsgKind::MissedCall => (Some((ic::CALL_MISS, true)), "Cuộc gọi nhỡ".to_owned()),
             MsgKind::Voice => (None, "Tin nhắn thoại".to_owned()),
             MsgKind::Video => (None, "Video".to_owned()),
             MsgKind::Poll => {
@@ -763,11 +808,28 @@ impl ShellView {
                                         el.child(div().flex_none().text_color(rgb(body_color)).child(p))
                                     })
                                     .when_some(icon, |el, (code, red_icon)| {
+                                        let is_call = matches!(
+                                            code,
+                                            ic::CALL_IN
+                                                | ic::CALL_OUT
+                                                | ic::CALL_MISS
+                                                | ic::CALL_VIDEO
+                                                | ic::HDR_VIDEO
+                                        );
+                                        let sz = if is_call { 13.5 } else { 16. };
                                         el.child(
                                             div()
+                                                .flex()
                                                 .flex_none()
-                                                .text_color(rgb(if red_icon { red } else { body_color }))
-                                                .child(fonts::icon_el(code, "•", 16.)),
+                                                .items_center()
+                                                .justify_center()
+                                                .when(is_call, |d| d.mt(px(2.)))
+                                                .text_color(rgb(if red_icon {
+                                                    red
+                                                } else {
+                                                    body_color
+                                                }))
+                                                .child(fonts::icon_el(code, "•", sz)),
                                         )
                                     })
                                     .child(

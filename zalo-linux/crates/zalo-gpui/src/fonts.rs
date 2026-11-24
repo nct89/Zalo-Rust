@@ -76,6 +76,18 @@ pub const FA_CHECK: char = '\u{F00C}';
 /// `fa-solid fa-arrow-up-right-from-square` (U+F08E).
 #[allow(dead_code)]
 pub const FA_EXTERNAL_LINK: char = '\u{F08E}';
+/// `fa-solid fa-star` (U+F005).
+#[allow(dead_code)]
+pub const FA_STAR: char = '\u{F005}';
+/// `fa-solid fa-lightbulb` (U+F0EB).
+#[allow(dead_code)]
+pub const FA_LIGHTBULB: char = '\u{F0EB}';
+/// `fa-solid fa-angles-down` (U+F103).
+#[allow(dead_code)]
+pub const FA_ANGLES_DOWN: char = '\u{F103}';
+/// `fa-solid fa-chevron-down` (U+F078).
+#[allow(dead_code)]
+pub const FA_CHEVRON_DOWN: char = '\u{F078}';
 
 /// Render a Font Awesome 6 Free Solid glyph (weight 900) with a Unicode fallback.
 pub fn fa_icon(glyph: char, fallback: &'static str, size_px: f32, color: u32) -> impl IntoElement {
@@ -88,7 +100,7 @@ pub fn fa_icon(glyph: char, fallback: &'static str, size_px: f32, color: u32) ->
         .line_height(px(size_px))
         .text_color(gpui::rgb(color))
         .when(loaded, |el| {
-            el.font_family(FAMILY_AWESOME)
+            el.font_family(awesome_family())
                 .font_weight(gpui::FontWeight::BLACK)
         })
         .child(if loaded {
@@ -108,7 +120,19 @@ const BUNDLED_FONTS: &str = concat!(
 
 static ICON_OK: AtomicBool = AtomicBool::new(false);
 static AWESOME_OK: AtomicBool = AtomicBool::new(false);
+static AWESOME_FAMILY: OnceLock<String> = OnceLock::new();
 static REPORT: OnceLock<FontReport> = OnceLock::new();
+
+/// Actual registered family name for Font Awesome 6 Solid on this OS.
+/// Linux registers `"Font Awesome 6 Free"` (name ID 16) while Windows
+/// DirectWrite registers `"Font Awesome 6 Free Solid"` (name ID 1).
+#[must_use]
+pub fn awesome_family() -> &'static str {
+    AWESOME_FAMILY
+        .get()
+        .map(String::as_str)
+        .unwrap_or(FAMILY_AWESOME)
+}
 
 /// Which faces were found on disk and handed to GPUI.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -241,6 +265,13 @@ pub fn install(cx: &App) -> FontReport {
             .filter(|name| name.to_ascii_lowercase().contains("awesome"))
             .cloned()
             .collect();
+        if let Some(picked) = awesome
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(FAMILY_AWESOME))
+            .or_else(|| awesome.first())
+        {
+            let _ = AWESOME_FAMILY.set(picked.clone());
+        }
         eprintln!("zalo-gpui font-awesome: {}", awesome.join(" "));
     }
     let _ = REPORT.set(found);
@@ -730,6 +761,16 @@ pub mod ic {
     pub const TB_SHOT_PLAIN: char = '\u{ED10}';
     /// `fa-Chevron_Down_24_Filled` — composer screenshot mode.
     pub const TB_CHEVRON: char = '\u{EA8B}';
+    /// `Chevron_Double_Down_32_Line` — official Zalo scroll-to-bottom double chevron.
+    pub const CHEVRON_DOUBLE_DOWN: char = '\u{EA89}';
+    /// `chevron-left` — official Zalo horizontal scroll left arrow.
+    pub const CHEVRON_LEFT: char = '\u{EA94}';
+    /// `chevron-right` — official Zalo horizontal scroll right arrow.
+    pub const CHEVRON_RIGHT: char = '\u{EA95}';
+    /// `Close_24_Line` — official Zalo crisp line close icon.
+    pub const CLOSE_LINE: char = '\u{EA9F}';
+    /// `textbox-icon-clear` — official Zalo search/input clear circle icon.
+    pub const TEXTBOX_CLEAR: char = '\u{EDA7}';
     /// `fa-TextFormat_24_Line` — composer text format.
     pub const TB_FORMAT: char = '\u{EDAB}';
     /// `fa-Quick-msg` — composer quick message.
@@ -754,6 +795,8 @@ pub mod ic {
     pub const CALL_IN: char = '\u{EA56}';
     /// `fa-chat_bubble_icon_misscall` — preview missed call.
     pub const CALL_MISS: char = '\u{EA58}';
+    /// `fa-chat-call-menu-video-16` — video call camcorder icon for bubbles & previews.
+    pub const CALL_VIDEO: char = '\u{EA5A}';
     /// `fa-File_24_Line` — preview file.
     pub const FILE: char = '\u{EB1B}';
     /// `fa-icon-outline-sticker` — preview sticker.

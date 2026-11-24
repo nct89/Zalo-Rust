@@ -2129,6 +2129,8 @@ impl CallView {
         };
         let blue = div()
             .id("incoming")
+            .window_control_area(gpui::WindowControlArea::Drag)
+            .occlude()
             .size_full()
             .relative()
             .rounded(px(zalo_design::WINDOW_RADIUS))
@@ -2145,7 +2147,9 @@ impl CallView {
                 blur_radius: shadow / 2.,
                 spread_radius: px(0.),
             }])
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+            .when(!cfg!(target_os = "windows"), |el| {
+                el.on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())
+            })
             .child(
                 div()
                     .id("incoming-close")
@@ -4633,49 +4637,61 @@ fn worker(
                         by_src.entry(frame.src).or_default().push(frame);
                     }
                     for (src, mut frames) in by_src {
-                        if frames.len() > 3 {
+                        if frames.len() > 1 {
                             if let Some(from) = frames.iter().rposition(|frame| frame.key) {
                                 frames.drain(..from);
-                            } else {
-                                frames.clear();
-                                if src != 0 || !group {
-                                    let _ = need_key_tx.send(src);
+                            }
+                        }
+                        if frames.is_empty() {
+                            continue;
+                        }
+                        // Decode earlier queued deltas in decode-only mode so
+                        // H.264 reference state stays intact without triggering
+                        // a PLI freeze or paying YUV→BGRA conversion on dropped
+                        // frames; only convert and publish the latest frame.
+                        let last = frames.pop().expect("non-empty batch");
+                        let mut need_key_sent = false;
+                        for frame in &frames {
+                            if let Some(need_src) = remote.push_decode_only(frame) {
+                                if !need_key_sent && (src != 0 || !group) {
+                                    let _ = need_key_tx.send(need_src);
+                                    need_key_sent = true;
                                 }
                             }
                         }
-                        for frame in frames {
-                            match remote.push(&frame) {
-                                Some(crate::call_video::Shown::Picture { src, picture }) => {
-                                    let size = (src, picture.w, picture.h);
-                                    if !noted_remote {
-                                        eprintln!(
-                                            "zalo-gpui call: remote video {}x{} from {src}",
-                                            picture.w, picture.h
-                                        );
-                                        noted_remote = true;
-                                    }
-                                    if verbose && video_size != Some(size) {
-                                        eprintln!(
-                                            "zalo-gpui call: video {}x{} from {src}",
-                                            picture.w, picture.h
-                                        );
-                                        video_size = Some(size);
-                                    }
-                                    shown.insert(src, picture);
-                                    let pictures: Vec<_> = shown
-                                        .iter()
-                                        .map(|(&id, pic)| (id, pic.clone()))
-                                        .collect();
-                                    set(&shared, |s| {
-                                        s.pictures = pictures;
-                                        s.picture_gen = s.picture_gen.saturating_add(1);
-                                    });
+                        match remote.push(&last) {
+                            Some(crate::call_video::Shown::Picture { src, picture }) => {
+                                let size = (src, picture.w, picture.h);
+                                if !noted_remote {
+                                    eprintln!(
+                                        "zalo-gpui call: remote video {}x{} from {src}",
+                                        picture.w, picture.h
+                                    );
+                                    noted_remote = true;
                                 }
-                                Some(crate::call_video::Shown::NeedKey(src)) => {
-                                    let _ = need_key_tx.send(src);
+                                if verbose && video_size != Some(size) {
+                                    eprintln!(
+                                        "zalo-gpui call: video {}x{} from {src}",
+                                        picture.w, picture.h
+                                    );
+                                    video_size = Some(size);
                                 }
-                                None => {}
+                                shown.insert(src, picture);
+                                let pictures: Vec<_> = shown
+                                    .iter()
+                                    .map(|(&id, pic)| (id, pic.clone()))
+                                    .collect();
+                                set(&shared, |s| {
+                                    s.pictures = pictures;
+                                    s.picture_gen = s.picture_gen.saturating_add(1);
+                                });
                             }
+                            Some(crate::call_video::Shown::NeedKey(need_src)) => {
+                                if !need_key_sent {
+                                    let _ = need_key_tx.send(need_src);
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }

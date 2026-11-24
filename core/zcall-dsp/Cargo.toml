@@ -1,0 +1,16 @@
+[package]
+name = "zcall-dsp"
+description = "Cross-platform pure-Rust audio DSP for Zalo calls (WebRTC APM, FIR resampler, jitter buffer, WSOLA, mixer)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nnnoiseless = "0.5"
+sonora = "0.3"
+zcall-core = { workspace = true }

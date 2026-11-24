@@ -29,10 +29,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Maximum video UDP packets sent in one burst (`zrtc-media.js` `VIDEO_BURST`).
-/// A larger frame, including a group camera keyframe, is queued and drained
-/// by the UDP tick. A single burst of a big picture is dropped by the SFU.
-const VIDEO_BURST: usize = 8;
+/// Maximum video UDP packets sent in one initial burst (`zrtc-media.js` `VIDEO_BURST`).
+/// Kept compact (5 packets ≈ 5.5 KB) so large 720p keyframes never flood home
+/// Wi-Fi / SFU ingress queues; the remainder drains via the token-bucket pacer.
+const VIDEO_BURST: usize = 5;
+/// Minimum video pacing rate (bps) so keyframes still clear promptly on low rungs.
+const PACE_MIN_BPS: f64 = 800_000.0;
+/// Token-bucket burst cap (bytes) for paced video packet drainage (~5 RTP packets).
+const PACE_BURST_BYTES: f64 = 5_600.0;
 
 /// Electron `vSeq` / `vTsBase`: a non-zero clock, not a stream that starts at 0.
 fn fresh_video_clock() -> (u16, u32) {
@@ -299,6 +303,10 @@ pub struct MediaSession {
     group_sfu: SfuLayer,
     /// Paced video packets waiting to drain in `VIDEO_BURST` batches.
     v_out: VecDeque<(Vec<u8>, Server, &'static str)>,
+    /// Token-bucket byte budget for smooth UDP video pacing.
+    video_pace_tokens: f64,
+    /// Last monotonic timestamp (ms) when `video_pace_tokens` was refilled.
+    video_pace_last_ms: u64,
     /// Separate UDP sender for group `ShareScreenPeer` (`uid = shareScreenId`).
     share_send_hook: Option<SendHook>,
     /// Server token issued to the group `ShareScreenPeer` on its own `InitZRTP`.
@@ -487,6 +495,8 @@ impl MediaSession {
                 long: false,
             },
             v_out: VecDeque::new(),
+            video_pace_tokens: PACE_BURST_BYTES,
+            video_pace_last_ms: 0,
             share_send_hook: None,
             share_token: 0,
             share_init_tries: 0,
@@ -670,6 +680,49 @@ impl MediaSession {
             };
             self.send(&packet, &server, label);
             count += 1;
+        }
+        !self.v_out.is_empty()
+    }
+
+    /// Drains queued video packets smoothly using a token-bucket pacer sized to
+    /// `1.6x` the current target bitrate (floor 800 kbps), preventing large 720p
+    /// keyframes from creating multi-megabit UDP bursts that drop tail packets.
+    pub fn drain_video_queue_paced(&mut self, now_ms: u64, max_packets: usize) -> bool {
+        if self.v_out.is_empty() {
+            self.video_pace_last_ms = now_ms;
+            self.video_pace_tokens = PACE_BURST_BYTES;
+            return false;
+        }
+        if max_packets == 0 {
+            return true;
+        }
+        let target_bps = f64::from(self.current_video_profile().bitrate) * 1.6;
+        let pace_bytes_per_ms = target_bps.max(PACE_MIN_BPS) / 8_000.0;
+        let dt_ms = if self.video_pace_last_ms == 0 {
+            5
+        } else {
+            now_ms.saturating_sub(self.video_pace_last_ms).min(100)
+        };
+        self.video_pace_last_ms = now_ms;
+        self.video_pace_tokens =
+            (self.video_pace_tokens + dt_ms as f64 * pace_bytes_per_ms).min(PACE_BURST_BYTES);
+        // Never allow queue backlog to grow beyond ~100 ms of stale packets.
+        if self.v_out.len() > 80 {
+            self.video_pace_tokens = PACE_BURST_BYTES;
+        }
+        let mut count = 0usize;
+        while count < max_packets {
+            let Some(next_len) = self.v_out.front().map(|(pkt, _, _)| pkt.len() as f64) else {
+                break;
+            };
+            if self.video_pace_tokens < next_len {
+                break;
+            }
+            if let Some((packet, server, label)) = self.v_out.pop_front() {
+                self.video_pace_tokens = (self.video_pace_tokens - next_len).max(0.0);
+                self.send(&packet, &server, label);
+                count += 1;
+            }
         }
         !self.v_out.is_empty()
     }
@@ -1636,7 +1689,6 @@ impl MediaSession {
         if parsed.is_media && parsed.msg_type == MsgType::VIDEO_DOWN {
             self.on_video_packet(&parsed.payload);
         } else if parsed.is_media && parsed.msg_type == MsgType::AUDIO_RTP_DOWN {
-            self.rtcp.on_rtp(false, &parsed.payload, now_ms());
             self.on_audio(&parsed.payload);
         } else if parsed.msg_type == MsgType::AUDIO_FEC || parsed.msg_type == MsgType::AUDIO_RTCP {
             self.rtcp.on_rtcp(false, &parsed.payload, now_ms());
@@ -1726,7 +1778,6 @@ impl MediaSession {
             self.send(&pkt, &dst, "P2P");
         }
         for rtp in audio {
-            self.rtcp.on_rtp(false, &rtp, now_ms());
             self.on_audio(&rtp);
         }
         for rtp in video {
@@ -2101,6 +2152,7 @@ impl MediaSession {
             return;
         };
         let rtp = &rtp[offset..];
+        self.rtcp.on_rtp(false, rtp, now_ms());
         let Some(header) = parse_rtp(rtp) else {
             return;
         };

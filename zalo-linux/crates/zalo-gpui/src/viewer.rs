@@ -227,6 +227,18 @@ impl ShellView {
         {
             cx.stop_propagation();
             cx.notify();
+        } else if e.keystroke.key.eq_ignore_ascii_case("c")
+            && (mods.control || mods.platform)
+            && !mods.alt
+            && !self.locked
+            && self.viewer.is_none()
+        {
+            if let Some(selected) = self.selected_chat_text() {
+                crate::clip::copy_text(cx, selected);
+                self.set_note(crate::color::str_vi("STR_COPY_0", "Sao chép"));
+                cx.stop_propagation();
+                cx.notify();
+            }
         } else if e.keystroke.key == "l" && mods.control && !self.locked {
             self.lock_now(window, cx);
             cx.stop_propagation();
@@ -423,6 +435,23 @@ impl ShellView {
                             .overflow_hidden()
                             .when(can_pan && !dragging, |el| el.cursor(CursorStyle::OpenHand))
                             .when(dragging, |el| el.cursor(CursorStyle::ClosedHand))
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener({
+                                    let right_msg = msg.clone();
+                                    move |this, e: &gpui::MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_menu(
+                                            crate::context_menu::MenuKind::Message(
+                                                right_msg.clone(),
+                                            ),
+                                            e.position,
+                                            window,
+                                        );
+                                        cx.notify();
+                                    }
+                                }),
+                            )
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {

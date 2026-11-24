@@ -19,15 +19,16 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use zcall_audio::apm::InProcessApm;
+use zcall_audio::apm::{InProcessApm, APM_NATIVE_RATE, APM_SAMPLE_RATE};
 use zcall_audio::capture::{
     live_mic_command, live_speaker_command, CardMic, CardSpeaker, MicCapture, Speaker,
-    CARD_LATENCY_MS, CARD_MIC_LATENCY_MS, FRAME_BYTES,
+    CARD_LATENCY_MS, CARD_MIC_LATENCY_MS, FRAME_BYTES, NATIVE_RATE,
 };
 use zcall_audio::mixer::Mixer;
 use zcall_audio::pipeline::AudioPipeline;
 use zcall_audio::processing::AudioProcessing;
 use zcall_audio::wsola::FRAME_SAMPLES;
+use zcall_dsp::resampler::PolyphaseResampler;
 use zcall_core::audio::OpusEncoderConfig;
 use zcall_core::clip_guard::{db_to_raw, percent_to_raw, ClipGuard, StepKind};
 use zcall_core::zrtc_helpers::{
@@ -101,6 +102,10 @@ pub struct AudioBridge {
     volume_pct: Arc<AtomicU8>,
     /// Pulse source level, 0..=100, written with `pactl`. 100 is 0 dB.
     os_volume_pct: u8,
+    /// True only when the user/settings explicitly requested a non-default OS
+    /// mic level. Leaves the user's Pulse/PipeWire gain untouched on call start
+    /// so we never blast a sensitive USB/laptop mic to 100% and clip its ADC.
+    os_volume_explicit: bool,
     /// The user moved the slider. The capture thread tells ClipGuard to stop.
     clip_manual: Arc<AtomicBool>,
     /// Latest `pactl` request. An older write bails out.
@@ -187,13 +192,14 @@ impl AudioBridge {
             muted: Arc::new(AtomicBool::new(false)),
             volume_pct: Arc::new(AtomicU8::new(100)),
             os_volume_pct: 100,
+            os_volume_explicit: false,
             clip_manual: Arc::new(AtomicBool::new(false)),
             vol_gen: Arc::new(AtomicU64::new(0)),
             mic_device: None,
             mic_source: None,
             speaker_sink: None,
             processing: None,
-            apm: Arc::new(InProcessApm::new(proc_opts)),
+            apm: Arc::new(InProcessApm::with_sample_rate(APM_NATIVE_RATE, proc_opts)),
             use_in_process_apm: Arc::new(AtomicBool::new(!legacy_pw)),
             proc_opts,
             user_aec: None,
@@ -337,9 +343,11 @@ impl AudioBridge {
         self.mic_source = named(mic_source);
         self.speaker_sink = named(speaker_sink);
         self.high_pass = high_pass;
-        // Before parec. A source left at the clip-guard floor (−24 dB) stays
-        // quiet for the whole call if the guard snapshots that level first.
-        self.write_os_volume(true);
+        // Respect the user's existing OS mic level unless a saved slider level
+        // (< 100%) was explicitly requested; ClipGuard protects against ADC clip.
+        if self.os_volume_explicit {
+            self.write_os_volume(true);
+        }
         self.far_heard.store(false, Ordering::Relaxed);
         self.speaker_fault.store(false, Ordering::Relaxed);
         {
@@ -480,7 +488,9 @@ impl AudioBridge {
                 self.apm.reset(self.proc_opts);
             }
             self.open_capture()?;
-            self.write_os_volume(true);
+            if self.os_volume_explicit {
+                self.write_os_volume(true);
+            }
             Ok(())
         } else {
             Ok(())
@@ -538,20 +548,32 @@ impl AudioBridge {
                 self.sync_effective_sink();
             }
         }
-        // Prefer in-process `CardMic` (`libpulse-simple`) on the sound-card
-        // clock so capture latency is measured directly for WebRTC AEC3 and
-        // no external `parec` subprocess/pipe is spawned. Fall back to
-        // `MicCapture` (`parec` / `pw-record` / `arecord`) if unavailable.
+        // Prefer in-process `CardMic` (`libpulse-simple`) at PipeWire's native
+        // 48 kHz rate so no daemon resampling or quantum beat distortion occurs,
+        // and capture latency is measured directly for WebRTC AEC3. Fall back
+        // to 16 kHz `CardMic` or `MicCapture` (`parec`/`pw-record`/`arecord`).
         let mut card_mic: Option<CardMic> = None;
         if self.mic_device.is_none() && pulse {
-            match CardMic::open(cap_source.as_deref()).or_else(|err| {
+            let open_48k = CardMic::open_48k(cap_source.as_deref()).or_else(|err| {
                 if cap_source.is_some() {
-                    eprintln!("zcall-mic: explicit source failed ({err}); retrying default");
-                    CardMic::open(None)
+                    eprintln!("zcall-mic: explicit 48k source failed ({err}); retrying default");
+                    CardMic::open_48k(None)
                 } else {
                     Err(err)
                 }
-            }) {
+            });
+            let opened = open_48k.or_else(|err_48k| {
+                eprintln!("zcall-mic: 48 kHz capture unavailable ({err_48k}); retrying 16 kHz");
+                CardMic::open(cap_source.as_deref()).or_else(|err| {
+                    if cap_source.is_some() {
+                        eprintln!("zcall-mic: explicit 16k source failed ({err}); retrying default");
+                        CardMic::open(None)
+                    } else {
+                        Err(err)
+                    }
+                })
+            });
+            match opened {
                 Ok(cm) => card_mic = Some(cm),
                 Err(err) => {
                     static NOTED: AtomicBool = AtomicBool::new(false);
@@ -561,6 +583,9 @@ impl AudioBridge {
                 }
             }
         }
+        let cap_rate = card_mic
+            .as_ref()
+            .map_or(APM_SAMPLE_RATE, CardMic::sample_rate);
         let mut proc_mic: Option<MicCapture> = None;
         let mut proc_stdout: Option<std::process::ChildStdout> = None;
         if card_mic.is_none() {
@@ -582,14 +607,16 @@ impl AudioBridge {
         let bt_capture = Arc::clone(&self.bt_capture_active);
         let live_mic_level = Arc::clone(&self.live_mic_level);
         let force_aec = std::env::var("ZCALL_AEC").ok().as_deref() == Some("1");
+        let clip_guard_enabled = std::env::var("ZCALL_CLIP_GUARD").ok().as_deref() != Some("0");
         let high_pass = self.high_pass;
         let enc_cfg = self.encoder_cfg;
         let pending_enc = Arc::clone(&self.pending_encoder);
         let source = volume_source(self.mic_source.as_deref());
         let clip_manual = Arc::clone(&self.clip_manual);
         let (tx_out, rx_out) = mpsc::channel::<AudioOut>();
-        // Opus complexity 10 + APM run off the reader thread so capture never
-        // stalls on the audio daemon.
+        // Opus complexity 10 + 48 kHz APM run off the reader thread so capture
+        // never stalls on the audio daemon.
+        const MIC_QUEUE_CAP: usize = 8;
         let pcm_queue = Arc::new(Mutex::new(VecDeque::<(Vec<i16>, u32)>::new()));
         let pcm_ready = Arc::new(Condvar::new());
         let reader_stop = Arc::clone(&stop);
@@ -600,6 +627,7 @@ impl AudioBridge {
         let reader = std::thread::Builder::new()
             .name("zcall-mic-read".into())
             .spawn(move || {
+                let mut dropped: u64 = 0;
                 if let Some(cm) = card_mic {
                     let mut latency_tick = 0_u32;
                     let mut cap_lat = CARD_MIC_LATENCY_MS;
@@ -607,13 +635,17 @@ impl AudioBridge {
                         let Ok(frame) = cm.read_frame() else {
                             break;
                         };
-                        if latency_tick % 25 == 0 {
+                        if latency_tick % 5 == 0 {
                             cap_lat = cm.latency_ms();
                         }
                         latency_tick = latency_tick.wrapping_add(1);
                         let mut q = reader_queue.lock().unwrap_or_else(|err| err.into_inner());
-                        if q.len() == 5 {
+                        if q.len() >= MIC_QUEUE_CAP {
                             q.pop_front();
+                            dropped += 1;
+                            if dropped == 1 || dropped % 50 == 0 {
+                                eprintln!("zcall-mic-read: capture queue overflow (dropped={dropped})");
+                            }
                         }
                         q.push_back((frame, cap_lat));
                         reader_ready.notify_one();
@@ -624,10 +656,14 @@ impl AudioBridge {
                             break;
                         };
                         let mut q = reader_queue.lock().unwrap_or_else(|err| err.into_inner());
-                        // Keep the newest 100 ms. Dropping the oldest frame loses
+                        // Keep the newest 160 ms. Dropping the oldest frame loses
                         // 20 ms; blocking here lets PipeWire tear the byte stream.
-                        if q.len() == 5 {
+                        if q.len() >= MIC_QUEUE_CAP {
                             q.pop_front();
+                            dropped += 1;
+                            if dropped == 1 || dropped % 50 == 0 {
+                                eprintln!("zcall-mic-read: capture pipe queue overflow (dropped={dropped})");
+                            }
                         }
                         q.push_back((zcall_audio::bytes_to_i16(&frame), CARD_MIC_LATENCY_MS));
                         reader_ready.notify_one();
@@ -646,6 +682,8 @@ impl AudioBridge {
                         return;
                     }
                 };
+                let mut down_48_to_16 = PolyphaseResampler::new(APM_NATIVE_RATE, APM_SAMPLE_RATE);
+                let mut up_16_to_48 = PolyphaseResampler::new(APM_SAMPLE_RATE, APM_NATIVE_RATE);
                 let clip_busy = Arc::new(AtomicBool::new(false));
                 let mut manual_on = false;
                 'run: loop {
@@ -695,17 +733,36 @@ impl AudioBridge {
                     let allow_aec = !bt_capture.load(Ordering::Acquire) || force_aec;
                     let run_apm = use_in_process_apm.load(Ordering::Acquire) && apm.is_enabled();
                     let encoded = if run_apm {
-                        // Keep WebRTC AEC3 converged even while muted, matching
-                        // Windows `ZaloCall.exe`, and keep RNNoise active even
-                        // when Bluetooth HFP bypasses software AEC3.
-                        let cleaned = apm.process_capture_with_aec(&scaled, cap_lat, allow_aec);
-                        if apm.has_gain_control() {
-                            pipeline.process_apm_frame(&cleaned, is_muted)
+                        // Run WebRTC AEC3 + NS + AGC2 natively at 48 kHz (even
+                        // while muted so AEC stays converged), then decimate to
+                        // 16 kHz for Opus via linear-phase polyphase FIR.
+                        let apm_in = if cap_rate == apm.sample_rate() {
+                            scaled
+                        } else if cap_rate == APM_SAMPLE_RATE && apm.sample_rate() == APM_NATIVE_RATE
+                        {
+                            up_16_to_48.process_i16(&scaled)
                         } else {
-                            pipeline.process_mic_frame(&raw, &cleaned, is_muted, heard, now)
+                            scaled
+                        };
+                        let cleaned = apm.process_capture_with_aec(&apm_in, cap_lat, allow_aec);
+                        let cleaned_16k = if apm.sample_rate() == APM_NATIVE_RATE {
+                            down_48_to_16.process_i16(&cleaned)
+                        } else {
+                            cleaned
+                        };
+                        if apm.has_gain_control() {
+                            pipeline.feed_clip_guard(&raw, is_muted, now);
+                            pipeline.process_apm_frame(&cleaned_16k, is_muted)
+                        } else {
+                            pipeline.process_mic_frame(&raw, &cleaned_16k, is_muted, heard, now)
                         }
                     } else {
-                        pipeline.process_mic_frame(&raw, &scaled, is_muted, heard, now)
+                        let pcm_16k = if cap_rate == APM_NATIVE_RATE {
+                            down_48_to_16.process_i16(&scaled)
+                        } else {
+                            scaled
+                        };
+                        pipeline.process_mic_frame(&raw, &pcm_16k, is_muted, heard, now)
                     };
                     if let Some((opus, tx_pcm)) = encoded {
                         let level = audio_level(&tx_pcm);
@@ -714,7 +771,7 @@ impl AudioBridge {
                             break 'run;
                         }
                     }
-                    if std::env::var("ZCALL_CLIP_GUARD").ok().as_deref() == Some("1") {
+                    if clip_guard_enabled {
                         if let Some(kind) = pipeline.take_clip_step() {
                             request_volume_step(&pipeline.clip_guard(), &clip_busy, &source, kind);
                         }
@@ -870,6 +927,7 @@ impl AudioBridge {
     /// Does not mark the slider as manual, so ClipGuard can still step.
     pub fn prepare_os_volume(&mut self, percent: u8) {
         self.os_volume_pct = percent.min(100);
+        self.os_volume_explicit = self.os_volume_pct < 100;
     }
 
     /// The Pulse level last requested, 0..=100.
@@ -882,6 +940,7 @@ impl AudioBridge {
     /// Digital `volume_pct` stays at 100. A second scale would square the cut.
     pub fn set_os_mic_volume(&mut self, percent: u8) {
         self.os_volume_pct = percent.min(100);
+        self.os_volume_explicit = true;
         self.clip_manual.store(true, Ordering::Relaxed);
         self.write_os_volume(false);
     }
@@ -1028,6 +1087,13 @@ impl PlayDevice {
         matches!(self, Self::Card(_))
     }
 
+    fn sample_rate(&self) -> u32 {
+        match self {
+            Self::Card(card) => card.sample_rate(),
+            Self::Pipe(_) => APM_SAMPLE_RATE,
+        }
+    }
+
     fn latency_ms(&self) -> u32 {
         match self {
             Self::Card(card) => card.latency_ms(),
@@ -1051,14 +1117,26 @@ impl PlayDevice {
 
 fn open_and_prime_speaker(sink: Option<&str>) -> io::Result<PlayDevice> {
     if std::env::var_os("ZCALL_NO_PULSE").is_none() {
-        match CardSpeaker::open(sink).or_else(|err| {
+        let open_48k = CardSpeaker::open_48k(sink).or_else(|err| {
             if sink.is_some() {
-                eprintln!("zcall-play: explicit sink failed ({err}); retrying default");
-                CardSpeaker::open(None)
+                eprintln!("zcall-play: explicit 48k sink failed ({err}); retrying default");
+                CardSpeaker::open_48k(None)
             } else {
                 Err(err)
             }
-        }) {
+        });
+        let opened = open_48k.or_else(|err_48k| {
+            eprintln!("zcall-play: 48 kHz speaker unavailable ({err_48k}); retrying 16 kHz");
+            CardSpeaker::open(sink).or_else(|err| {
+                if sink.is_some() {
+                    eprintln!("zcall-play: explicit 16k sink failed ({err}); retrying default");
+                    CardSpeaker::open(None)
+                } else {
+                    Err(err)
+                }
+            })
+        });
+        match opened {
             Ok(card) => {
                 card.prime_silence(CARD_PRIME_FRAMES)?;
                 return Ok(PlayDevice::Card(card));
@@ -1103,6 +1181,7 @@ fn run_playout_loop(shared: PlayoutShared, ready: mpsc::SyncSender<io::Result<()
     let mut next = Instant::now() + PLAYOUT_FRAME;
     let mut play_lat = CARD_LATENCY_MS;
     let mut lat_tick = 0_u32;
+    let mut up_16_to_48 = PolyphaseResampler::new(APM_SAMPLE_RATE, APM_NATIVE_RATE);
     while !shared.stop.load(Ordering::Acquire) {
         if !shared.wanted.load(Ordering::Acquire) {
             std::thread::park_timeout(Duration::from_millis(50));
@@ -1188,14 +1267,27 @@ fn run_playout_loop(shared: PlayoutShared, ready: mpsc::SyncSender<io::Result<()
             play
         };
         if let Some(sp) = speaker.as_mut() {
-            if shared.use_in_process_apm.load(Ordering::Acquire) {
-                if lat_tick % 25 == 0 {
+            let use_apm = shared.use_in_process_apm.load(Ordering::Acquire);
+            let need_48k = sp.sample_rate() == NATIVE_RATE
+                || (use_apm && shared.apm.sample_rate() == APM_NATIVE_RATE);
+            let play_48k = need_48k.then(|| up_16_to_48.process_i16(&play));
+            if use_apm {
+                if lat_tick % 5 == 0 {
                     play_lat = sp.latency_ms();
                 }
                 lat_tick = lat_tick.wrapping_add(1);
-                shared.apm.feed_render(&play, play_lat);
+                if let Some(ref pcm48) = play_48k {
+                    shared.apm.feed_render(pcm48, play_lat);
+                } else {
+                    shared.apm.feed_render(&play, play_lat);
+                }
             }
-            if sp.write(&play).is_err() {
+            let write_pcm = if sp.sample_rate() == NATIVE_RATE {
+                play_48k.as_deref().unwrap_or(&play)
+            } else {
+                &play
+            };
+            if sp.write(write_pcm).is_err() {
                 shared.fault.store(true, Ordering::Release);
                 sp.close();
                 return;

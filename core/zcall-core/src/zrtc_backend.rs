@@ -686,13 +686,13 @@ pub fn poll_and_tick(
         }
         return;
     }
-    if let Some(driver) = backend.driver.as_mut() {
-        driver.media.send_fwd8_if_due();
-        let _ = driver.media.drain_video_queue(16);
-        driver.media.tick_share();
-    }
     let now = Instant::now();
     let now_ms = now.duration_since(backend.started_at).as_millis() as u64;
+    if let Some(driver) = backend.driver.as_mut() {
+        driver.media.send_fwd8_if_due();
+        let _ = driver.media.drain_video_queue_paced(now_ms, 8);
+        driver.media.tick_share();
+    }
 
     // RTCP: transport-cc every 50 ms, SR/RR every second.
     let reports = now.duration_since(*last_report) >= Duration::from_millis(REPORT_INTERVAL_MS);

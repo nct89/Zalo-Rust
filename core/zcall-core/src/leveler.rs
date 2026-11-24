@@ -82,6 +82,7 @@ pub struct MicLeveler {
     /// The learned noise floor in dBFS.
     pub noise_db: f64,
     gain_prev: f64,
+    lim_gain: f64,
     levels: VecDeque<f64>,
     learned: bool,
     n: u64,
@@ -95,6 +96,9 @@ const MAX_GAIN_DB: f64 = 9.0;
 /// Peak after gain, official `agcTargetLevel` 3 (−3 dBFS). A 0 dBFS clamp
 /// is already the onset of harsh clipping.
 const LIMIT_PEAK: f64 = 23_170.0;
+/// Smooth per-sample limiter attack (~1 ms at 16 kHz) and release (~50 ms at 16 kHz).
+const LIM_ATTACK_ALPHA: f64 = 0.06;
+const LIM_RELEASE_ALPHA: f64 = 0.00125;
 const SPEECH_OVER_NOISE_DB: f64 = 9.0;
 const HIGH_PASS_HZ: f64 = 100.0;
 const SILENCE_DB: f64 = -90.0;
@@ -116,6 +120,7 @@ impl MicLeveler {
             applied_db: 0.0,
             noise_db: -70.0,
             gain_prev: 1.0,
+            lim_gain: 1.0,
             levels: VecDeque::new(),
             learned: false,
             n: 0,
@@ -131,6 +136,7 @@ impl MicLeveler {
         self.gain_db = 0.0;
         self.applied_db = 0.0;
         self.gain_prev = 1.0;
+        self.lim_gain = 1.0;
         if self.hp.is_some() {
             self.hp = Some(HighPass::new(HIGH_PASS_HZ, 16_000.0));
         }
@@ -199,23 +205,29 @@ impl MicLeveler {
         // 0 dB. Skipping that left a hot vowel at 0 dBFS, which is already
         // the harsh edge the far end hears as crackle on top of the voice.
         let n = samples.len();
-        let step = (gain - gain0) / n as f64;
-        let mut shaped = vec![0_f64; n];
-        let mut peak = 0_f64;
+        let step = (gain - gain0) / n.max(1) as f64;
+        let mut out = Vec::with_capacity(n);
         for (i, &value) in samples.iter().enumerate() {
             let x = f64::from(value) * (gain0 + step * (i as f64 + 1.0));
-            shaped[i] = x;
-            peak = peak.max(x.abs());
+            let abs_x = x.abs();
+            let target_lim = if abs_x > LIMIT_PEAK {
+                LIMIT_PEAK / abs_x
+            } else {
+                1.0
+            };
+            // Smooth per-sample envelope limiter: fast attack prevents clipping
+            // while slow release eliminates 20 ms frame-boundary step clicks.
+            if target_lim < self.lim_gain {
+                self.lim_gain += (target_lim - self.lim_gain) * LIM_ATTACK_ALPHA;
+                if self.lim_gain * abs_x > LIMIT_PEAK {
+                    self.lim_gain = LIMIT_PEAK / abs_x;
+                }
+            } else {
+                self.lim_gain += (target_lim - self.lim_gain) * LIM_RELEASE_ALPHA;
+            }
+            out.push(clamp_i16(x * self.lim_gain));
         }
-        // Keep the waveform. Scaling the whole frame down to −3 dBFS holds the
-        // shape; clamping each hot sample first turned the vowel into a square
-        // wave (the crackle with no voice left in it).
-        let scale = if peak > LIMIT_PEAK {
-            LIMIT_PEAK / peak
-        } else {
-            1.0
-        };
-        shaped.into_iter().map(|x| clamp_i16(x * scale)).collect()
+        out
     }
 }
 

@@ -931,6 +931,7 @@ fn synced_message_body(msg: &SyncMessage, server_json: Option<&Value>) -> String
         "chat.recommended" => match action {
             "recommened.misscall" => "[Cuộc gọi nhỡ]".into(),
             "recommened.calltime" => "[Cuộc gọi]".into(),
+            "recommened.groupcall" => "[Cuộc gọi nhóm]".into(),
             "recommened.user" | "recommened.vip" => match (title, desc) {
                 (Some(t), Some(d)) => format!("[Danh thiếp] {t}\n{d}"),
                 (Some(t), None) => format!("[Danh thiếp] {t}"),

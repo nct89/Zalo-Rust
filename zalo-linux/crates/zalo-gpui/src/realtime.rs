@@ -138,6 +138,10 @@ pub struct Incoming {
     pub poll_closed: bool,
     /// Choices present on the message. Detail fills the rest.
     pub poll_options: Vec<PollChoice>,
+    /// True when a `MsgKind::Call` / `MsgKind::MissedCall` is a video call (`calltype == 1`).
+    pub call_video: bool,
+    /// Zalo `recommened.misscall` reason code (`2` rejected, `4` cancelled, `5` busy, `0` missed).
+    pub call_reason: u8,
     /// `1` when the row came from `/api/message/fetchImportant`.
     pub urgency: u8,
     /// Album id when this photo is one cell of a multi-photo send. `0` otherwise.
@@ -1210,11 +1214,48 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
         "chat.recommended" | "chat.link" => match action.as_str() {
             "recommened.misscall" => {
                 m.kind = MsgKind::MissedCall;
-                m.text = "[Cuộc gọi nhỡ]".into();
+                m.call_video = crate::media::is_video_call_payload(&content, &params);
+                m.call_reason = params
+                    .get("reason")
+                    .and_then(json_i64)
+                    .unwrap_or(0)
+                    .clamp(0, 255) as u8;
+                m.duration_ms = params
+                    .get("duration")
+                    .and_then(json_i64)
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                if m.call_video {
+                    m.file_name = "Cuộc gọi video".into();
+                    m.text = "[Cuộc gọi video nhỡ]".into();
+                } else {
+                    m.text = "[Cuộc gọi nhỡ]".into();
+                }
             }
             "recommened.calltime" => {
                 m.kind = MsgKind::Call;
-                m.text = "[Cuộc gọi]".into();
+                m.call_video = crate::media::is_video_call_payload(&content, &params);
+                m.duration_ms = params
+                    .get("duration")
+                    .and_then(json_i64)
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                if m.call_video {
+                    m.file_name = "Cuộc gọi video".into();
+                    m.text = "[Cuộc gọi video]".into();
+                } else {
+                    m.text = "[Cuộc gọi]".into();
+                }
+            }
+            "recommened.groupcall" => {
+                m.kind = MsgKind::Call;
+                m.file_name = "Cuộc gọi nhóm".into();
+                m.duration_ms = params
+                    .get("duration")
+                    .and_then(json_i64)
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                m.text = "[Cuộc gọi nhóm]".into();
             }
             "recommened.user" => {
                 m.kind = MsgKind::Card;
@@ -1350,7 +1391,12 @@ fn refresh_richer(store: &LocalStore, m: &Incoming) {
     let photo_upgrade = m.kind == MsgKind::Photo && !m.media_url.is_empty();
     let rich = matches!(
         m.kind,
-        MsgKind::Location | MsgKind::Doodle | MsgKind::Ecard | MsgKind::Card
+        MsgKind::Location
+            | MsgKind::Doodle
+            | MsgKind::Ecard
+            | MsgKind::Card
+            | MsgKind::Call
+            | MsgKind::MissedCall
     );
     if !rich && !marker && !photo_upgrade {
         return;
@@ -1394,6 +1440,13 @@ fn refresh_richer(store: &LocalStore, m: &Incoming) {
         }),
         MsgKind::Card => serde_json::json!({
             "kind": "card", "title": m.file_name, "thumb": m.media_url, "hd": ""
+        }),
+        MsgKind::Call | MsgKind::MissedCall => serde_json::json!({
+            "kind": if m.kind == MsgKind::MissedCall { "misscall" } else { "call" },
+            "call_video": m.call_video,
+            "call_reason": m.call_reason,
+            "size": m.duration_ms,
+            "title": m.file_name,
         }),
         _ => return,
     };
@@ -1533,6 +1586,14 @@ pub(crate) fn store_all(path: &Path, list: &mut [Incoming]) {
             } else if m.kind == MsgKind::Card {
                 Some(serde_json::json!({
                     "kind": "card", "title": m.file_name, "thumb": m.media_url, "hd": ""
+                }))
+            } else if matches!(m.kind, MsgKind::Call | MsgKind::MissedCall) {
+                Some(serde_json::json!({
+                    "kind": if m.kind == MsgKind::MissedCall { "misscall" } else { "call" },
+                    "call_video": m.call_video,
+                    "call_reason": m.call_reason,
+                    "size": m.duration_ms,
+                    "title": m.file_name,
                 }))
             } else if matches!(m.kind, MsgKind::Voice | MsgKind::Video) && !m.href.is_empty() {
                 // Voice / video: zalo-gui ignores unknown kinds, GPUI reads them back.

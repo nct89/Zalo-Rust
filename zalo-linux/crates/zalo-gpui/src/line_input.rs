@@ -30,6 +30,7 @@ actions!(
         Cut,
         Copy,
         Submit,
+        Newline,
     ]
 );
 
@@ -51,7 +52,10 @@ pub enum LineEvent {
     },
 }
 
-/// One-line editor used by the search bar and the composer.
+/// Maximum visible lines painted inside a multiline composer input.
+pub const MAX_VISIBLE_LINES: usize = 6;
+
+/// One-line or multiline editor used by the search bar and the composer.
 pub struct LineInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -60,10 +64,15 @@ pub struct LineInput {
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
+    /// Shaped visual lines `(utf8_byte_range, line)` for multiline mode.
+    last_lines: Vec<(Range<usize>, ShapedLine)>,
+    last_line_h: Pixels,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
     /// Password / PIN field: draw `*` per byte (keeps offsets aligned).
     masked: bool,
+    /// Preserve `\n` on paste and allow `Shift+Enter` newlines (composer).
+    multiline: bool,
 }
 
 impl LineInput {
@@ -71,6 +80,13 @@ impl LineInput {
     pub fn new_masked(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
         let mut input = Self::new(cx, placeholder);
         input.masked = true;
+        input
+    }
+
+    /// Multiline composer field (preserves newlines on paste & `Shift+Enter`).
+    pub fn new_multiline(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
+        let mut input = Self::new(cx, placeholder);
+        input.multiline = true;
         input
     }
 
@@ -84,10 +100,22 @@ impl LineInput {
             selection_reversed: false,
             marked_range: None,
             last_layout: None,
+            last_lines: Vec::new(),
+            last_line_h: px(22.0),
             last_bounds: None,
             is_selecting: false,
             masked: false,
+            multiline: false,
         }
+    }
+
+    /// Number of visible lines (1..=[`MAX_VISIBLE_LINES`]) for multiline height sizing.
+    #[must_use]
+    pub fn visible_line_count(&self) -> usize {
+        if !self.multiline || self.content.is_empty() {
+            return 1;
+        }
+        (self.content.bytes().filter(|&b| b == b'\n').count() + 1).clamp(1, MAX_VISIBLE_LINES)
     }
 
     /// Change the hint shown while empty (no notify; call from a parent render).
@@ -152,6 +180,7 @@ impl LineInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.last_layout = None;
+        self.last_lines.clear();
         self.last_bounds = None;
         self.is_selecting = false;
     }
@@ -232,7 +261,12 @@ impl LineInput {
                 cx.emit(LineEvent::PasteImage(image));
             }
             (None, Some(text)) => {
-                self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+                let normalized = if self.multiline {
+                    text.replace("\r\n", "\n").replace('\r', "\n")
+                } else {
+                    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
+                };
+                self.replace_text_in_range(None, &normalized, window, cx);
             }
             (None, None) => {}
         }
@@ -290,6 +324,15 @@ impl LineInput {
         cx.emit(LineEvent::Submit(self.content.to_string()));
     }
 
+    /// `Shift+Enter` inserts a newline in multiline inputs (or submits in single-line inputs).
+    fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.multiline {
+            self.replace_text_in_range(None, "\n", window, cx);
+        } else {
+            cx.emit(LineEvent::Submit(self.content.to_string()));
+        }
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -343,8 +386,21 @@ impl LineInput {
         if self.content.is_empty() {
             return 0;
         }
-        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
-        else {
+        let Some(bounds) = self.last_bounds.as_ref() else {
+            return 0;
+        };
+        if !self.last_lines.is_empty() {
+            let line_h = f32::from(self.last_line_h).max(1.0);
+            if position.y < bounds.top() {
+                return self.last_lines[0].0.start;
+            }
+            let row = ((f32::from(position.y - bounds.top()) / line_h).floor() as isize)
+                .clamp(0, (self.last_lines.len() as isize) - 1) as usize;
+            let (range, line) = &self.last_lines[row];
+            let local = line.closest_index_for_x(position.x - bounds.left());
+            return (range.start + local).min(range.end);
+        }
+        let Some(line) = self.last_layout.as_ref() else {
             return 0;
         };
         if position.y < bounds.top() {
@@ -557,8 +613,36 @@ struct LineElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    lines: Vec<(Range<usize>, ShapedLine)>,
+    line_h: Pixels,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
+    selections: Vec<PaintQuad>,
+}
+
+/// Split `text` into byte ranges of logical lines separated by `\n`, returning
+/// a window of at most `MAX_VISIBLE_LINES` lines containing `cursor_offset`.
+fn visible_line_ranges(text: &str, cursor_offset: usize) -> Vec<Range<usize>> {
+    let mut all = Vec::new();
+    let mut start = 0usize;
+    for (idx, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            all.push(start..idx);
+            start = idx + 1;
+        }
+    }
+    all.push(start..text.len());
+    if all.len() <= MAX_VISIBLE_LINES {
+        return all;
+    }
+    let cur_row = all
+        .iter()
+        .position(|r| cursor_offset <= r.end)
+        .unwrap_or(all.len() - 1);
+    let max_start = all.len().saturating_sub(MAX_VISIBLE_LINES);
+    let win_start = cur_row
+        .saturating_sub(MAX_VISIBLE_LINES - 1)
+        .min(max_start);
+    all[win_start..win_start + MAX_VISIBLE_LINES].to_vec()
 }
 
 impl IntoElement for LineElement {
@@ -588,9 +672,10 @@ impl Element for LineElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        let vis_lines = self.input.read(cx).visible_line_count().max(1) as f32;
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = (window.line_height() * vis_lines).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -608,6 +693,75 @@ impl Element for LineElement {
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
         let style = window.text_style();
+        let line_h = window.line_height();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+
+        if input.multiline && !input.masked && !content.is_empty() && content.contains('\n') {
+            let ranges = visible_line_ranges(&content, cursor);
+            let mut shaped_lines = Vec::with_capacity(ranges.len());
+            let mut selections = Vec::new();
+            let mut caret = None;
+            for (row_idx, range) in ranges.into_iter().enumerate() {
+                let slice = &content[range.clone()];
+                let run = TextRun {
+                    len: slice.len(),
+                    font: style.font(),
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = if slice.is_empty() {
+                    window
+                        .text_system()
+                        .shape_line(SharedString::from(""), font_size, &[], None)
+                } else {
+                    window.text_system().shape_line(
+                        SharedString::from(slice.to_owned()),
+                        font_size,
+                        &[run],
+                        None,
+                    )
+                };
+                let row_top = bounds.top() + line_h * (row_idx as f32);
+                let row_bot = row_top + line_h;
+                if selected_range.is_empty() {
+                    if cursor >= range.start && cursor <= range.end && caret.is_none() {
+                        let cx_pos = shaped.x_for_index(cursor - range.start);
+                        caret = Some(fill(
+                            Bounds::new(point(bounds.left() + cx_pos, row_top), size(px(2.), line_h)),
+                            caret_color(crate::color::is_dark()),
+                        ));
+                    }
+                } else {
+                    let s = selected_range.start.max(range.start);
+                    let e = selected_range.end.min(range.end);
+                    if s < e || (selected_range.start <= range.start && selected_range.end > range.end)
+                    {
+                        let x0 = bounds.left() + shaped.x_for_index(s - range.start);
+                        let x1 = if selected_range.end > range.end {
+                            (bounds.left() + shaped.x_for_index(range.len()) + px(6.))
+                                .min(bounds.right())
+                        } else {
+                            bounds.left() + shaped.x_for_index(e - range.start)
+                        };
+                        selections.push(fill(
+                            Bounds::from_corners(point(x0, row_top), point(x1, row_bot)),
+                            gpui::rgba(0x00_68_ff_55),
+                        ));
+                    }
+                }
+                shaped_lines.push((range, shaped));
+            }
+            return PrepaintState {
+                line: None,
+                lines: shaped_lines,
+                line_h,
+                cursor: caret,
+                selections,
+            };
+        }
+
         let (display_text, text_color) = if content.is_empty() {
             (
                 input.placeholder.clone(),
@@ -653,14 +807,13 @@ impl Element for LineElement {
         } else {
             vec![run]
         };
-        let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
         let cursor_pos = line.x_for_index(cursor);
-        let (selection, cursor) = if selected_range.is_empty() {
+        let (selections, cursor) = if selected_range.is_empty() {
             (
-                None,
+                Vec::new(),
                 Some(fill(
                     Bounds::new(
                         point(bounds.left() + cursor_pos, bounds.top()),
@@ -671,7 +824,7 @@ impl Element for LineElement {
             )
         } else {
             (
-                Some(fill(
+                vec![fill(
                     Bounds::from_corners(
                         point(
                             bounds.left() + line.x_for_index(selected_range.start),
@@ -683,14 +836,16 @@ impl Element for LineElement {
                         ),
                     ),
                     gpui::rgba(0x00_68_ff_55),
-                )),
+                )],
                 None,
             )
         };
         PrepaintState {
             line: Some(line),
+            lines: Vec::new(),
+            line_h,
             cursor,
-            selection,
+            selections,
         }
     }
 
@@ -710,18 +865,39 @@ impl Element for LineElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
+        for selection in prepaint.selections.drain(..) {
             window.paint_quad(selection);
         }
+        let line_h = prepaint.line_h;
+        if !prepaint.lines.is_empty() {
+            let lines = std::mem::take(&mut prepaint.lines);
+            for (row_idx, (_, line)) in lines.iter().enumerate() {
+                let origin = point(bounds.left(), bounds.top() + line_h * (row_idx as f32));
+                let _ = line.paint(origin, line_h, window, cx);
+            }
+            if focus_handle.is_focused(window) {
+                if let Some(cursor) = prepaint.cursor.take() {
+                    window.paint_quad(cursor);
+                }
+            }
+            self.input.update(cx, |input, _cx| {
+                input.last_layout = None;
+                input.last_lines = lines;
+                input.last_line_h = line_h;
+                input.last_bounds.replace(bounds);
+            });
+            return;
+        }
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
+        line.paint(bounds.origin, line_h, window, cx).unwrap();
         if focus_handle.is_focused(window) {
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
             }
         }
         self.input.update(cx, |input, _cx| {
+            input.last_lines.clear();
+            input.last_line_h = line_h;
             input.last_layout.replace(line);
             input.last_bounds.replace(bounds);
         });
@@ -753,6 +929,7 @@ impl gpui::Render for LineInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::newline))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -782,6 +959,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-enter", Newline, ctx),
         KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("ctrl-a", SelectAll, ctx),
         KeyBinding::new("cmd-a", SelectAll, ctx),

@@ -59,7 +59,9 @@ impl RemoteVideo {
         }
     }
 
-    /// Decodes one access unit. Deltas before the first key ask for a PLI.
+    /// Decodes one access unit and returns a preview-ready BGRA picture
+    /// (pre-scaled to [`PREVIEW_MAX_EDGE`] on the decode thread so the UI
+    /// thread never performs CPU scaling). Deltas before the first key ask for a PLI.
     pub(crate) fn push(&mut self, frame: &VideoFrame) -> Option<Shown> {
         let src = frame.src;
         if !self.decoders.contains_key(&src) {
@@ -91,14 +93,46 @@ impl RemoteVideo {
             return None;
         }
         let bgra = yuv_to_bgra(&yuv, w, h);
+        let (pw, ph) = fit_preview(w as u32, h as u32);
+        let final_bgra = if (pw, ph) == (w as u32, h as u32) {
+            bgra
+        } else {
+            scale_bgra_bilinear(&bgra, w as u32, h as u32, pw, ph)
+        };
         Some(Shown::Picture {
             src,
             picture: RemotePicture {
-                w: w as u32,
-                h: h as u32,
-                bgra: Arc::new(bgra),
+                w: pw,
+                h: ph,
+                bgra: Arc::new(final_bgra),
             },
         })
+    }
+
+    /// Advances the H.264 decoder reference chain for a queued delta frame
+    /// without paying for YUV→BGRA conversion or scaling. Returns `Some(src)`
+    /// only when the decoder needs a key frame (PLI).
+    pub(crate) fn push_decode_only(&mut self, frame: &VideoFrame) -> Option<u32> {
+        let src = frame.src;
+        if !self.decoders.contains_key(&src) {
+            if !frame.key {
+                return Some(src);
+            }
+            match Decoder::new() {
+                Ok(decoder) => {
+                    self.decoders.insert(src, decoder);
+                }
+                Err(_) => return Some(src),
+            }
+        }
+        let Some(decoder) = self.decoders.get_mut(&src) else {
+            return Some(src);
+        };
+        if decoder.decode(&frame.data).is_err() {
+            self.decoders.remove(&src);
+            return Some(src);
+        }
+        None
     }
 }
 
@@ -190,6 +224,9 @@ pub(crate) fn scale_bgra_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32
 
 /// Converts OpenH264 YUV420p planes directly into packed BGRA `[B, G, R, 255]`
 /// matching GPUI's `RenderImage` pixel layout without an intermediate RGB copy.
+///
+/// Uses BT.709 coefficients for HD frames (`max(w, h) >= 720`, matching iOS /
+/// Android / macOS / Windows HD streams) and BT.601 for SD frames.
 pub(crate) fn yuv_to_bgra(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
     let (y_stride, u_stride, v_stride) = yuv.strides();
     let y_plane = yuv.y();
@@ -199,6 +236,7 @@ pub(crate) fn yuv_to_bgra(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
     let y_max = y_plane.len();
     let u_max = u_plane.len();
     let v_max = v_plane.len();
+    let bt709 = w.max(h) >= 720;
 
     for row in 0..h {
         let y_row = row * y_stride;
@@ -219,9 +257,19 @@ pub(crate) fn yuv_to_bgra(yuv: &impl YUVSource, w: usize, h: usize) -> Vec<u8> {
             let d = i32::from(u_plane[u_idx]) - 128;
             let e = i32::from(v_plane[v_idx]) - 128;
             let y298 = 298 * c + 128;
-            let r = ((y298 + 409 * e) >> 8).clamp(0, 255) as u8;
-            let g = ((y298 - 100 * d - 208 * e) >> 8).clamp(0, 255) as u8;
-            let b = ((y298 + 516 * d) >> 8).clamp(0, 255) as u8;
+            let (r, g, b) = if bt709 {
+                (
+                    ((y298 + 459 * e) >> 8).clamp(0, 255) as u8,
+                    ((y298 - 55 * d - 136 * e) >> 8).clamp(0, 255) as u8,
+                    ((y298 + 541 * d) >> 8).clamp(0, 255) as u8,
+                )
+            } else {
+                (
+                    ((y298 + 409 * e) >> 8).clamp(0, 255) as u8,
+                    ((y298 - 100 * d - 208 * e) >> 8).clamp(0, 255) as u8,
+                    ((y298 + 516 * d) >> 8).clamp(0, 255) as u8,
+                )
+            };
             let px = dst_row + col * 4;
             bgra[px] = b;
             bgra[px + 1] = g;
@@ -300,6 +348,25 @@ mod tests {
         assert!((i16::from(dst[4]) - 127).abs() <= 1);
         assert_eq!(dst[7], 255);
         assert_eq!(&dst[8..12], &[254, 254, 254, 255]);
+    }
+
+    #[test]
+    fn yuv_to_bgra_uses_bt709_for_hd_frames() {
+        // Pure BT.709 green (R=0, G=255, B=0) -> Y=173, U=42, V=26.
+        let (w, h) = (720, 4);
+        let y_len = w * h;
+        let c_len = y_len / 4;
+        let mut buf = vec![0_u8; y_len + c_len * 2];
+        buf[..y_len].fill(173);
+        buf[y_len..y_len + c_len].fill(42);
+        buf[y_len + c_len..].fill(26);
+        let yuv = YUVBuffer::from_vec(buf, w, h);
+        let bgra = yuv_to_bgra(&yuv, w, h);
+        // Under BT.709, pure green reconstructs cleanly with R<=4, G>=250, B<=4.
+        assert!(bgra[2] <= 4, "R={}", bgra[2]);
+        assert!(bgra[1] >= 250, "G={}", bgra[1]);
+        assert!(bgra[0] <= 4, "B={}", bgra[0]);
+        assert_eq!(bgra[3], 255);
     }
 
     #[test]

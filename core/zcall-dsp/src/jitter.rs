@@ -1,10 +1,5 @@
-//! The receive-side jitter buffer (`_Stream`), ported from the reference
-//! call implementation (`audio-io.py`).
-//!
-//! It orders Opus packets by sequence, absorbs arrival jitter, decodes ahead,
-//! conceals loss with FEC/PLC, and shortens a buffer that grew too deep with
-//! one pitch period (WSOLA). Pure logic; the Opus decode and WSOLA helpers
-//! come from the other modules.
+//! Receive-side adaptive jitter buffer with Opus FEC/PLC, NCC-WSOLA
+//! acceleration, and 5 ms click-free crossfades on resets and underruns.
 
 use crate::wsola::{rms, wsola_shrink, FRAME_SAMPLES};
 use std::collections::{BTreeMap, VecDeque};
@@ -16,8 +11,10 @@ const MAX_EXPAND: u32 = 5;
 const WINDOW: usize = 250;
 /// Sequence jump large enough to indicate sender stream reset or wrap.
 const RESYNC_GAP: u32 = 100;
+/// 5 ms crossfade window at 16 kHz to suppress discontinuities on reset/resume.
+const XFADE_SAMPLES: usize = 80;
 
-/// Counters for the playout diagnostics.
+/// Counters for playout diagnostics.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     /// Frames decoded successfully.
@@ -50,6 +47,10 @@ pub struct JitterBuffer {
     playing: bool,
     expand: u32,
     carry: Vec<i16>,
+    /// Last emitted tail samples (up to 5 ms) for smooth crossfading after a discontinuity.
+    prev_tail: Vec<i16>,
+    /// True after a reset or underrun so the next emitted frame crossfades cleanly.
+    need_xfade: bool,
     transit: VecDeque<f64>,
     target: usize,
     min_target: usize,
@@ -79,6 +80,8 @@ impl JitterBuffer {
             playing: false,
             expand: 0,
             carry: Vec::new(),
+            prev_tail: vec![0_i16; XFADE_SAMPLES],
+            need_xfade: true,
             transit: VecDeque::new(),
             target: START_TARGET.max(min_target),
             min_target,
@@ -90,9 +93,6 @@ impl JitterBuffer {
     }
 
     /// Updates the floor and ceiling (20 ms frames) from `zrtc_config`.
-    ///
-    /// Electron applies `minAudioDelayMs` / `maxAudioDelayMs` after the call
-    /// is negotiated, which is after this buffer already exists.
     pub fn set_limits(&mut self, max_target: usize, min_target: usize) {
         let min_target = 2.max(min_target);
         let max_target = min_target.max(max_target);
@@ -102,11 +102,13 @@ impl JitterBuffer {
     }
 
     /// The arrival time of the most recent packet.
+    #[must_use]
     pub fn last(&self) -> f64 {
         self.last
     }
 
     /// Whether there is nothing buffered and no decoded carry left.
+    #[must_use]
     pub fn is_idle(&self) -> bool {
         self.packets.is_empty() && self.carry.is_empty()
     }
@@ -117,14 +119,13 @@ impl JitterBuffer {
         if let Some(next) = self.next {
             let diff = idx.abs_diff(next);
             if diff > RESYNC_GAP {
-                // Sender reset sequence numbers (e.g. peer handoff / network switch):
-                // re-anchor cleanly instead of dropping the rest of the call as late.
                 self.packets.clear();
                 self.carry.clear();
                 self.transit.clear();
                 self.next = Some(idx);
                 self.playing = false;
                 self.expand = 0;
+                self.need_xfade = true;
                 self.stats.reset += 1;
             } else if idx < next {
                 self.stats.late += 1;
@@ -157,6 +158,7 @@ impl JitterBuffer {
                 return None;
             }
             self.playing = true;
+            self.need_xfade = true;
             if let Some(first) = self.packets.keys().next().copied() {
                 if self.next.is_none() || first > self.next.unwrap() {
                     self.next = Some(first);
@@ -173,19 +175,17 @@ impl JitterBuffer {
             && self.ensure(FRAME_SAMPLES * 2)
         {
             let head = self.carry.len().min(FRAME_SAMPLES);
-            // Prefer time-compressing quiet pauses, but also allow smooth WSOLA
-            // acceleration during continuous speech once delay grows past target+5
-            // so we never hit a hard `discard_to` cut in the middle of a sentence.
             if rms(&self.carry[..head]) < 900.0 || span > self.target + 5 {
                 self.since_drop = 0;
                 self.stats.accelerate += 1;
                 let (played, rest) = wsola_shrink(&self.carry);
                 self.carry = rest;
-                return Some(played);
+                return Some(self.finalize_frame(played));
             }
         }
         if self.ensure(FRAME_SAMPLES) {
-            return Some(self.take_play());
+            let play = self.take_play();
+            return Some(self.finalize_frame(play));
         }
 
         let has_packets = !self.packets.is_empty();
@@ -199,11 +199,13 @@ impl JitterBuffer {
             if let Some(payload) = next_payload {
                 self.stats.fec += 1;
                 let decoded = self.decode(Some(&payload), true);
-                return Some(self.emit(decoded));
+                let play = self.emit(decoded);
+                return Some(self.finalize_frame(play));
             }
             self.stats.plc += 1;
             let decoded = self.decode(None, false);
-            return Some(self.emit(decoded));
+            let play = self.emit(decoded);
+            return Some(self.finalize_frame(play));
         }
 
         self.stats.underrun += 1;
@@ -211,11 +213,38 @@ impl JitterBuffer {
             self.expand += 1;
             self.stats.plc += 1;
             let decoded = self.decode(None, false);
-            return Some(self.emit(decoded));
+            let mut play = self.emit(decoded);
+            // Smoothly fade out on the last PLC frame before going quiet.
+            if self.expand == MAX_EXPAND {
+                fade_out(&mut play);
+            }
+            return Some(self.finalize_frame(play));
         }
         self.expand = 0;
         self.playing = false;
+        self.prev_tail.fill(0);
+        self.need_xfade = true;
         None
+    }
+
+    fn finalize_frame(&mut self, mut frame: Vec<i16>) -> Vec<i16> {
+        if self.need_xfade {
+            let n = XFADE_SAMPLES.min(frame.len()).min(self.prev_tail.len());
+            for i in 0..n {
+                let w = (i as f64 + 1.0) / (n as f64 + 1.0);
+                let prev = f64::from(self.prev_tail[i]);
+                let cur = f64::from(frame[i]);
+                frame[i] = (prev * (1.0 - w) + cur * w)
+                    .round()
+                    .clamp(-32_768.0, 32_767.0) as i16;
+            }
+            self.need_xfade = false;
+        }
+        if frame.len() >= XFADE_SAMPLES {
+            self.prev_tail
+                .copy_from_slice(&frame[frame.len() - XFADE_SAMPLES..]);
+        }
+        frame
     }
 
     fn span(&self) -> usize {
@@ -264,8 +293,6 @@ impl JitterBuffer {
     }
 
     fn decode(&mut self, payload: Option<&[u8]>, fec: bool) -> Vec<i16> {
-        // FEC and PLC decode exactly one 20 ms frame (like the JS "size = FRAME");
-        // a normal packet may decode more and uses the full buffer.
         let conceal = fec || payload.is_none_or(|p| p.is_empty());
         let max = if conceal { FRAME_SAMPLES } else { 1920 };
         let mut pcm = vec![0_i16; max];
@@ -311,8 +338,18 @@ impl JitterBuffer {
         self.next = self.packets.keys().next().copied().or(Some(cut));
         self.carry.clear();
         self.expand = 0;
+        self.need_xfade = true;
         self.stats.reset += 1;
         extra as u32
+    }
+}
+
+fn fade_out(frame: &mut [i16]) {
+    let n = frame.len().min(XFADE_SAMPLES);
+    let start = frame.len().saturating_sub(n);
+    for (i, sample) in frame[start..].iter_mut().enumerate() {
+        let w = 1.0 - (i as f64 + 1.0) / (n as f64 + 1.0);
+        *sample = (f64::from(*sample) * w).round() as i16;
     }
 }
 
@@ -353,15 +390,15 @@ mod tests {
         for idx in 5..10 {
             jb.push(idx, &payload, 0.0);
         }
-        assert!(jb.pull().is_some()); // starts at idx 5
-        jb.push(4, &payload, 0.0); // late (< next)
-        jb.push(6, &payload, 0.0); // duplicate
+        assert!(jb.pull().is_some());
+        jb.push(4, &payload, 0.0);
+        jb.push(6, &payload, 0.0);
         assert_eq!(jb.stats.late, 1);
         assert_eq!(jb.stats.dup, 1);
     }
 
     #[test]
-    fn conceals_loss_then_goes_quiet() {
+    fn conceals_loss_fades_out_smoothly_then_goes_quiet() {
         let mut encoder = OpusEncoder::new().expect("encoder");
         let payload = encoder.encode_frame(&tone()).expect("encode");
         let mut jb = JitterBuffer::new(10, Some(5)).expect("jitter");
@@ -371,10 +408,11 @@ mod tests {
         for _ in 0..5 {
             assert!(jb.pull().is_some());
         }
-        // No more packets: PLC for MAX_EXPAND frames, then quiet.
+        let mut last_plc = Vec::new();
         for _ in 0..MAX_EXPAND {
-            assert!(jb.pull().is_some());
+            last_plc = jb.pull().expect("plc frame");
         }
+        assert!(last_plc.last().copied().unwrap_or(999).abs() < 200);
         assert!(jb.pull().is_none());
         assert!(jb.stats.plc >= MAX_EXPAND as u64);
     }
@@ -388,15 +426,12 @@ mod tests {
             jb.push(idx, &payload, 0.0);
         }
         assert!(jb.pull().is_some());
-        // Simulate a stream restart / reconnect jump (> RESYNC_GAP behind/ahead).
         for idx in 500..505 {
             jb.push(idx, &payload, 0.1);
         }
         assert!(jb.stats.reset >= 1);
         assert!(jb.pull().is_some());
 
-        // Push a moderate burst past target + 5 so speech WSOLA shrink engages
-        // instead of dropping frames abruptly.
         for idx in 505..516 {
             jb.push(idx, &payload, 0.12);
         }

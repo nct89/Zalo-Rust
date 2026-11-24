@@ -14,6 +14,7 @@ name = "zcall_audio"
 workspace = true
 
 [dependencies]
+zcall-dsp = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 cpal = "0.15"

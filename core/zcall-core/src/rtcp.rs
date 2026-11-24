@@ -437,6 +437,55 @@ pub fn build_pli(sender_ssrc: u32, media_ssrc: u32) -> Vec<u8> {
     b
 }
 
+/// REMB (Receiver Estimated Maximum Bitrate, PSFB `PT=206, FMT=15`,
+/// draft-alvestrand-rmcat-remb). Tells the peer/phone how much inbound video
+/// bandwidth we can cleanly receive so it climbs to 720p smoothly.
+pub fn build_remb(sender_ssrc: u32, media_ssrc: u32, bitrate_bps: u64) -> Vec<u8> {
+    let mut mantissa = bitrate_bps;
+    let mut exp: u8 = 0;
+    while mantissa > 0x3_ffff && exp < 63 {
+        mantissa >>= 1;
+        exp += 1;
+    }
+    let mantissa = (mantissa & 0x3_ffff) as u32;
+    let mut b = vec![0u8; 24];
+    b[0] = 0x8f; // V=2, P=0, FMT=15 (AFB)
+    b[1] = 206; // PSFB
+    put16(&mut b, 2, 5); // 24 bytes / 4 - 1
+    put32(&mut b, 4, sender_ssrc);
+    put32(&mut b, 8, 0); // media SSRC always 0 per REMB spec
+    b[12..16].copy_from_slice(b"REMB");
+    b[16] = 1; // Num SSRCs
+    b[17] = (exp << 2) | ((mantissa >> 16) as u8 & 0x03);
+    b[18] = ((mantissa >> 8) & 0xff) as u8;
+    b[19] = (mantissa & 0xff) as u8;
+    put32(&mut b, 20, media_ssrc);
+    b
+}
+
+/// Parses a single REMB packet (`PT=206, FMT=15`, `"REMB"`), returning
+/// `(sender_ssrc, media_ssrcs, bitrate_bps)`.
+pub fn parse_remb(pkt: &[u8]) -> Option<(u32, Vec<u32>, u64)> {
+    if pkt.len() < 20 || (pkt[0] >> 6) != 2 || (pkt[0] & 0x1f) != 15 || pkt[1] != 206 {
+        return None;
+    }
+    if &pkt[12..16] != b"REMB" {
+        return None;
+    }
+    let count = usize::from(pkt[16]);
+    if pkt.len() < 20 + count * 4 {
+        return None;
+    }
+    let exp = u32::from(pkt[17] >> 2);
+    let mantissa = (u64::from(pkt[17] & 0x03) << 16) | (u64::from(pkt[18]) << 8) | u64::from(pkt[19]);
+    let bitrate_bps = mantissa.checked_shl(exp).unwrap_or(u64::MAX);
+    let mut ssrcs = Vec::with_capacity(count);
+    for i in 0..count {
+        ssrcs.push(be32(pkt, 20 + i * 4));
+    }
+    Some((be32(pkt, 4), ssrcs, bitrate_bps))
+}
+
 /// Generic NACK (RTPFB fmt 1): encodes PID + BLP for each span of up to 17 sequence numbers.
 pub fn build_nack(sender_ssrc: u32, media_ssrc: u32, seqs: &[u16]) -> Vec<u8> {
     let mut items: Vec<(u16, u16)> = Vec::new();
@@ -753,6 +802,13 @@ impl RxStats {
     }
 }
 
+/// Initial inbound REMB estimate (1.5 Mbps, allows 720p24/30 climb).
+const REMB_INITIAL_BPS: u64 = 1_500_000;
+/// Floor for inbound REMB estimate (250 kbps).
+const REMB_MIN_BPS: u64 = 250_000;
+/// Ceiling for inbound REMB estimate (2.5 Mbps).
+const REMB_MAX_BPS: u64 = 2_500_000;
+
 /// Aggregated RTCP feedback state for a single call.
 pub struct RtcpFeedback {
     /// Local SSRC.
@@ -764,6 +820,8 @@ pub struct RtcpFeedback {
     pub peer_ssrc: u32,
     /// Pending PLI/FIR received from peer or SFU targeting our video SSRC.
     key_frame_requested: bool,
+    /// Estimated receive-side video bitrate reported in RTCP REMB.
+    remb_bps: u64,
     /// Feedback counters.
     pub counters: RtcpCounters,
 }
@@ -779,6 +837,8 @@ pub struct RtcpCounters {
     pub pli: u64,
     /// Number of NACK requests built.
     pub nack: u64,
+    /// Number of REMB feedback packets built.
+    pub remb: u64,
 }
 
 impl RtcpFeedback {
@@ -791,6 +851,7 @@ impl RtcpFeedback {
             video: RxStats::new(90_000),
             peer_ssrc: 0,
             key_frame_requested: false,
+            remb_bps: REMB_INITIAL_BPS,
             counters: RtcpCounters::default(),
         }
     }
@@ -882,12 +943,23 @@ impl RtcpFeedback {
         out
     }
 
-    /// Builds a video channel report: RR + SDES, or `None` if no video has arrived yet.
+    /// Builds a video channel report: RR + SDES + REMB, or `None` if no video has arrived yet.
     pub fn video_report(&mut self, now_ms: u64) -> Option<Vec<u8>> {
         let blk = self.video.block(now_ms)?;
+        // Adapt inbound REMB estimate smoothly from interval packet loss.
+        let loss_frac = f64::from(blk.fraction_lost) / 256.0;
+        if loss_frac > 0.10 {
+            self.remb_bps = ((self.remb_bps as f64 * (1.0 - 0.5 * loss_frac)) as u64)
+                .clamp(REMB_MIN_BPS, REMB_MAX_BPS);
+        } else if loss_frac < 0.02 {
+            self.remb_bps = ((self.remb_bps as f64 * 1.08) as u64)
+                .clamp(REMB_MIN_BPS, REMB_MAX_BPS);
+        }
         self.counters.reports += 1;
-        let mut out = build_rr(self.local_ssrc, &[blk]);
+        self.counters.remb += 1;
+        let mut out = build_rr(self.local_ssrc, &[blk.clone()]);
         out.extend_from_slice(&build_sdes(self.local_ssrc));
+        out.extend_from_slice(&build_remb(self.local_ssrc, blk.ssrc, self.remb_bps));
         Some(out)
     }
 
@@ -1059,5 +1131,22 @@ mod tests {
         let all = parse_nacks_in_compound(&compound);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0], parsed);
+    }
+
+    #[test]
+    fn remb_round_trips_and_attaches_to_video_report() {
+        let pkt = build_remb(0x1122, 0x3344, 1_500_000);
+        let (sender, ssrcs, bps) = parse_remb(&pkt).expect("parse remb");
+        assert_eq!(sender, 0x1122);
+        assert_eq!(ssrcs, vec![0x3344]);
+        assert!((bps as i64 - 1_500_000).abs() <= 32, "got {bps}");
+
+        let mut fb = RtcpFeedback::new(7);
+        let mut rtp = vec![0x80, 98, 0, 1, 0, 0, 0, 90, 0, 0, 0, 99];
+        rtp.extend_from_slice(&[0; 8]);
+        fb.on_rtp(true, &rtp, 1_000);
+        let report = fb.video_report(2_000).expect("video report");
+        assert!(report.windows(4).any(|w| w == b"REMB"));
+        assert_eq!(fb.counters.remb, 1);
     }
 }

@@ -804,6 +804,8 @@ impl ZaloApi {
             .cookie_provider(Arc::clone(&jar))
             .default_headers(headers)
             .user_agent(user_agent())
+            .connect_timeout(Duration::from_secs(8))
+            .tcp_nodelay(true)
             .pool_idle_timeout(Duration::from_secs(30))
             .tcp_keepalive(Duration::from_secs(30))
             .timeout(Duration::from_secs(40))

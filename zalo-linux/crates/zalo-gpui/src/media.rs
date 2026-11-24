@@ -129,6 +129,10 @@ pub struct MediaMeta {
     pub poll_options: Vec<PollChoice>,
     /// Stored `group_layout_id` for one cell of a multi-photo send. `0` if none.
     pub group_layout_id: i64,
+    /// True when a `MsgKind::Call` / `MsgKind::MissedCall` is a video call (`calltype == 1`).
+    pub call_video: bool,
+    /// Zalo `recommened.misscall` reason code (`2` rejected, `4` cancelled, `5` busy, `0` missed).
+    pub call_reason: u8,
 }
 
 /// FNV-1a of a photo URL — same as `zalo-gui` `url_key`.
@@ -250,6 +254,23 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
         "file" => meta.kind = MsgKind::File,
         "voice" => meta.kind = MsgKind::Voice,
         "video" => meta.kind = MsgKind::Video,
+        "call" | "misscall" => {
+            meta.kind = if kind == "misscall" {
+                MsgKind::MissedCall
+            } else {
+                MsgKind::Call
+            };
+            meta.call_video = value
+                .get("call_video")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || value
+                    .get("calltype")
+                    .and_then(|v| v.as_i64())
+                    .is_some_and(|n| n != 0);
+            meta.call_reason = num("call_reason") as u8;
+            meta.title = text("title");
+        }
         "doodle" => meta.kind = MsgKind::Doodle,
         "location" => {
             meta.kind = MsgKind::Location;
@@ -529,8 +550,28 @@ fn fill_from_server_message(meta: &mut MediaMeta, value: &serde_json::Value) {
             apply_poll(meta, &body);
         }
         "chat.recommended" | "chat.link" => match action {
-            "recommened.misscall" => meta.kind = MsgKind::MissedCall,
-            "recommened.calltime" => meta.kind = MsgKind::Call,
+            "recommened.misscall" => {
+                meta.kind = MsgKind::MissedCall;
+                meta.call_video = is_video_call_payload(&content, &params);
+                meta.call_reason = num(&params, "reason") as u8;
+                meta.size = u64::from(num(&params, "duration"));
+                if meta.call_video {
+                    meta.title = "Cuộc gọi video".to_owned();
+                }
+            }
+            "recommened.calltime" => {
+                meta.kind = MsgKind::Call;
+                meta.call_video = is_video_call_payload(&content, &params);
+                meta.size = u64::from(num(&params, "duration"));
+                if meta.call_video {
+                    meta.title = "Cuộc gọi video".to_owned();
+                }
+            }
+            "recommened.groupcall" => {
+                meta.kind = MsgKind::Call;
+                meta.title = "Cuộc gọi nhóm".to_owned();
+                meta.size = u64::from(num(&params, "duration"));
+            }
             "recommened.user" | "recommened.vip" => {
                 meta.kind = MsgKind::Card;
                 meta.title = text(&content, "title");
@@ -638,7 +679,147 @@ pub fn find_downloaded(name: &str) -> Option<PathBuf> {
     found
 }
 
-/// Group-call system bodies that `zalo-gui` stored as the raw action name.
+/// Returns true when a Zalo `recommened.calltime` / `recommened.misscall` payload
+/// represents a video call rather than a voice-only call.
+#[must_use]
+pub fn is_video_call_payload(
+    content: &serde_json::Value,
+    params: &serde_json::Value,
+) -> bool {
+    let flag_num = |obj: &serde_json::Value, key: &str| -> Option<i64> {
+        obj.get(key).and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_bool().map(i64::from))
+                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+        })
+    };
+    if flag_num(params, "isVideo").is_some_and(|n| n != 0)
+        || flag_num(params, "video").is_some_and(|n| n != 0)
+        || flag_num(content, "isVideo").is_some_and(|n| n != 0)
+        || matches!(flag_num(params, "calltype"), Some(1 | 2 | 3))
+        || matches!(flag_num(params, "callType"), Some(1 | 2 | 3))
+        || matches!(flag_num(params, "call_type"), Some(1 | 2 | 3))
+        || matches!(flag_num(content, "calltype"), Some(1 | 2 | 3))
+        || matches!(flag_num(params, "type"), Some(2 | 3))
+    {
+        return true;
+    }
+    for obj in [content, params] {
+        for key in ["title", "description", "desc", "action"] {
+            if obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.to_ascii_lowercase().contains("video"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when a call message text/title indicates a video call.
+#[must_use]
+pub fn is_video_call_text(text: &str, file_name: &str) -> bool {
+    file_name.to_ascii_lowercase().contains("video")
+        || text.to_ascii_lowercase().contains("video")
+}
+
+/// Format a call duration in seconds the way Zalo Electron displays it inside
+/// call bubbles (e.g. `0 phút 25 giây`, `1 phút 8 giây`, `1 giờ 5 phút 2 giây`).
+#[must_use]
+pub fn format_call_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h} giờ {m} phút {s} giây")
+    } else {
+        format!("{m} phút {s} giây")
+    }
+}
+
+/// Resolved Electron-matching labels for a call message:
+/// `(bubble_title, bubble_subtitle, sidebar_preview, sidebar_red)`.
+#[must_use]
+pub fn call_display_texts(
+    kind: MsgKind,
+    from_me: bool,
+    video: bool,
+    group: bool,
+    reason: u8,
+    duration_s: u64,
+) -> (String, String, String, bool) {
+    if group {
+        let sub = if duration_s > 0 {
+            format_call_duration(duration_s)
+        } else {
+            "Cuộc gọi nhóm".to_owned()
+        };
+        return (
+            "Cuộc gọi nhóm".to_owned(),
+            sub,
+            "Cuộc gọi nhóm".to_owned(),
+            false,
+        );
+    }
+    let missed = kind == MsgKind::MissedCall;
+    let type_label = if video {
+        "Cuộc gọi video"
+    } else {
+        "Cuộc gọi thoại"
+    };
+    if missed {
+        let title = if from_me {
+            match reason {
+                2 => "Người nhận từ chối",
+                4 => "Bạn đã hủy",
+                5 => "Người nhận bận",
+                _ => "Người nhận bị nhỡ",
+            }
+        } else {
+            match reason {
+                2 => "Bạn đã từ chối",
+                _ => "Bạn bị nhỡ",
+            }
+        };
+        let (preview, red) = if !from_me || reason == 0 {
+            (
+                if video {
+                    "Cuộc gọi video nhỡ"
+                } else {
+                    "Cuộc gọi thoại nhỡ"
+                },
+                true,
+            )
+        } else if video {
+            ("Cuộc gọi video đi", false)
+        } else {
+            ("Cuộc gọi thoại đi", false)
+        };
+        (
+            title.to_owned(),
+            type_label.to_owned(),
+            preview.to_owned(),
+            red,
+        )
+    } else {
+        let title = match (video, from_me) {
+            (true, true) => "Cuộc gọi video đi",
+            (true, false) => "Cuộc gọi video đến",
+            (false, true) => "Cuộc gọi thoại đi",
+            (false, false) => "Cuộc gọi thoại đến",
+        };
+        let subtitle = if duration_s > 0 {
+            format_call_duration(duration_s)
+        } else {
+            type_label.to_owned()
+        };
+        (title.to_owned(), subtitle, title.to_owned(), false)
+    }
+}
+
+/// Group-call system bodies synced from Zalo.
 #[must_use]
 pub fn is_group_call_body(body: &str) -> bool {
     matches!(
@@ -702,8 +883,18 @@ fn fill_from_body(meta: &mut MediaMeta, body: &str) {
         "[Sticker]" => meta.kind = MsgKind::Sticker,
         "[GIF]" => meta.kind = MsgKind::Gif,
         "[Cuộc gọi nhỡ]" | "Cuộc gọi nhỡ" => meta.kind = MsgKind::MissedCall,
+        "[Cuộc gọi video nhỡ]" | "Cuộc gọi video nhỡ" => {
+            meta.kind = MsgKind::MissedCall;
+            meta.call_video = true;
+            meta.title = "Cuộc gọi video".to_owned();
+        }
         "[Cuộc gọi]" | "Cuộc gọi" | "Cuộc gọi đến" | "Cuộc gọi đi" | "Cuộc gọi thoại đến"
         | "Cuộc gọi thoại đi" => meta.kind = MsgKind::Call,
+        "[Cuộc gọi video]" | "Cuộc gọi video" | "Cuộc gọi video đến" | "Cuộc gọi video đi" => {
+            meta.kind = MsgKind::Call;
+            meta.call_video = true;
+            meta.title = "Cuộc gọi video".to_owned();
+        }
         "[Tin nhắn thoại]" | "[Voice]" => meta.kind = MsgKind::Voice,
         "[Video]" => meta.kind = MsgKind::Video,
         _ if is_group_call_body(trimmed) => {
@@ -962,14 +1153,23 @@ const MAX_ANIM_FRAMES: usize = 32;
 /// `image` crate cannot read them, so JXL goes through `zjxl`. GPUI
 /// `RenderImage` frames are BGRA.
 #[must_use]
+fn is_jxl_bytes(bytes: &[u8]) -> bool {
+    (bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0x0A)
+        || (bytes.len() >= 12
+            && &bytes[..12] == b"\x00\x00\x00\x0CJXL \r\n\x87\n")
+}
+
+#[must_use]
 pub fn decode_thumb(path: &Path, max_edge: u32) -> Option<Arc<RenderImage>> {
     let edge = max_edge.saturating_mul(2);
     let bytes = std::fs::read(path).ok()?;
     if let Some(anim) = decode_animated(&bytes, edge) {
         return Some(anim);
     }
-    // Small PNG next to the photo cache: JXL decode happens once per photo.
-    let thumb = thumb_path(path, edge);
+    let jxl = is_jxl_bytes(&bytes);
+    // Small PNG sidecar cache only for JXL (JPEG/PNG/WebP already decode in <5 ms,
+    // whereas re-encoding a PNG synchronously stalls display).
+    let thumb = jxl.then(|| thumb_path(path, edge)).flatten();
     if let Some(rgba) = thumb
         .as_ref()
         .and_then(|t| std::fs::read(t).ok())
@@ -981,9 +1181,19 @@ pub fn decode_thumb(path: &Path, max_edge: u32) -> Option<Arc<RenderImage>> {
     let rgba = decode_rgba(&bytes, edge)?;
     if let Some(t) = thumb {
         let mut png = Vec::new();
-        if rgba
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .is_ok()
+        let encoder = image::codecs::png::PngEncoder::new_with_quality(
+            &mut png,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        );
+        if image::ImageEncoder::write_image(
+            encoder,
+            rgba.as_raw(),
+            rgba.width(),
+            rgba.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .is_ok()
         {
             let _ = std::fs::write(t, png);
         }
@@ -1216,6 +1426,9 @@ pub fn decode_rgba(bytes: &[u8], max_edge: u32) -> Option<image::RgbaImage> {
     if bytes.is_empty() || max_edge == 0 {
         return None;
     }
+    if is_jxl_bytes(bytes) {
+        return decode_jxl(bytes, max_edge);
+    }
     if let Ok(img) = image::load_from_memory(bytes) {
         let img = if img.width().max(img.height()) > max_edge {
             img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
@@ -1262,8 +1475,8 @@ fn decode_jxl(bytes: &[u8], max_edge: u32) -> Option<image::RgbaImage> {
 /// GPUI paints `RenderImage` as BGRA (see `gpui::elements::img`).
 #[must_use]
 pub fn rgba_to_bgra(mut img: image::RgbaImage) -> image::RgbaImage {
-    for pixel in img.pixels_mut() {
-        pixel.0.swap(0, 2);
+    for px in img.as_flat_samples_mut().samples.chunks_exact_mut(4) {
+        px.swap(0, 2);
     }
     img
 }
@@ -2056,5 +2269,56 @@ mod tests {
             );
         }
         assert!(png_asset("zcloud-promo.png", 672).is_some());
+    }
+
+    #[test]
+    fn lowercase_calltype_video_and_electron_call_labels() {
+        let video_call = r#"{"msgType":"chat.recommended","content":{"action":"recommened.calltime","params":"{\"callId\":1,\"duration\":9,\"isCaller\":1,\"isEnableCallback\":1,\"calltype\":1}"}}"#;
+        let meta = classify("[Cuộc gọi]", Some(video_call));
+        assert_eq!(meta.kind, MsgKind::Call);
+        assert!(meta.call_video);
+        assert_eq!(meta.size, 9);
+        assert_eq!(
+            call_display_texts(meta.kind, true, meta.call_video, false, meta.call_reason, meta.size),
+            (
+                "Cuộc gọi video đi".into(),
+                "0 phút 9 giây".into(),
+                "Cuộc gọi video đi".into(),
+                false,
+            )
+        );
+
+        let missed_video = r#"{"msgType":"chat.recommended","content":{"action":"recommened.misscall","params":"{\"callId\":2,\"duration\":0,\"reason\":0,\"isCaller\":0,\"calltype\":1}"}}"#;
+        let mmeta = classify("[Cuộc gọi nhỡ]", Some(missed_video));
+        assert_eq!(mmeta.kind, MsgKind::MissedCall);
+        assert!(mmeta.call_video);
+        assert_eq!(mmeta.call_reason, 0);
+        assert_eq!(
+            call_display_texts(mmeta.kind, false, mmeta.call_video, false, mmeta.call_reason, 0),
+            (
+                "Bạn bị nhỡ".into(),
+                "Cuộc gọi video".into(),
+                "Cuộc gọi video nhỡ".into(),
+                true,
+            )
+        );
+
+        let rejected_audio = r#"{"msgType":"chat.recommended","content":{"action":"recommened.misscall","params":"{\"callId\":3,\"duration\":0,\"reason\":2,\"isCaller\":1,\"calltype\":0}"}}"#;
+        let rmeta = classify("[Cuộc gọi nhỡ]", Some(rejected_audio));
+        assert_eq!(rmeta.kind, MsgKind::MissedCall);
+        assert!(!rmeta.call_video);
+        assert_eq!(rmeta.call_reason, 2);
+        assert_eq!(
+            call_display_texts(rmeta.kind, true, rmeta.call_video, false, rmeta.call_reason, 0),
+            (
+                "Người nhận từ chối".into(),
+                "Cuộc gọi thoại".into(),
+                "Cuộc gọi thoại đi".into(),
+                false,
+            )
+        );
+        assert_eq!(format_call_duration(9), "0 phút 9 giây");
+        assert_eq!(format_call_duration(125), "2 phút 5 giây");
+        assert_eq!(format_call_duration(3660), "1 giờ 1 phút 0 giây");
     }
 }

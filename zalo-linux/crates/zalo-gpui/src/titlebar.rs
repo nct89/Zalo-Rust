@@ -287,7 +287,7 @@ fn theme_mark(dark: bool) -> gpui::AnyElement {
         .line_height(px(10.))
         .text_color(color)
         .when(loaded, |el| {
-            el.font_family(crate::fonts::FAMILY_AWESOME)
+            el.font_family(crate::fonts::awesome_family())
                 .font_weight(gpui::FontWeight::BLACK)
         })
         .child(glyph.to_string())
@@ -444,9 +444,15 @@ fn caption_bar(
         })
         .when_some(leading, |el, child| el.child(child))
         .child(
+            // `.occlude()` prevents ancestor `.track_focus(...)` containers
+            // (e.g. `#shell`, `#zalo-photo`) from calling `prevent_default()` on
+            // `MouseDown`, which would cause GPUI's Windows `WM_NCLBUTTONDOWN`
+            // handler to swallow `HTCAPTION` instead of passing it to
+            // `DefWindowProcW` for native dragging and double-click maximize.
             div()
                 .id("titleBar-drag")
                 .window_control_area(gpui::WindowControlArea::Drag)
+                .occlude()
                 .flex_1()
                 .h_full()
                 .flex()
@@ -456,14 +462,16 @@ fn caption_bar(
                 .pl(px(12.))
                 .text_size(px(13.))
                 .text_color(rgb(ink))
-                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                    window.start_window_move();
-                })
-                .when(with_zoom, |el| {
-                    el.on_click(|event, window, _| {
-                        if event.click_count() >= 2 {
-                            window.zoom_window();
-                        }
+                .when(!cfg!(target_os = "windows"), |el| {
+                    el.on_mouse_down(MouseButton::Left, |_, window, _| {
+                        window.start_window_move();
+                    })
+                    .when(with_zoom, |el| {
+                        el.on_click(|event, window, _| {
+                            if event.click_count() >= 2 {
+                                window.zoom_window();
+                            }
+                        })
                     })
                 })
                 .when_some(title_icon, |el, icon| {

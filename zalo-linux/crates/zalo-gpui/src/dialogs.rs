@@ -60,6 +60,8 @@ pub enum Dialog {
     GroupManage(crate::account::GroupManageDlg),
     /// Account menu "Your Profile".
     Profile(crate::account::ProfileDlg),
+    /// Clicking a `@mention` or peer opens their Zalo account info card.
+    UserInfo(crate::account::UserInfoDlg),
     /// Settings "Decrypt .zdb4 Backup".
     BackupDecrypt(crate::account::BackupDecryptDlg),
     /// Composer "Send Contact Card".
@@ -197,6 +199,7 @@ pub struct GroupPicker {
     query: Entity<LineInput>,
     query_text: String,
     label_filter: Option<i64>,
+    label_scroll: gpui::ScrollHandle,
     picked: Vec<String>,
     busy: bool,
     error: Option<String>,
@@ -318,6 +321,7 @@ impl ShellView {
             query,
             query_text: String::new(),
             label_filter: None,
+            label_scroll: gpui::ScrollHandle::new(),
             picked: Vec::new(),
             busy: false,
             error: None,
@@ -626,6 +630,7 @@ impl ShellView {
                 return div().into_any_element();
             }
             Some(Dialog::Profile(p)) => self.profile_el(p, cx).into_any_element(),
+            Some(Dialog::UserInfo(u)) => self.user_info_el(u, cx).into_any_element(),
             Some(Dialog::BackupDecrypt(b)) => self.backup_decrypt_el(b, cx).into_any_element(),
             Some(Dialog::Namecard(n)) => self.namecard_el(n, cx).into_any_element(),
             Some(Dialog::BankCard(b)) => self.bank_card_el(b, cx).into_any_element(),
@@ -1201,82 +1206,166 @@ impl ShellView {
                     .child(fonts::icon_el('\u{ED15}', "⌕", 14.))
                     .child(div().flex_1().child(g.query.clone())),
             )
-            .child(
+            .child({
+                let label_scroll_prev = g.label_scroll.clone();
+                let label_scroll_next = g.label_scroll.clone();
+                let label_scroll_wheel = g.label_scroll.clone();
+                let cur_x = f32::from(g.label_scroll.offset().x);
+                let max_x = f32::from(g.label_scroll.max_offset().width);
+                let has_overflow = max_x > 1.0 || self.labels.len() > 3;
+                let can_prev = cur_x < -1.0;
+                let can_next = max_x <= 1.0 || cur_x > -(max_x - 1.0);
+                let arrow_col_on = token_rgb("--icon-primary", "#081b3a");
+                let arrow_col_off = token_rgb("--text-secondary", "#9aa5b4");
                 div()
-                    .id("group-label-chips")
-                    .mx(px(16.))
+                    .id("group-label-bar")
+                    .w_full()
+                    .px(px(6.))
                     .mt(px(10.))
                     .flex()
                     .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .overflow_x_scroll()
+                    .gap(px(4.))
+                    .when(has_overflow, |row| {
+                        row.child(
+                            div()
+                                .id("group-chip-prev")
+                                .flex_none()
+                                .size(px(24.))
+                                .rounded(px(12.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(if can_prev { arrow_col_on } else { arrow_col_off }))
+                                .when(can_prev, |el| {
+                                    el.cursor_pointer().hover(move |st| st.bg(rgb(hover)))
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let cur = label_scroll_prev.offset();
+                                    let next_x = (cur.x + px(140.)).min(px(0.));
+                                    label_scroll_prev.set_offset(gpui::point(next_x, cur.y));
+                                    cx.notify();
+                                }))
+                                .child(fonts::icon_el(fonts::ic::CHEVRON_LEFT, "‹", 13.)),
+                        )
+                    })
                     .child(
                         div()
-                            .id("group-chip-all")
-                            .flex_none()
-                            .h(px(26.))
-                            .px(px(12.))
-                            .rounded(px(13.))
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .text_size(px(13.))
-                            .font_family(FAMILY_SEMIBOLD)
-                            .bg(rgb(if label_filter.is_none() { blue } else { field }))
-                            .text_color(rgb(if label_filter.is_none() { 0xffffff } else { ink }))
-                            .when(label_filter.is_some(), |el| {
-                                el.hover(move |st| st.bg(rgb(hover)))
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(Dialog::Group(g)) = this.dialog.as_mut() {
-                                    g.label_filter = None;
-                                }
-                                cx.notify();
-                            }))
-                            .child("Tất cả"),
-                    )
-                    .children(self.labels.iter().map(|label| {
-                        let lid = label.id;
-                        let on = label_filter == Some(lid);
-                        let dot = crate::color::parse_hex(&label.color);
-                        div()
-                            .id(("group-chip", lid as u64))
-                            .flex_none()
-                            .h(px(26.))
-                            .px(px(10.))
-                            .rounded(px(13.))
+                            .id("group-label-chips")
+                            .flex_1()
+                            .min_w(px(0.))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(6.))
-                            .cursor_pointer()
-                            .text_size(px(13.))
-                            .bg(rgb(if on { blue } else { field }))
-                            .text_color(rgb(if on { 0xffffff } else { ink }))
-                            .when(!on, |el| el.hover(move |st| st.bg(rgb(hover))))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(Dialog::Group(g)) = this.dialog.as_mut() {
-                                    g.label_filter = if g.label_filter == Some(lid) {
-                                        None
+                            .overflow_x_scroll()
+                            .track_scroll(&g.label_scroll)
+                            .on_scroll_wheel(cx.listener(
+                                move |_, e: &gpui::ScrollWheelEvent, _, cx| {
+                                    let delta = e.delta.pixel_delta(px(28.));
+                                    let step = if f32::from(delta.x).abs() > 0.5 {
+                                        delta.x
                                     } else {
-                                        Some(lid)
+                                        delta.y
                                     };
-                                }
-                                cx.notify();
-                            }))
-                            .when_some(dot, |el, c| {
-                                el.child(
-                                    div()
-                                        .size(px(8.))
-                                        .rounded(px(4.))
-                                        .bg(rgb(if on { 0xffffff } else { c })),
-                                )
-                            })
-                            .child(label.text.clone())
-                    })),
-            )
+                                    let cur = label_scroll_wheel.offset();
+                                    let max = label_scroll_wheel.max_offset().width;
+                                    let next_x = (cur.x + step).clamp(-max, px(0.));
+                                    label_scroll_wheel.set_offset(gpui::point(next_x, cur.y));
+                                    cx.notify();
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .id("group-chip-all")
+                                    .flex_none()
+                                    .h(px(26.))
+                                    .px(px(12.))
+                                    .rounded(px(13.))
+                                    .flex()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .text_size(px(13.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .bg(rgb(if label_filter.is_none() { blue } else { field }))
+                                    .text_color(rgb(if label_filter.is_none() { 0xffffff } else { ink }))
+                                    .when(label_filter.is_some(), |el| {
+                                        el.hover(move |st| st.bg(rgb(hover)))
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(Dialog::Group(g)) = this.dialog.as_mut() {
+                                            g.label_filter = None;
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child("Tất cả"),
+                            )
+                            .children(self.labels.iter().map(|label| {
+                                let lid = label.id;
+                                let on = label_filter == Some(lid);
+                                let dot = crate::color::parse_hex(&label.color);
+                                div()
+                                    .id(("group-chip", lid as u64))
+                                    .flex_none()
+                                    .h(px(26.))
+                                    .px(px(10.))
+                                    .rounded(px(13.))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .cursor_pointer()
+                                    .text_size(px(13.))
+                                    .bg(rgb(if on { blue } else { field }))
+                                    .text_color(rgb(if on { 0xffffff } else { ink }))
+                                    .when(!on, |el| el.hover(move |st| st.bg(rgb(hover))))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(Dialog::Group(g)) = this.dialog.as_mut() {
+                                            g.label_filter = if g.label_filter == Some(lid) {
+                                                None
+                                            } else {
+                                                Some(lid)
+                                            };
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .when_some(dot, |el, c| {
+                                        el.child(
+                                            div()
+                                                .size(px(8.))
+                                                .rounded(px(4.))
+                                                .bg(rgb(if on { 0xffffff } else { c })),
+                                        )
+                                    })
+                                    .child(label.text.clone())
+                            })),
+                    )
+                    .when(has_overflow, |row| {
+                        row.child(
+                            div()
+                                .id("group-chip-next")
+                                .flex_none()
+                                .size(px(24.))
+                                .rounded(px(12.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(if can_next { arrow_col_on } else { arrow_col_off }))
+                                .when(can_next, |el| {
+                                    el.cursor_pointer().hover(move |st| st.bg(rgb(hover)))
+                                })
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let cur = label_scroll_next.offset();
+                                    let max = label_scroll_next.max_offset().width;
+                                    let next_x = (cur.x - px(140.)).max(-max);
+                                    label_scroll_next.set_offset(gpui::point(next_x, cur.y));
+                                    cx.notify();
+                                }))
+                                .child(fonts::icon_el(fonts::ic::CHEVRON_RIGHT, "›", 13.)),
+                        )
+                    })
+            })
             .child(
                 div()
                     .mx(px(16.))

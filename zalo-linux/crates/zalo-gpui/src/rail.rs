@@ -267,6 +267,7 @@ impl ShellView {
     ) -> impl IntoElement {
         mark_btn(id, code, fallback, label, on, RAIL_ICON_PX, badge).on_click(cx.listener(
             move |this, _, _, cx| {
+                this.clear_sidebar_search(cx);
                 this.set_rail(rail);
                 cx.notify();
             },
@@ -295,6 +296,7 @@ impl ShellView {
                 if screenshot {
                     this.capture_screenshot(Some(window.window_handle()), cx);
                 } else if matches!(rail, Some(Rail::Settings)) {
+                    this.clear_sidebar_search(cx);
                     this.rail_popup = None;
                     if matches!(this.menu.as_ref().map(|m| &m.kind), Some(MenuKind::Gear)) {
                         this.menu = None;
@@ -302,6 +304,7 @@ impl ShellView {
                         this.open_menu(MenuKind::Gear, event.position(), window);
                     }
                 } else if let Some(rail) = rail {
+                    this.clear_sidebar_search(cx);
                     let popup = match rail {
                         Rail::Cloud => Some(RailPopup::ZCloud),
                         Rail::Tools => Some(RailPopup::Tools),

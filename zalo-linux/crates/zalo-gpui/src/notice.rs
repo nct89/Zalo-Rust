@@ -760,7 +760,7 @@ impl Render for NoticeView {
                                     cx.stop_propagation();
                                 },
                             )
-                            .child("×"),
+                            .child(crate::fonts::icon_el(crate::fonts::ic::CLOSE_LINE, "×", 14.)),
                     ),
             )
     }

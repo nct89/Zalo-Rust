@@ -34,6 +34,8 @@ mod call_screen;
 mod call_screen;
 mod call_video;
 mod chat;
+mod chat_select;
+mod code_detect;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod clip;
 #[cfg(target_os = "macos")]

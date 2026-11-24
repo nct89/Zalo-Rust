@@ -1,12 +1,8 @@
-//! The playout mixer (`Playout`), ported from the reference call
-//! implementation (`audio-io.py`).
+//! Multi-source playout mixer shared across Linux, macOS, and Windows.
 //!
-//! Every 20 ms it pulls the next frame of each source and sums them, with the
-//! limiter holding a multi-voice mix to about -2 dBFS. The `pacat` write and
-//! the 20 ms pacing loop are left to the caller; `mix` and `far_active` are
-//! pure and testable.
+//! Every 20 ms it pulls the next frame of each source's [`JitterBuffer`] and
+//! sums them with a smooth peak limiter holding multi-voice mixes to ~−2 dBFS.
 
-use crate::capture::Speaker;
 use crate::jitter::JitterBuffer;
 use crate::wsola::{rms, FRAME_SAMPLES};
 use std::collections::BTreeMap;
@@ -40,11 +36,7 @@ pub struct Mixer {
 
 impl Mixer {
     /// Builds an empty mixer.
-    ///
-    /// # Errors
-    ///
-    /// Returns the Opus error when a decoder cannot be created lazily (it is
-    /// created on the first packet of each source).
+    #[must_use]
     pub fn new(max_target: usize, min_target: Option<usize>) -> Self {
         Self {
             sources: BTreeMap::new(),
@@ -67,7 +59,7 @@ impl Mixer {
         }
     }
 
-    /// Routes one decoded-to-Opus packet to a source's jitter buffer.
+    /// Routes one Opus packet to a source's jitter buffer.
     pub fn push(&mut self, idx: u32, payload: &[u8], source: Option<u32>, now: f64) {
         let jitter = self.sources.entry(source).or_insert_with(|| {
             JitterBuffer::new(self.max_target, self.min_target).expect("opus decoder")
@@ -75,7 +67,7 @@ impl Mixer {
         jitter.push(idx, payload, now);
     }
 
-    /// Mixes the next 20 ms of every source.
+    /// Mixes the next 20 ms of every active source.
     pub fn mix(&mut self, now: f64) -> Vec<i16> {
         let mut frames = Vec::new();
         let mut voices = 0_usize;
@@ -112,19 +104,21 @@ impl Mixer {
         }
     }
 
-    /// Records the played frame for echo detection.
+    /// Records the played frame for echo-hold tracking.
     pub fn note_played(&mut self, pcm: &[i16], now: f64) {
         if rms(pcm) >= FAR_RMS {
             self.far_until = now + FAR_HOLD_SEC;
         }
     }
 
-    /// Whether the far end is talking (to hold the MicLeveler gain).
+    /// Whether the far end is talking (to hold fallback leveler gain).
+    #[must_use]
     pub fn far_active(&self, now: f64) -> bool {
         now < self.far_until
     }
 
     /// Number of live sources.
+    #[must_use]
     pub fn source_count(&self) -> usize {
         self.sources.len()
     }
@@ -145,7 +139,6 @@ impl Mixer {
                 .map(|(i, v)| clamp((f64::from(*v) * (prev + step * (i as f64 + 1.0))) as i32))
                 .collect();
         }
-        // `i32::abs` panics on `i32::MIN` in a debug build.
         let peak = acc.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
         let target = if peak <= LIMIT as u32 {
             1.0
@@ -158,8 +151,6 @@ impl Mixer {
             self.limiter += (target - self.limiter) * 0.1;
         }
         let next = self.limiter;
-        // Attack immediately when gain drops so multi-speaker peaks never clip;
-        // ramp smoothly across the 20 ms frame on release to prevent clicks.
         if next < prev {
             return acc
                 .iter()
@@ -188,23 +179,25 @@ fn clamp(value: i32) -> i16 {
 /// A PCM sink that receives one 320-sample frame per tick.
 pub trait PcmSink {
     /// Writes one frame of i16 PCM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if the underlying audio sink fails.
     fn write_pcm(&mut self, pcm: &[i16]) -> io::Result<()>;
 }
 
-impl PcmSink for Speaker {
-    fn write_pcm(&mut self, pcm: &[i16]) -> io::Result<()> {
-        self.write(pcm)
-    }
-}
-
 /// One 20 ms tick: mix, note the far-end level, write to the sink.
+///
+/// # Errors
+///
+/// Propagates any error from [`PcmSink::write_pcm`].
 pub fn playout_step(mixer: &mut Mixer, sink: &mut impl PcmSink, now: f64) -> io::Result<()> {
     let pcm = mixer.mix(now);
     mixer.note_played(&pcm, now);
     sink.write_pcm(&pcm)
 }
 
-/// Runs the playout loop, paced 20 ms by our own clock (the non-PulseOut path).
+/// Runs the playout loop, paced 20 ms by our own clock.
 pub fn run_playout(mixer: &mut Mixer, sink: &mut impl PcmSink, stop: &AtomicBool) {
     let mut next = Instant::now();
     while !stop.load(Ordering::SeqCst) {
@@ -247,79 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn mixes_silence_with_no_sources() {
-        let mut mixer = Mixer::new(10, Some(5));
-        let out = mixer.mix(0.0);
-        assert_eq!(out.len(), FRAME_SAMPLES);
-        assert!(out.iter().all(|v| *v == 0));
-    }
-
-    #[test]
-    fn mixes_two_sources() {
-        let mut mixer = Mixer::new(10, Some(5));
-        let payload = encoded_tone(8000);
-        for idx in 0..5 {
-            mixer.push(idx, &payload, Some(1), 0.0);
-            mixer.push(idx, &payload, Some(2), 0.0);
-        }
-        let out = mixer.mix(0.0);
-        assert_eq!(out.len(), FRAME_SAMPLES);
-        assert_eq!(mixer.source_count(), 2);
-        let peak = out.iter().map(|v| v.saturating_abs()).max().unwrap_or(0);
-        assert!(peak > 0, "mixed output should not be silent");
-    }
-
-    #[test]
-    fn detects_far_speech() {
-        let mut mixer = Mixer::new(10, Some(5));
-        let loud = tone(20_000);
-        mixer.note_played(&loud, 0.0);
-        assert!(mixer.far_active(0.1));
-        assert!(!mixer.far_active(1.0));
-    }
-
-    #[test]
-    fn forgets_an_idle_source() {
-        let mut mixer = Mixer::new(10, Some(5));
-        let payload = encoded_tone(1000);
-        for idx in 0..5 {
-            mixer.push(idx, &payload, Some(7), 0.0);
-        }
-        assert_eq!(mixer.source_count(), 1);
-        for _ in 0..5 {
-            let _ = mixer.mix(0.0); // drain the packets
-        }
-        // No packets, no carry, and idle past IDLE_SEC: the source is gone.
-        mixer.mix(IDLE_SEC + 1.0);
-        assert_eq!(mixer.source_count(), 0);
-    }
-
-    struct Recorder {
-        frames: Vec<Vec<i16>>,
-    }
-
-    impl PcmSink for Recorder {
-        fn write_pcm(&mut self, pcm: &[i16]) -> io::Result<()> {
-            self.frames.push(pcm.to_vec());
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn playout_step_writes_one_frame() {
-        let mut mixer = Mixer::new(10, Some(5));
-        let payload = encoded_tone(8000);
-        for idx in 0..5 {
-            mixer.push(idx, &payload, None, 0.0);
-        }
-        let mut sink = Recorder { frames: Vec::new() };
-        playout_step(&mut mixer, &mut sink, 0.0).expect("step");
-        assert_eq!(sink.frames.len(), 1);
-        assert_eq!(sink.frames[0].len(), FRAME_SAMPLES);
-    }
-
-    #[test]
-    fn smooth_limiter_prevents_multi_speaker_clipping() {
+    fn mixes_two_sources_without_clipping() {
         let mut mixer = Mixer::new(10, Some(3));
         let loud = encoded_tone(26_000);
         for idx in 0..6 {

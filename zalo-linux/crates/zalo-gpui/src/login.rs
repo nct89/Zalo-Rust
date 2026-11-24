@@ -208,6 +208,7 @@ impl LoginView {
             .id("login-menu-dismiss")
             .absolute()
             .inset(px(0.))
+            .occlude()
             .on_click(cx.listener(|this, _, _, cx| {
                 this.menu_open = false;
                 cx.notify();
@@ -383,10 +384,14 @@ impl Render for LoginView {
                         .child(
                             div()
                                 .id("login-drag-strip")
+                                .window_control_area(gpui::WindowControlArea::Drag)
+                                .occlude()
                                 .flex_1()
                                 .h_full()
-                                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                                    window.start_window_move();
+                                .when(!cfg!(target_os = "windows"), |el| {
+                                    el.on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                                        window.start_window_move();
+                                    })
                                 }),
                         )
                         .child(self.hamburger(cx)),

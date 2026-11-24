@@ -100,6 +100,21 @@ impl AudioPipeline {
         self.encoder.set_packet_loss_perc(loss_perc)
     }
 
+    /// Feeds raw hardware capture samples into [`ClipGuard`] without running
+    /// the legacy [`MicLeveler`] (used when WebRTC AGC2 owns digital gain).
+    pub fn feed_clip_guard(&mut self, raw_clip: &[i16], muted: bool, now: f64) {
+        if !muted {
+            let step = self
+                .clip_guard
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .feed(raw_clip, now);
+            if let Some(step) = step {
+                self.pending_clip = Some(step);
+            }
+        }
+    }
+
     /// Encodes one 320-sample frame already processed by in-process WebRTC APM
     /// (`InProcessApm`), skipping the redundant software `MicLeveler` so only a
     /// single AGC/limiter stage runs (matching Windows `ZaloCall.exe`).

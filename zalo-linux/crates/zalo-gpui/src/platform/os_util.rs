@@ -48,6 +48,50 @@ pub(crate) fn open_external(target: impl AsRef<OsStr>) -> io::Result<()> {
     }
 }
 
+/// Opens an `http://` or `https://` URL in the user's web browser.
+///
+/// On Linux, GPUI's `cx.open_url` routes through `ashpd::OpenFileRequest`, which
+/// on XFCE / misconfigured portals can launch the file manager instead of the
+/// web browser. Calling the system web-browser opener directly avoids that bug.
+pub(crate) fn open_url(url: &str) {
+    let url = url.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return;
+    }
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    {
+        let _ = open_external(url);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        // Prefer real system browser launchers over any sandboxed PATH wrapper
+        // or broken xdg-desktop-portal OpenFile handler.
+        let candidates: &[(&str, &[&str])] = &[
+            ("/usr/bin/xfce4-open", &["--launch", "WebBrowser", url]),
+            ("/usr/bin/exo-open", &["--launch", "WebBrowser", url]),
+            ("/usr/bin/x-www-browser", &[url]),
+            ("/usr/bin/xdg-open", &[url]),
+            ("/usr/bin/gio", &["open", url]),
+            ("/usr/bin/google-chrome", &[url]),
+            ("/usr/bin/firefox", &[url]),
+            ("xdg-open", &[url]),
+        ];
+        for (prog, args) in candidates {
+            if prog.starts_with('/') && !Path::new(prog).is_file() {
+                continue;
+            }
+            let mut cmd = std::process::Command::new(prog);
+            cmd.args(*args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if cmd.spawn().is_ok() {
+                return;
+            }
+        }
+    }
+}
+
 /// Returns `(drive_or_mount, total_bytes, used_bytes, available_bytes)` on Windows
 /// via `GetDiskFreeSpaceExW`.
 #[cfg(target_os = "windows")]

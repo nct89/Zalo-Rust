@@ -1194,7 +1194,7 @@ impl ShellView {
                         this.sticker_open = false;
                         cx.notify();
                     }))
-                    .child("×"),
+                    .child(crate::fonts::icon_el(crate::fonts::ic::CLOSE_LINE, "×", 15.)),
             )
     }
 

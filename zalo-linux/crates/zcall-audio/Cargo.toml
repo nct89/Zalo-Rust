@@ -13,6 +13,5 @@ workspace = true
 [dependencies]
 libpulse-binding = "2.29"
 libpulse-simple-binding = "2.29"
-nnnoiseless = "0.5"
-sonora = "0.3"
 zcall-core = { workspace = true }
+zcall-dsp = { workspace = true }

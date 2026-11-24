@@ -1,13 +1,14 @@
-//! WSOLA time-stretch and RMS helpers, ported from the reference call
-//! implementation (`audio-io.py`).
+//! WSOLA time-stretch and RMS helpers for the jitter buffer.
 //!
 //! `wsola_shrink` shortens the playout buffer by one pitch period when it grows
-//! past its target, like NetEq's Accelerate. Pure DSP, no Opus or threads.
+//! past its target, like NetEq's Accelerate. Uses Normalized Cross-Correlation
+//! (NCC) so rising speech onsets never bias the pitch lag toward the boundary.
 
 /// Samples in one 20 ms frame at 16 kHz.
 pub const FRAME_SAMPLES: usize = 320;
 
 /// RMS of an i16 frame.
+#[must_use]
 pub fn rms(samples: &[i16]) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -16,22 +17,38 @@ pub fn rms(samples: &[i16]) -> f64 {
     (sum / samples.len() as f64).sqrt()
 }
 
-/// Lag, in samples, of one pitch period inside 2.5..10 ms.
+/// Lag, in samples, of one pitch period inside 2.5..10 ms (40..=160 @ 16 kHz)
+/// using Normalized Cross-Correlation so rising envelopes do not skew the lag.
+#[must_use]
 pub fn pitch_lag(samples: &[i16]) -> usize {
     let window = 80_usize;
     let limit = 160_usize.min(samples.len().saturating_sub(window + 1));
     if limit < 40 {
         return 80;
     }
-    let mut best: Option<i64> = None;
+    let mut base_energy = 0.0_f64;
+    for &s in &samples[..window] {
+        let v = f64::from(s);
+        base_energy += v * v;
+    }
+    if base_energy < 1.0 {
+        return 80;
+    }
+    let mut best_score = f64::NEG_INFINITY;
     let mut best_lag = 80_usize;
     for lag in (40..=limit).step_by(2) {
-        let mut score = 0_i64;
+        let mut dot = 0.0_f64;
+        let mut shift_energy = 0.0_f64;
         for i in 0..window {
-            score += i64::from(samples[i]) * i64::from(samples[i + lag]);
+            let a = f64::from(samples[i]);
+            let b = f64::from(samples[i + lag]);
+            dot += a * b;
+            shift_energy += b * b;
         }
-        if best.is_none() || score > best.unwrap() {
-            best = Some(score);
+        let denom = (base_energy * shift_energy).sqrt() + 1.0;
+        let score = dot / denom;
+        if score > best_score {
+            best_score = score;
             best_lag = lag;
         }
     }
@@ -42,6 +59,7 @@ pub fn pitch_lag(samples: &[i16]) -> usize {
 ///
 /// Returns `(20 ms to play, the rest)`. The join is an overlap-add so the
 /// sample stream does not jump.
+#[must_use]
 pub fn wsola_shrink(pcm: &[i16]) -> (Vec<i16>, Vec<i16>) {
     if pcm.len() < FRAME_SAMPLES * 2 {
         let mut play = pcm.to_vec();
@@ -103,6 +121,24 @@ mod tests {
         let lag = pitch_lag(&sine_1k(10_000, 640));
         assert!((40..=160).contains(&lag), "lag {lag}");
         assert_eq!(lag % 16, 0, "1 kHz period 16 -> lag {lag}");
+    }
+
+    #[test]
+    fn pitch_lag_tracks_true_period_even_on_rising_onset() {
+        // 250 Hz sine wave (period = 64 samples @ 16 kHz) with a steep rising ramp:
+        // unnormalized dot-product would wrongly pick lag=160; NCC picks 64 or 128.
+        let rising: Vec<i16> = (0..640)
+            .map(|i| {
+                let env = 0.2 + 0.8 * (i as f64 / 640.0);
+                let t = i as f64 / 16_000.0;
+                (env * 18_000.0 * (2.0 * std::f64::consts::PI * 250.0 * t).sin()).round() as i16
+            })
+            .collect();
+        let lag = pitch_lag(&rising);
+        assert!(
+            lag == 64 || lag == 128,
+            "NCC should pick a true 250 Hz period (64 or 128), got {lag}"
+        );
     }
 
     #[test]

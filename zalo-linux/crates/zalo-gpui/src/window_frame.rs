@@ -201,6 +201,11 @@ pub fn wrap_csd(window: &mut Window, content: impl IntoElement) -> gpui::AnyElem
     // widgets (e.g. blue `#main-tab` rail) anti-alias directly against the
     // desktop with zero white-plate fringing. On non-composited X11 paint solid
     // `paper` with 0 px corners so no premultiplied-black crumbs appear.
+    //
+    // Only stop left-mouse-down propagation when CSD edge-resize pads are active
+    // on `#window-backdrop`. On Windows (`corners.any_pad() == false`), GPUI
+    // dispatches `MouseDown` inside `WM_NCLBUTTONDOWN(HTCAPTION)` and only
+    // forwards the drag to `DefWindowProcW` when `propagate` stays true.
     let chrome = corners.apply(
         div()
             .id("window-chrome")
@@ -209,8 +214,10 @@ pub fn wrap_csd(window: &mut Window, content: impl IntoElement) -> gpui::AnyElem
             .overflow_hidden()
             .when(composited, |el| el.bg(transparent_black()))
             .when(!composited, |el| el.bg(rgb(paper)))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                cx.stop_propagation();
+            .when(corners.any_pad(), |el| {
+                el.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
             })
             .child(content)
             .when(show_hairline, |el| el.child(frame_hairline(corners))),
@@ -228,11 +235,13 @@ pub fn wrap_csd(window: &mut Window, content: impl IntoElement) -> gpui::AnyElem
         .relative()
         .bg(transparent_black())
         .size_full()
-        .on_mouse_down(MouseButton::Left, move |event, window, _| {
-            let size = window.window_bounds().get_bounds().size;
-            if let Some(edge) = resize_edge(event.position, px(GRIP), size) {
-                window.start_window_resize(edge);
-            }
+        .when(corners.any_pad(), |el| {
+            el.on_mouse_down(MouseButton::Left, move |event, window, _| {
+                let size = window.window_bounds().get_bounds().size;
+                if let Some(edge) = resize_edge(event.position, px(GRIP), size) {
+                    window.start_window_resize(edge);
+                }
+            })
         })
         .child(chrome)
         .when(corners.pad_left, |el| {

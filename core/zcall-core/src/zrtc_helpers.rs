@@ -173,17 +173,16 @@ impl Default for AudioProcessingOptions {
     fn default() -> Self {
         Self {
             aec: true,
-            // Powered by in-process RNNoise (`nnnoiseless`), which preserves
-            // continuous speech while suppressing steady background noise
-            // (fans, keyboards, hiss). Opt out via ZCALL_NOISE_SUPPRESSION=0
-            // or the in-app Call Settings / Device Status toggle.
+            // Powered by in-process WebRTC native NS (`sonora-ns`), matching
+            // official Zalo Windows/Android (`audioNSLevel: 2`) without
+            // 16->48 kHz upsample artifacts. Opt out via ZCALL_NOISE_SUPPRESSION=0.
             noise_suppression: true,
             ns_level: 2,
             high_pass: false,
-            // Zalo's agcMode=3 is fixed digital, not AGC2 AdaptiveDigital.
-            // Keep sonora AGC2 off so AudioPipeline's single smooth MicLeveler
-            // owns gain without pumping background noise/comfort noise.
-            gain_control: false,
+            // Powered by in-process WebRTC AGC2 + smooth limiter (`sonora`),
+            // avoiding MicLeveler's per-frame 20 ms limiter step clicks.
+            // Opt out via ZCALL_AGC2=0.
+            gain_control: true,
             agc_gain_db: 9,
             voice_detection: false,
         }
@@ -197,11 +196,17 @@ pub fn noise_suppression_requested() -> bool {
         && std::env::var("ZCALL_NOISE_SUPPRESSION").ok().as_deref() != Some("0")
 }
 
-/// Returns `true` only when the user explicitly opted into WebRTC AGC2 via
-/// `ZCALL_AGC2=1`.
+/// Returns `true` only when the user explicitly opted into native 48 kHz AI
+/// noise suppression (RNNoise) via `ZCALL_AI_NS=1`.
+pub fn ai_noise_suppression_requested() -> bool {
+    noise_suppression_requested() && std::env::var("ZCALL_AI_NS").ok().as_deref() == Some("1")
+}
+
+/// Returns `true` unless the user explicitly opted out of WebRTC AGC2 via
+/// `ZCALL_AGC2=0` or `ZCALL_AUDIO_PROCESSING=0`.
 pub fn agc2_requested() -> bool {
     std::env::var("ZCALL_AUDIO_PROCESSING").ok().as_deref() != Some("0")
-        && std::env::var("ZCALL_AGC2").ok().as_deref() == Some("1")
+        && std::env::var("ZCALL_AGC2").ok().as_deref() != Some("0")
 }
 
 /// Returns `true` unless the user explicitly opted out via `ZCALL_AEC=0`
@@ -216,7 +221,7 @@ pub fn audio_processing_options(config: &Value) -> AudioProcessingOptions {
     let c = config.as_object();
     let ns_level = num(c, "audioNSLevel")
         .map(|v| v.round().clamp(0.0, 3.0) as u8)
-        .unwrap_or(0);
+        .unwrap_or(1);
     let agc_gain_db = num(c, "agcGain")
         .filter(|v| *v >= 0.0)
         .map(|v| v.round().clamp(0.0, 30.0) as u8)
@@ -447,7 +452,8 @@ mod tests {
         let opts = audio_processing_options(&json!({}));
         assert!(opts.aec);
         assert!(opts.noise_suppression);
-        assert!(!opts.gain_control);
+        assert_eq!(opts.ns_level, 1);
+        assert!(opts.gain_control);
         assert_eq!(opts.agc_gain_db, 9);
         assert!(!opts.high_pass);
 

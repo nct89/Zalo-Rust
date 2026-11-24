@@ -196,6 +196,8 @@ struct PhotoView {
     /// In-frame ffmpeg frames. `None` while the video is stopped.
     video_pump: Option<VideoPump>,
     video_seq: u64,
+    /// Open right-click context menu position `(x, y)` in chrome pixels.
+    context_menu: Option<(f32, f32)>,
 }
 
 struct VideoPump {
@@ -257,6 +259,7 @@ impl PhotoView {
             mute_video,
             video_pump: None,
             video_seq: 0,
+            context_menu: None,
         };
         this.load_thumbs(cx);
         this.reload(cx);
@@ -426,6 +429,7 @@ impl PhotoView {
 
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.stop_video();
+        self.context_menu = None;
         let next = self.index as isize + delta;
         if next < 0 || next >= self.items.len() as isize {
             return;
@@ -907,6 +911,9 @@ impl PhotoView {
     fn on_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         match key {
             "escape" => {
+                if self.context_menu.take().is_some() {
+                    return true;
+                }
                 if !self.ocr_selected.is_empty() {
                     self.ocr_selected.clear();
                     self.ocr_drag = None;
@@ -1203,6 +1210,7 @@ impl Render for PhotoView {
                         cx.notify();
                     }
                 }))
+                .relative()
                 .flex()
                 .flex_col()
                 .size_full()
@@ -1241,6 +1249,17 @@ impl Render for PhotoView {
                         .child(
                             div()
                                 .id("zalo-photo-stage")
+                                .on_mouse_down(
+                                    gpui::MouseButton::Right,
+                                    cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        let (mx, my) = crate::window_frame::window_to_chrome(
+                                            window, e.position,
+                                        );
+                                        this.context_menu = Some((mx, my));
+                                        cx.notify();
+                                    }),
+                                )
                                 .on_scroll_wheel(cx.listener(
                                     |this, e: &ScrollWheelEvent, _, cx| {
                                         cx.stop_propagation();
@@ -1498,12 +1517,12 @@ impl Render for PhotoView {
                                                                   cx| {
                                                                 cx.stop_propagation();
                                                                 this.ocr_drag = None;
+                                                                let (cx_pos, cy_pos) =
+                                                                    crate::window_frame::window_to_chrome(
+                                                                        window,
+                                                                        e.position,
+                                                                    );
                                                                 if this.ocr_selected.is_empty() {
-                                                                    let (cx_pos, cy_pos) =
-                                                                        crate::window_frame::window_to_chrome(
-                                                                            window,
-                                                                            e.position,
-                                                                        );
                                                                     let lx = (cx_pos - img_left)
                                                                         .clamp(0.0, dw);
                                                                     let ly = (cy_pos
@@ -1524,7 +1543,8 @@ impl Render for PhotoView {
                                                                             .insert(hit);
                                                                     }
                                                                 }
-                                                                this.copy_ocr_selection(cx);
+                                                                this.context_menu =
+                                                                    Some((cx_pos, cy_pos));
                                                                 cx.notify();
                                                             },
                                                         ),
@@ -2182,8 +2202,250 @@ impl Render for PhotoView {
                                     })),
                                 ),
                         ),
-                ),
+                )
+                .when(self.context_menu.is_some(), |el| {
+                    el.child(self.context_menu_overlay(window, cx))
+                }),
         )
+    }
+}
+
+impl PhotoView {
+    /// Right-click context menu inside `Zalo Photo`, mirroring conversation photo actions.
+    fn context_menu_overlay(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some((raw_x, raw_y)) = self.context_menu else {
+            return div().into_any_element();
+        };
+        let is_video = self.current().kind == MsgKind::Video;
+        let can_ocr = matches!(
+            self.current().kind,
+            MsgKind::Photo | MsgKind::Doodle | MsgKind::Gif
+        );
+        let ocr_live = self.ocr_active && !self.ocr_boxes.is_empty() && !is_video;
+        let rail_open = self.rail_open;
+
+        const MENU_W: f32 = 224.0;
+        const ITEM_H: f32 = 34.0;
+        let item_count: usize = (if ocr_live { 1 } else { 0 })
+            + (if !is_video { 1 } else { 0 }) // Copy image
+            + 2 // Save, Share
+            + (if can_ocr { 1 } else { 0 })
+            + (if !is_video { 3 } else { 0 }) // Rotate L, Rotate R, Fit 100%
+            + 1; // Toggle filmstrip
+        let menu_h = 16.0 + item_count as f32 * (ITEM_H + 2.0) + 18.0;
+
+        let vp = window.viewport_size();
+        let csd = if crate::window_frame::CsdCorners::from_window(window).any_pad() {
+            zalo_design::WINDOW_SHADOW * 2.0
+        } else {
+            0.0
+        };
+        let vw = (f32::from(vp.width) - csd).max(320.0);
+        let vh = (f32::from(vp.height) - csd).max(240.0);
+        let x = if raw_x + MENU_W + 6.0 <= vw {
+            raw_x
+        } else {
+            (raw_x - MENU_W).clamp(6.0, (vw - MENU_W - 6.0).max(6.0))
+        };
+        let y = if raw_y + menu_h + 6.0 <= vh {
+            raw_y
+        } else {
+            (raw_y - menu_h).clamp(6.0, (vh - menu_h - 6.0).max(6.0))
+        };
+
+        let menu_bg = 0x2b_2d_31;
+        let menu_hover = 0x3b_3e_45;
+        let menu_ink = 0xf3_f4_f6;
+        let row_btn = |id: &'static str, icon: char, fallback: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .h(px(ITEM_H))
+                .px(px(10.))
+                .rounded(px(5.))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.))
+                .cursor_pointer()
+                .text_size(px(13.5))
+                .text_color(rgb(menu_ink))
+                .hover(move |st| st.bg(rgb(menu_hover)))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .w(px(18.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::fonts::icon_el(icon, fallback, 16.)),
+                )
+                .child(label)
+        };
+        let sep = || {
+            div()
+                .h(px(1.))
+                .my(px(4.))
+                .mx(px(6.))
+                .bg(hsla(0., 0., 1., 0.1))
+        };
+
+        div()
+            .id("zalo-photo-ctx-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.context_menu = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let (mx, my) = crate::window_frame::window_to_chrome(window, e.position);
+                    this.context_menu = Some((mx, my));
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("zalo-photo-ctx-panel")
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(MENU_W))
+                    .p(px(6.))
+                    .rounded(px(8.))
+                    .bg(rgb(menu_bg))
+                    .border_1()
+                    .border_color(hsla(0., 0., 1., 0.14))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .when(ocr_live, |el| {
+                        el.child(
+                            row_btn(
+                                "pctx-ocr-copy",
+                                IC_COPY,
+                                "📋",
+                                "Sao chép văn bản đã quét",
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.context_menu = None;
+                                this.copy_ocr_selection(cx);
+                                cx.notify();
+                            })),
+                        )
+                        .child(sep())
+                    })
+                    .when(!is_video, |el| {
+                        el.child(
+                            row_btn("pctx-copy", IC_COPY, "📋", "Copy hình ảnh").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.context_menu = None;
+                                    this.copy_current(cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                    })
+                    .child(
+                        row_btn("pctx-save", IC_DOWNLOAD, "⬇", "Lưu về máy").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.context_menu = None;
+                                this.save_current(cx);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        row_btn("pctx-share", IC_SHARE, "↗", "Chia sẻ").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.context_menu = None;
+                                this.share_current(cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(can_ocr, |el| {
+                        el.child(
+                            row_btn("pctx-ocr", IC_OCR, "🔍", "Quét chữ (OCR)").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.context_menu = None;
+                                    this.start_ocr(cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                    })
+                    .when(!is_video, |el| {
+                        el.child(sep())
+                            .child(
+                                row_btn("pctx-rot-l", IC_ROTATE_L, "↺", "Xoay trái").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.context_menu = None;
+                                        this.rotate(-1, cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                row_btn("pctx-rot-r", IC_ROTATE_L, "↻", "Xoay phải").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.context_menu = None;
+                                        this.rotate(1, cx);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .child(
+                                row_btn("pctx-fit", IC_ZOOM_OUT, "⊡", "Vừa khung").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.context_menu = None;
+                                        this.set_zoom(1.0);
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                    })
+                    .child(sep())
+                    .child(
+                        row_btn(
+                            "pctx-rail",
+                            crate::fonts::ic::HDR_RIGHT_BAR,
+                            "▤",
+                            if rail_open {
+                                "Ẩn danh sách ảnh"
+                            } else {
+                                "Hiện danh sách ảnh"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.context_menu = None;
+                            this.rail_open = !this.rail_open;
+                            cx.notify();
+                        })),
+                    ),
+            )
+            .into_any_element()
     }
 }
 

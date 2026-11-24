@@ -13,8 +13,7 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamConfig};
-
-use crate::resample_to_device;
+use zcall_dsp::resampler::PolyphaseResampler;
 
 /// Bytes of one 20 ms, 16 kHz mono `i16` frame.
 pub const FRAME_BYTES: usize = 640;
@@ -58,9 +57,9 @@ pub struct CardSpeaker {
     queue: Arc<Mutex<VecDeque<f32>>>,
     space: Arc<Condvar>,
     closed: Arc<AtomicBool>,
+    resampler: Mutex<PolyphaseResampler>,
     out_rate: u32,
     out_channels: u16,
-    in_rate: u32,
     in_channels: u8,
 }
 
@@ -118,9 +117,9 @@ impl CardSpeaker {
             queue,
             space,
             closed,
+            resampler: Mutex::new(PolyphaseResampler::new(rate, out_rate)),
             out_rate,
             out_channels,
-            in_rate: rate,
             in_channels: channels,
         })
     }
@@ -134,13 +133,11 @@ impl CardSpeaker {
         if pcm.is_empty() {
             return Ok(());
         }
-        let samples = resample_to_device(
-            pcm,
-            self.in_rate,
-            self.in_channels,
-            self.out_rate,
-            self.out_channels,
-        );
+        let samples = self
+            .resampler
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .upmix_i16_to_f32(pcm, self.in_channels, self.out_channels);
         let cap = queued_cap(self.out_rate, self.out_channels, CARD_LATENCY_MS);
         let mut guard = self.queue.lock().unwrap_or_else(|err| err.into_inner());
         while guard.len() + samples.len() > cap && !self.closed.load(Ordering::Acquire) {
@@ -361,32 +358,22 @@ fn queued_cap(rate: u32, channels: u16, latency_ms: u32) -> usize {
 }
 
 struct InputState {
-    phase: f64,
+    resampler: PolyphaseResampler,
     pending: Vec<i16>,
 }
 
 fn consume_device_input(
     state: &mut InputState,
-    device_rate: u32,
     channels: u16,
     samples: &[f32],
     queue: &Mutex<VecDeque<i16>>,
     ready: &Condvar,
 ) {
-    if device_rate == 0 || channels == 0 {
+    if channels == 0 || samples.is_empty() {
         return;
     }
-    let step = f64::from(CALL_RATE) / f64::from(device_rate);
-    for frame in samples.chunks(usize::from(channels)) {
-        let sum: f32 = frame.iter().copied().sum();
-        let mono = sum / f32::from(channels);
-        state.phase += step;
-        if state.phase >= 1.0 {
-            state.phase -= 1.0;
-            let sample = (mono.clamp(-1.0, 1.0) * 32767.0) as i16;
-            state.pending.push(sample);
-        }
-    }
+    let converted = state.resampler.downmix_f32_to_i16(samples, channels);
+    state.pending.extend(converted);
     if state.pending.len() >= FRAME_SAMPLES {
         push_i16(queue, ready, &state.pending);
         state.pending.clear();
@@ -514,7 +501,7 @@ fn build_input(
     let stream = match format {
         SampleFormat::F32 => {
             let state = Arc::new(Mutex::new(InputState {
-                phase: 0.0,
+                resampler: PolyphaseResampler::new(device_rate, CALL_RATE),
                 pending: Vec::new(),
             }));
             device.build_input_stream(
@@ -524,14 +511,7 @@ fn build_input(
                         return;
                     }
                     if let Ok(mut guard) = state.lock() {
-                        consume_device_input(
-                            &mut guard,
-                            device_rate,
-                            channels,
-                            data,
-                            &queue,
-                            &ready,
-                        );
+                        consume_device_input(&mut guard, channels, data, &queue, &ready);
                     }
                 },
                 err_fn,
@@ -540,7 +520,7 @@ fn build_input(
         }
         SampleFormat::I16 => {
             let state = Arc::new(Mutex::new(InputState {
-                phase: 0.0,
+                resampler: PolyphaseResampler::new(device_rate, CALL_RATE),
                 pending: Vec::new(),
             }));
             device.build_input_stream(
@@ -554,14 +534,7 @@ fn build_input(
                         .map(|sample| f32::from(*sample) / 32768.0)
                         .collect();
                     if let Ok(mut guard) = state.lock() {
-                        consume_device_input(
-                            &mut guard,
-                            device_rate,
-                            channels,
-                            &floats,
-                            &queue,
-                            &ready,
-                        );
+                        consume_device_input(&mut guard, channels, &floats, &queue, &ready);
                     }
                 },
                 err_fn,
@@ -570,7 +543,7 @@ fn build_input(
         }
         SampleFormat::U16 => {
             let state = Arc::new(Mutex::new(InputState {
-                phase: 0.0,
+                resampler: PolyphaseResampler::new(device_rate, CALL_RATE),
                 pending: Vec::new(),
             }));
             device.build_input_stream(
@@ -584,14 +557,7 @@ fn build_input(
                         .map(|sample| (f32::from(*sample) - 32768.0) / 32768.0)
                         .collect();
                     if let Ok(mut guard) = state.lock() {
-                        consume_device_input(
-                            &mut guard,
-                            device_rate,
-                            channels,
-                            &floats,
-                            &queue,
-                            &ready,
-                        );
+                        consume_device_input(&mut guard, channels, &floats, &queue, &ready);
                     }
                 },
                 err_fn,

@@ -12,6 +12,15 @@ use std::process::{Child, Command, Stdio};
 /// Bytes of one 20 ms, 16 kHz mono i16 frame.
 pub const FRAME_BYTES: usize = 640;
 
+/// Native hardware sample rate matching PipeWire's default graph clock (Hz).
+pub const NATIVE_RATE: u32 = 48_000;
+
+/// Samples in one 20 ms, 48 kHz mono i16 frame.
+pub const NATIVE_FRAME_SAMPLES: usize = 960;
+
+/// Bytes in one 20 ms, 48 kHz mono i16 frame.
+pub const NATIVE_FRAME_BYTES: usize = NATIVE_FRAME_SAMPLES * 2;
+
 /// The microphone capture command.
 ///
 /// Same flags as `audio-io.py` `mic_command`: 16 kHz mono s16le, 20 ms.
@@ -159,12 +168,18 @@ fn pw_play_command(sink: Option<&str>) -> Vec<String> {
     cmd
 }
 
-/// Target device buffer of [`CardSpeaker`], in milliseconds.
-pub const CARD_LATENCY_MS: u32 = 60;
+/// Target device buffer of [`CardSpeaker`], in milliseconds (4 × 20 ms frames).
+pub const CARD_LATENCY_MS: u32 = 80;
+/// Prebuffer before playback begins, in milliseconds (2 × 20 ms frames).
+/// Keeping `prebuf < tlength` prevents `pipewire-pulse` from corking/popping on
+/// minor scheduling jitter.
+const CARD_PREBUF_MS: u32 = 40;
 
 /// Playback through `libpulse-simple`. `write` blocks until the stream has room.
 pub struct CardSpeaker {
     simple: libpulse_simple_binding::Simple,
+    rate: u32,
+    channels: u8,
 }
 
 impl CardSpeaker {
@@ -176,6 +191,22 @@ impl CardSpeaker {
     /// back to [`Speaker`].
     pub fn open(device: Option<&str>) -> Result<Self, std::io::Error> {
         Self::open_spec(device, 16_000, 1, "Call")
+    }
+
+    /// Opens the default sink, or `device` when set, at native 48 kHz mono so
+    /// PipeWire does not insert a 16↔48 kHz resampler across quantum boundaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `libpulse-simple` cannot connect.
+    pub fn open_48k(device: Option<&str>) -> Result<Self, std::io::Error> {
+        Self::open_spec(device, NATIVE_RATE, 1, "Call")
+    }
+
+    /// Sample rate of the opened playback stream in Hz.
+    #[must_use]
+    pub fn sample_rate(&self) -> u32 {
+        self.rate
     }
 
     /// Opens the default sink, or `device` when set, with an arbitrary PCM
@@ -203,14 +234,15 @@ impl CardSpeaker {
         if !spec.is_valid() {
             return Err(std::io::Error::other("invalid playback spec"));
         }
-        // Target ~60 ms buffer scaled to the chosen sample rate and channel count.
-        let bytes_per_20ms = (rate as usize * usize::from(channels) * 2 / 50).max(640);
-        let tlength = (bytes_per_20ms as u32).saturating_mul(CARD_LATENCY_MS / 20);
+        // Target 80 ms buffer with 40 ms prebuf and 20 ms minreq scaled to the stream format.
+        let bytes_per_20ms = (rate as usize * usize::from(channels) * 2 / 50).max(640) as u32;
+        let tlength = bytes_per_20ms.saturating_mul(CARD_LATENCY_MS / 20);
+        let prebuf = bytes_per_20ms.saturating_mul(CARD_PREBUF_MS / 20);
         let attr = BufferAttr {
             maxlength: u32::MAX,
             tlength,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
+            prebuf,
+            minreq: bytes_per_20ms,
             fragsize: u32::MAX,
         };
         let simple = Simple::new(
@@ -224,17 +256,21 @@ impl CardSpeaker {
             Some(&attr),
         )
         .map_err(|err| std::io::Error::other(format!("pa_simple_new failed ({err})")))?;
-        Ok(Self { simple })
+        Ok(Self {
+            simple,
+            rate,
+            channels,
+        })
     }
 
-    /// Writes one PCM buffer. Blocks while the 60 ms stream is full.
+    /// Writes one PCM buffer. Blocks while the stream buffer is full.
     ///
     /// # Errors
     ///
     /// Returns an error when the stream has failed.
     pub fn write(&self, pcm: &[i16]) -> Result<(), std::io::Error> {
-        let mut buf = [0_u8; FRAME_BYTES];
-        for chunk in pcm.chunks(FRAME_BYTES / 2) {
+        let mut buf = [0_u8; NATIVE_FRAME_BYTES];
+        for chunk in pcm.chunks(NATIVE_FRAME_SAMPLES) {
             let bytes_len = chunk.len() * 2;
             for (dst, &sample) in buf[..bytes_len].chunks_exact_mut(2).zip(chunk.iter()) {
                 dst.copy_from_slice(&sample.to_le_bytes());
@@ -246,13 +282,15 @@ impl CardSpeaker {
         Ok(())
     }
 
-    /// Writes `frames` of silence so the canceller has a reference before the mic.
+    /// Writes `frames` of 20 ms silence at this stream's sample rate so the echo
+    /// canceller has a live reference before the microphone opens.
     ///
     /// # Errors
     ///
     /// Returns the error from [`Self::write`].
     pub fn prime_silence(&self, frames: usize) -> Result<(), std::io::Error> {
-        let zeros = [0_i16; FRAME_BYTES / 2];
+        let samples_20ms = (self.rate as usize * usize::from(self.channels) / 50).max(320);
+        let zeros = vec![0_i16; samples_20ms];
         for _ in 0..frames {
             self.write(&zeros)?;
         }
@@ -277,6 +315,8 @@ pub const CARD_MIC_LATENCY_MS: u32 = 20;
 /// clock (zero `parec` subprocess or OS pipe buffering).
 pub struct CardMic {
     simple: libpulse_simple_binding::Simple,
+    rate: u32,
+    frame_bytes: usize,
 }
 
 impl CardMic {
@@ -287,6 +327,25 @@ impl CardMic {
     /// Returns an error when `libpulse-simple` cannot connect. Callers fall
     /// back to [`MicCapture`].
     pub fn open(device: Option<&str>) -> Result<Self, std::io::Error> {
+        Self::open_rate(device, 16_000)
+    }
+
+    /// Opens the default source, or `device` when set, at native 48 kHz mono
+    /// s16le to match PipeWire's clock with zero daemon-side resampling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `libpulse-simple` cannot connect.
+    pub fn open_48k(device: Option<&str>) -> Result<Self, std::io::Error> {
+        Self::open_rate(device, NATIVE_RATE)
+    }
+
+    /// Opens a mono capture stream at `rate` Hz (`16_000` or `48_000`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream spec is invalid or `libpulse-simple` cannot connect.
+    pub fn open_rate(device: Option<&str>, rate: u32) -> Result<Self, std::io::Error> {
         use libpulse_binding::def::BufferAttr;
         use libpulse_binding::sample::{Format, Spec};
         use libpulse_binding::stream::Direction;
@@ -294,22 +353,21 @@ impl CardMic {
 
         let spec = Spec {
             format: Format::S16le,
-            rate: 16_000,
+            rate,
             channels: 1,
         };
         if !spec.is_valid() {
             return Err(std::io::Error::other("invalid capture spec"));
         }
-        // `fragsize` = 20 ms (640 bytes). Leave `maxlength` at `u32::MAX` so
-        // PipeWire (`pipewire-pulse`) manages its ring around the device
-        // quantum (often 21.3 ms / 42.6 ms at 48 kHz); a small `maxlength`
-        // causes continuous server-side buffer drops and harsh crackle on USB mics.
+        let frame_bytes = (rate as usize * 2 / 50).max(FRAME_BYTES);
+        // `fragsize` = 20 ms. Leave `maxlength` at `u32::MAX` so PipeWire
+        // manages its ring cleanly around hardware quanta without buffer drops.
         let attr = BufferAttr {
             maxlength: u32::MAX,
             tlength: u32::MAX,
             prebuf: u32::MAX,
             minreq: u32::MAX,
-            fragsize: FRAME_BYTES as u32,
+            fragsize: frame_bytes as u32,
         };
         let simple = Simple::new(
             None,
@@ -322,16 +380,27 @@ impl CardMic {
             Some(&attr),
         )
         .map_err(|err| std::io::Error::other(format!("pa_simple_new record failed ({err})")))?;
-        Ok(Self { simple })
+        Ok(Self {
+            simple,
+            rate,
+            frame_bytes,
+        })
     }
 
-    /// Reads one 20 ms (320-sample) i16 PCM frame directly from the sound card.
+    /// Sample rate of the opened capture stream in Hz.
+    #[must_use]
+    pub fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Reads one 20 ms mono i16 PCM frame directly from the sound card
+    /// (960 samples at 48 kHz, or 320 samples at 16 kHz).
     ///
     /// # Errors
     ///
     /// Returns an error when the stream disconnects or fails.
     pub fn read_frame(&self) -> Result<Vec<i16>, std::io::Error> {
-        let mut buf = [0_u8; FRAME_BYTES];
+        let mut buf = vec![0_u8; self.frame_bytes];
         self.simple
             .read(&mut buf)
             .map_err(|err| std::io::Error::other(format!("pa_simple_read failed ({err})")))?;
@@ -518,6 +587,12 @@ impl Speaker {
 impl Drop for Speaker {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+impl zcall_dsp::mixer::PcmSink for Speaker {
+    fn write_pcm(&mut self, pcm: &[i16]) -> std::io::Result<()> {
+        self.write(pcm)
     }
 }
 

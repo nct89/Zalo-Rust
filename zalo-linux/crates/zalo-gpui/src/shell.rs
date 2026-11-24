@@ -124,6 +124,10 @@ pub struct ShellView {
     pub(crate) members_view: Option<crate::info::MembersView>,
     /// "Select Multiple Messages": conversation + ticked message ids.
     pub(crate) select_msgs: Option<(u64, Vec<u64>)>,
+    /// Drag-selected text range inside the active chat thread.
+    pub(crate) chat_sel: crate::chat_select::ChatTextSelection,
+    /// Per-frame layout registry for selectable message text blocks.
+    pub(crate) chat_sel_reg: crate::chat_select::SharedSelectionRegistry,
     /// Link card previews by URL (`parselink` / realtime), disk-cached.
     pub(crate) link_previews: HashMap<String, crate::links::LinkPreview>,
     /// URLs whose preview or thumbnail is being fetched.
@@ -186,8 +190,8 @@ pub struct ShellView {
     pub(crate) lock_input: Entity<LineInput>,
     /// Last unread total sent to the tray / launcher badge.
     badge_sent: Option<i64>,
-    /// Root focus so Esc reaches the shell when no input is focused.
-    root_focus: gpui::FocusHandle,
+    /// Root focus so Esc and Ctrl+C/Cmd+C reach the shell when no input is focused.
+    pub(crate) root_focus: gpui::FocusHandle,
     pub(crate) settings_open: bool,
     pub(crate) settings_page: SettingsPage,
     pub(crate) sticker_open: bool,
@@ -286,6 +290,12 @@ pub struct ShellView {
     pub(crate) msg_list: gpui::ListState,
     /// Last `(conv_id, item_count, hidden_count)` synced into `msg_list`.
     pub(crate) msg_list_state: std::cell::Cell<(Option<u64>, usize, usize)>,
+    /// True when `#message-view` is scrolled up away from the newest bubble.
+    pub(crate) chat_scrolled_up: bool,
+    /// Live incoming messages received in the active chat while scrolled up.
+    pub(crate) chat_unread_below: u32,
+    /// Highlighted row in the floating vertical `@mention` popup.
+    pub(crate) mention_idx: usize,
     /// Server-known pinned `thread_id`s preserved even before their conversation is loaded.
     pub(crate) server_pinned_threads: HashSet<String>,
     /// Server-known archived ("Other") `thread_id`s preserved even before their conversation is loaded.
@@ -345,6 +355,13 @@ pub struct ShellView {
     last_typing_sent: Option<(u64, std::time::Instant)>,
     /// Per-message reactions keyed by local `ChatMsg.id`.
     pub(crate) reactions: HashMap<u64, Vec<crate::read_sync::MsgReaction>>,
+    /// Recently sent local reactions `(msg_id, r_type, sent_at)` used to skip
+    /// our own WS `612` echo so multi-tap counts never double-increment.
+    pub(crate) recent_my_reacts: Vec<(u64, i64, std::time::Instant)>,
+    /// Active Like / reaction firework bursts animating in the overlay.
+    pub(crate) react_bursts: Vec<crate::context_menu::ReactBurst>,
+    /// True while the 60 FPS firework burst timer loop is running.
+    pub(crate) react_burst_anim: bool,
     /// Sticker/GIF store state, suggestions, inline commands, and decoded thumbs.
     pub(crate) stickers: StickerState,
     /// Search input inside Sticker tab.
@@ -528,7 +545,8 @@ impl ShellView {
         .detach();
         let search =
             cx.new(|cx| LineInput::new(cx, str_vi("STR_PLACE_HOLDER_SEARCH_PRODUCT", "Tìm kiếm")));
-        let composer = cx.new(|cx| LineInput::new(cx, str_vi("STR_SEND_MESSAGE", "Nhập tin nhắn")));
+        let composer =
+            cx.new(|cx| LineInput::new_multiline(cx, str_vi("STR_SEND_MESSAGE", "Nhập tin nhắn")));
         let caption_input = cx.new(|cx| {
             LineInput::new(
                 cx,
@@ -579,6 +597,10 @@ impl ShellView {
             &composer,
             |this, input, event: &LineEvent, cx| match event {
                 LineEvent::Submit(text) => {
+                    if this.apply_active_mention(cx) {
+                        cx.notify();
+                        return;
+                    }
                     let text = text.clone();
                     this.composer_link = None;
                     this.composer_link_hide = None;
@@ -605,6 +627,7 @@ impl ShellView {
                     cx.notify();
                 }
                 LineEvent::Change(text) => {
+                    this.mention_idx = 0;
                     this.on_composer_media_change(text, cx);
                     this.sync_composer_link(text);
                     if !text.is_empty() {
@@ -641,6 +664,8 @@ impl ShellView {
             input_has_sel: false,
             members_view: None,
             select_msgs: None,
+            chat_sel: crate::chat_select::ChatTextSelection::default(),
+            chat_sel_reg: crate::chat_select::ChatSelectionRegistry::new_shared(),
             link_previews,
             link_pending: HashSet::new(),
             link_thumbs: HashMap::new(),
@@ -749,6 +774,9 @@ impl ShellView {
             conv_scroll: gpui::UniformListScrollHandle::new(),
             msg_list: gpui::ListState::new(0, gpui::ListAlignment::Bottom, px(300.)),
             msg_list_state: std::cell::Cell::new((None, 0, 0)),
+            chat_scrolled_up: false,
+            chat_unread_below: 0,
+            mention_idx: 0,
             server_pinned_threads: HashSet::new(),
             server_archived_threads: HashSet::new(),
             msg_window: MSG_WINDOW,
@@ -777,6 +805,9 @@ impl ShellView {
             typing: HashMap::new(),
             last_typing_sent: None,
             reactions: HashMap::new(),
+            recent_my_reacts: Vec::new(),
+            react_bursts: Vec::new(),
+            react_burst_anim: false,
             stickers: StickerState {
                 recent: crate::stickers::load_recent_stickers(),
                 ..StickerState::default()
@@ -852,6 +883,22 @@ impl ShellView {
         };
         crate::i18n::set_english(this.english);
         this.apply_theme(window);
+        {
+            let weak_scroll = cx.weak_entity();
+            this.msg_list.set_scroll_handler(move |ev, _window, cx| {
+                let scrolled_up = ev.count > 2 && ev.visible_range.end < ev.count;
+                let _ = weak_scroll.update(cx, |view, cx| {
+                    let changed = view.chat_scrolled_up != scrolled_up;
+                    view.chat_scrolled_up = scrolled_up;
+                    if !scrolled_up && view.chat_unread_below > 0 {
+                        view.chat_unread_below = 0;
+                        cx.notify();
+                    } else if changed {
+                        cx.notify();
+                    }
+                });
+            });
+        }
         if !cfg!(test) {
             window.activate_window();
             let weak = cx.weak_entity();
@@ -1081,7 +1128,7 @@ impl ShellView {
                 max_edge: match msg.kind {
                     crate::media::MsgKind::Sticker => crate::media::STICKER_SIZE as u32,
                     crate::media::MsgKind::Card => 96,
-                    _ => 480,
+                    _ => 320,
                 },
             })
             .collect();
@@ -1648,22 +1695,42 @@ impl ShellView {
         cx.defer(crate::close_all_shell_windows);
     }
 
-    /// Start background batches for everything in [`Self::media_queue`].
+    /// Start concurrent background fetches for everything in [`Self::media_queue`].
+    /// Each photo streams to the UI as soon as IT finishes (newest-first, bounded
+    /// concurrency), so one slow or expired URL never holds up a newly received photo.
     pub(crate) fn drain_media_queue(&mut self, cx: &mut Context<Self>) {
         if self.media_queue.is_empty() {
             return;
         }
         let dir = self.session_dir.clone();
-        let batches = crate::fetch::plan(std::mem::take(&mut self.media_queue));
+        let now = data::now_ms();
+        let mut jobs: Vec<(crate::fetch::Job, bool)> = std::mem::take(&mut self.media_queue)
+            .into_iter()
+            .map(|job| {
+                let recent = self
+                    .messages
+                    .values()
+                    .find_map(|list| list.iter().find(|m| m.id == job.msg_id).map(|m| m.at_ms))
+                    .is_some_and(|at| at == 0 || now.saturating_sub(at) < 5 * 60_000);
+                (job, recent)
+            })
+            .collect();
+        // Newest first so newly received / bottom photos appear immediately.
+        jobs.reverse();
+        let bg = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
-            for batch in batches {
-                let dir = dir.clone();
-                let done = cx
-                    .background_executor()
-                    .spawn(async move { crate::fetch::run_batch(dir.as_deref(), batch) })
-                    .await;
+            use futures::StreamExt;
+            let mut stream = futures::stream::iter(jobs)
+                .map(move |(job, recent)| {
+                    let dir = dir.clone();
+                    bg.spawn(async move {
+                        crate::fetch::run_one_with_retry(dir.as_deref(), job, recent)
+                    })
+                })
+                .buffer_unordered(crate::fetch::BUDGET);
+            while let Some(done) = stream.next().await {
                 let alive = this.update(cx, |view, cx| {
-                    view.apply_media(done);
+                    view.apply_media(vec![done]);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -1694,6 +1761,7 @@ impl ShellView {
         for item in done {
             match item.image {
                 Some(image) => {
+                    self.media_failed.remove(&item.msg_id);
                     self.media_bitmaps.insert(item.msg_id, image);
                 }
                 None => {
@@ -1825,7 +1893,21 @@ impl ShellView {
         );
     }
 
+    /// Clear sidebar conversation search input and query, plus any open in-thread
+    /// search drawer so switching rail tabs always lands cleanly in the target section.
+    pub(crate) fn clear_sidebar_search(&mut self, cx: &mut Context<Self>) {
+        self.search_query.clear();
+        if !self.search.read(cx).text().is_empty() {
+            self.search.update(cx, |input, cx| input.clear(cx));
+        }
+        self.msg_search_open = false;
+        self.msg_search_popup = None;
+    }
+
     pub(crate) fn set_rail(&mut self, rail: Rail) {
+        self.search_query.clear();
+        self.msg_search_open = false;
+        self.msg_search_popup = None;
         if rail == Rail::Settings {
             self.settings_open = true;
             self.refresh_settings_cache(self.settings_page);
@@ -1834,11 +1916,15 @@ impl ShellView {
             return;
         }
         self.rail = rail;
+        self.rail_popup = None;
         self.note = None;
         self.sticker_open = false;
         self.menu = None;
         self.forward_of = None;
         self.settings_open = false;
+        if rail == Rail::Chats {
+            self.list_filter = ListFilter::All;
+        }
         if rail == Rail::Docs {
             self.ensure_my_documents_conv();
             if let Some(id) = self.cloud_id() {
@@ -2123,10 +2209,27 @@ impl ShellView {
                 self.send_seen_if_due(&m.thread_id);
             }
         }
-        if let Some(gid) = m.global_msg_id {
+        {
             let mut upgraded_media = false;
             let id = self.messages.get_mut(&conv_id).and_then(|list| {
-                let row = list.iter_mut().find(|x| x.global_msg_id == Some(gid))?;
+                let row = list.iter_mut().rev().find(|x| {
+                    data::is_duplicate_msg(
+                        x,
+                        m.global_msg_id,
+                        m.cli_msg_id,
+                        m.from_me,
+                        &m.sender_uid,
+                        m.kind,
+                        &m.text,
+                        m.at_ms,
+                    )
+                })?;
+                if row.global_msg_id.unwrap_or(0) <= 0 && m.global_msg_id.unwrap_or(0) > 0 {
+                    row.global_msg_id = m.global_msg_id;
+                }
+                if row.cli_msg_id.unwrap_or(0) <= 0 && m.cli_msg_id.unwrap_or(0) > 0 {
+                    row.cli_msg_id = m.cli_msg_id;
+                }
                 if m.kind != crate::media::MsgKind::Text && row.kind == crate::media::MsgKind::Text
                 {
                     row.kind = m.kind;
@@ -2178,8 +2281,29 @@ impl ShellView {
                 } else if row.href.is_empty() && !m.href.is_empty() {
                     row.href = m.href.clone();
                 }
+                if row.quote_text.is_empty() && !m.quote_text.is_empty() {
+                    row.quote_sender = m.quote_sender.clone();
+                    row.quote_text = m.quote_text.clone();
+                    row.quote_global_id = m.quote_global_id;
+                    row.quote_cli_id = m.quote_cli_id;
+                }
                 if m.group_layout_id != 0 {
                     row.group_layout_id = m.group_layout_id;
+                }
+                if matches!(
+                    m.kind,
+                    crate::media::MsgKind::Call | crate::media::MsgKind::MissedCall
+                ) {
+                    row.call_video |= m.call_video;
+                    if row.call_reason == 0 && m.call_reason != 0 {
+                        row.call_reason = m.call_reason;
+                    }
+                    if row.file_size == 0 && m.duration_ms > 0 {
+                        row.file_size = m.duration_ms;
+                    }
+                    if row.file_name.is_empty() && !m.file_name.is_empty() {
+                        row.file_name = m.file_name.clone();
+                    }
                 }
                 Some(row.id)
             });
@@ -2292,6 +2416,15 @@ impl ShellView {
         msg.media_h = m.height;
         msg.file_name = m.file_name.clone();
         msg.file_size = m.file_size;
+        msg.call_video = m.call_video;
+        msg.call_reason = m.call_reason;
+        if matches!(
+            m.kind,
+            crate::media::MsgKind::Call | crate::media::MsgKind::MissedCall
+        ) && m.duration_ms > 0
+        {
+            msg.file_size = m.duration_ms;
+        }
         if !m.quote_sender.is_empty() || !m.quote_text.is_empty() {
             msg.quote_sender = if m.quote_sender == "Bạn" || m.quote_sender.is_empty() {
                 m.quote_sender.clone()
@@ -2368,6 +2501,9 @@ impl ShellView {
                     conv.unread = 0;
                     self.marked_read.insert(conv_id);
                     self.mark_thread_read_pref(&m.thread_id, m.at_ms);
+                    if self.chat_scrolled_up {
+                        self.chat_unread_below = self.chat_unread_below.saturating_add(1);
+                    }
                 } else {
                     conv.unread += 1;
                     self.marked_read.remove(&conv_id);
@@ -2617,34 +2753,69 @@ impl ShellView {
     }
 
     pub(crate) fn apply_reactions(&mut self, list: Vec<crate::realtime::ReactionUpdate>) {
+        let now = std::time::Instant::now();
+        self.recent_my_reacts
+            .retain(|(_, _, at)| now.duration_since(*at) < std::time::Duration::from_secs(4));
         for r in list {
-            let Some(conv_id) = self
+            let mut found_id: Option<(u64, u64)> = None;
+            if let Some(conv_id) = self
                 .convs
                 .iter()
                 .find(|c| c.thread_id == r.thread_id)
                 .map(|c| c.id)
-            else {
+            {
+                if let Some(msgs) = self.messages.get(&conv_id) {
+                    if let Some(m) = msgs.iter().find(|m| {
+                        r.target_global_id
+                            .is_some_and(|g| m.global_msg_id == Some(g))
+                            || r.target_cli_id.is_some_and(|c| m.cli_msg_id == Some(c))
+                    }) {
+                        found_id = Some((conv_id, m.id));
+                    }
+                }
+            }
+            // Fallback across all loaded threads when `gMsgID` is present.
+            if found_id.is_none() {
+                if let Some(gid) = r.target_global_id {
+                    'outer: for (&cid, msgs) in &self.messages {
+                        for m in msgs {
+                            if m.global_msg_id == Some(gid) {
+                                found_id = Some((cid, m.id));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            let Some((conv_id, msg_id)) = found_id else {
                 continue;
             };
-            let Some(msgs) = self.messages.get_mut(&conv_id) else {
-                continue;
-            };
-            let Some(msg) = msgs.iter_mut().find(|m| {
-                r.target_global_id
-                    .is_some_and(|g| m.global_msg_id == Some(g))
-                    || r.target_cli_id.is_some_and(|c| m.cli_msg_id == Some(c))
-            }) else {
-                continue;
-            };
+            // Skip immediate WS echo of a reaction we just applied optimistically.
+            if r.from_me {
+                let echo_type = if r.cleared { -1 } else { r.r_type };
+                if let Some(pos) = self
+                    .recent_my_reacts
+                    .iter()
+                    .position(|&(id, rt, _)| id == msg_id && rt == echo_type)
+                {
+                    self.recent_my_reacts.remove(pos);
+                    continue;
+                }
+            }
             crate::read_sync::update_reaction(
                 &mut self.reactions,
-                msg.id,
+                msg_id,
                 &r.sender_uid,
                 &r.r_icon,
                 r.r_type,
                 r.cleared,
             );
-            msg.liked = self.reactions.get(&msg.id).is_some_and(|v| !v.is_empty());
+            let has_any = self.reactions.get(&msg_id).is_some_and(|v| !v.is_empty());
+            if let Some(msgs) = self.messages.get_mut(&conv_id) {
+                if let Some(msg) = msgs.iter_mut().find(|m| m.id == msg_id) {
+                    msg.liked = has_any;
+                }
+            }
         }
     }
 
@@ -4072,6 +4243,10 @@ impl ShellView {
         if self.select_msgs.take().is_some() || self.members_view.take().is_some() {
             return true;
         }
+        if self.chat_sel.has_selection() {
+            self.chat_sel.clear();
+            return true;
+        }
         if let Some(rec) = &self.voice_rec {
             rec.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             rec.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -4112,7 +4287,11 @@ impl ShellView {
     pub(crate) fn select_conv(&mut self, id: u64) {
         if self.selected != Some(id) {
             self.msg_window = MSG_WINDOW;
+            self.chat_scrolled_up = false;
+            self.chat_unread_below = 0;
+            self.mention_idx = 0;
             self.select_msgs = None;
+            self.chat_sel.clear();
             self.members_view = None;
             self.msg_search_open = false;
             self.msg_search_q.clear();
@@ -5113,6 +5292,9 @@ impl Render for ShellView {
                     .when(self.react_picker.is_some(), |el| {
                         el.child(self.react_picker_overlay(cx))
                     })
+                    .when(!self.react_bursts.is_empty(), |el| {
+                        el.child(self.react_burst_overlay())
+                    })
                     .when(forward, |el| el.child(self.forward_overlay(cx)))
                     .when_some(toast, |el, text| el.child(toast_el(text)))
                     .when(self.locked, |el| el.child(self.lock_overlay(cx))),
@@ -5235,6 +5417,9 @@ impl Render for ShellView {
                 .when(menu, |el| el.child(self.context_menu_overlay(cx)))
                 .when(self.react_picker.is_some(), |el| {
                     el.child(self.react_picker_overlay(cx))
+                })
+                .when(!self.react_bursts.is_empty(), |el| {
+                    el.child(self.react_burst_overlay())
                 })
                 .when(forward, |el| el.child(self.forward_overlay(cx)))
                 .when_some(toast, |el, text| el.child(toast_el(text)))

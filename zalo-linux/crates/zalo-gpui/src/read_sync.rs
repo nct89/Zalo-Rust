@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use zalo_client::{ReadMark, StatusUpdate};
 
-/// One reaction attached to a local chat message.
+/// One reaction entry attached to a local chat message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MsgReaction {
     /// Sender key (`"me"` for self, otherwise sender uid).
@@ -14,6 +14,8 @@ pub struct MsgReaction {
     pub r_icon: String,
     /// Zalo numeric reaction type (`3` = like).
     pub r_type: i64,
+    /// Number of times `sender_uid` tapped this emoji on the message (`>= 1`).
+    pub count: u32,
 }
 
 /// Zalo PC hides the member list above this count (`max_member_group_show_seen`, default 20).
@@ -346,7 +348,8 @@ fn gmi_of(record: &Value) -> Option<String> {
     }
 }
 
-/// Inserts or removes a sender's reaction on a message in the in-memory table.
+/// Inserts, increments, or removes a sender's reaction on a message in the
+/// in-memory table (matching Zalo's multi-tap count behavior).
 pub fn update_reaction(
     by_msg: &mut HashMap<u64, Vec<MsgReaction>>,
     msg_id: u64,
@@ -356,17 +359,58 @@ pub fn update_reaction(
     cleared: bool,
 ) {
     let list = by_msg.entry(msg_id).or_default();
-    list.retain(|r| r.sender_uid != sender_uid);
-    if !cleared {
-        list.push(MsgReaction {
-            sender_uid: sender_uid.to_owned(),
-            r_icon: r_icon.to_owned(),
-            r_type,
-        });
+    if cleared {
+        list.retain(|r| r.sender_uid != sender_uid);
+    } else {
+        let preset = reaction_preset_index(r_icon, r_type);
+        if let Some(pos) = list.iter().position(|r| {
+            r.sender_uid == sender_uid && reaction_preset_index(&r.r_icon, r.r_type) == preset
+        }) {
+            let mut existing = list.remove(pos);
+            existing.count = existing.count.saturating_add(1);
+            if !r_icon.is_empty() {
+                existing.r_icon = r_icon.to_owned();
+            }
+            existing.r_type = r_type;
+            // Keep the most recently tapped emoji last so the trigger button reflects it.
+            list.push(existing);
+        } else {
+            list.push(MsgReaction {
+                sender_uid: sender_uid.to_owned(),
+                r_icon: r_icon.to_owned(),
+                r_type,
+                count: 1,
+            });
+        }
     }
     if list.is_empty() {
         by_msg.remove(&msg_id);
     }
+}
+
+/// Summarize reactions on one message into `(top_3_preset_indices, total_count)`.
+#[must_use]
+pub fn summarize_reactions(list: &[MsgReaction]) -> Option<(Vec<usize>, u32)> {
+    if list.is_empty() {
+        return None;
+    }
+    let mut per_preset = [0u32; 6];
+    let mut total = 0u32;
+    for r in list {
+        let idx = reaction_preset_index(&r.r_icon, r.r_type);
+        let c = r.count.max(1);
+        per_preset[idx] = per_preset[idx].saturating_add(c);
+        total = total.saturating_add(c);
+    }
+    let mut ranked: Vec<(usize, u32)> = per_preset
+        .iter()
+        .enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, &c)| (i, c))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let indices: Vec<usize> = ranked.into_iter().take(3).map(|(i, _)| i).collect();
+    (!indices.is_empty() && total > 0).then_some((indices, total))
 }
 
 /// Official Zalo reaction buttons `(emoji, rIcon, rType, label_vi)` from `compact1847.js`.
@@ -532,8 +576,23 @@ mod tests {
         let mut map = HashMap::new();
         update_reaction(&mut map, 1, "me", "/-heart", 5, false);
         assert_eq!(map[&1].len(), 1);
+        assert_eq!(map[&1][0].count, 1);
         assert_eq!(reaction_emoji(&map[&1][0].r_icon, map[&1][0].r_type), "❤️");
+        // Multi-tap increments the count rather than overwriting at 1.
+        update_reaction(&mut map, 1, "me", "/-heart", 5, false);
+        assert_eq!(map[&1].len(), 1);
+        assert_eq!(map[&1][0].count, 2);
+        // Adding a different emoji preserves existing counts and sorts top emojis.
+        update_reaction(&mut map, 1, "me", "/-strong", 3, false);
+        update_reaction(&mut map, 1, "peer", ":>", 0, false);
+        let (indices, total) = summarize_reactions(&map[&1]).expect("summary");
+        assert_eq!(total, 4);
+        assert_eq!(indices, vec![1, 0, 2]);
+        // Clearing removes only that sender's reactions.
         update_reaction(&mut map, 1, "me", "", -1, true);
+        let (indices, total) = summarize_reactions(&map[&1]).expect("peer remains");
+        assert_eq!((indices, total), (vec![2], 1));
+        update_reaction(&mut map, 1, "peer", "", -1, true);
         assert!(map.is_empty());
     }
 }

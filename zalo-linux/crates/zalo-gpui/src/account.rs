@@ -658,6 +658,20 @@ pub struct GroupManageDlg {
     pub(crate) error: Option<String>,
 }
 
+/// Account info modal opened when clicking a `@mention` or peer name.
+pub struct UserInfoDlg {
+    pub(crate) uid: String,
+    pub(crate) display_name: String,
+    pub(crate) zalo_name: String,
+    pub(crate) gender: i64,
+    pub(crate) birthday: String,
+    pub(crate) phone: String,
+    pub(crate) status: String,
+    pub(crate) cover_img: Option<Arc<RenderImage>>,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+}
+
 /// "Your Profile" account info + editor modal state.
 pub struct ProfileDlg {
     pub(crate) me: AccountMe,
@@ -1681,8 +1695,8 @@ impl ShellView {
                                                     .text_color(rgb(blue))
                                                     .truncate()
                                                     .cursor_pointer()
-                                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                                        cx.open_url(&url);
+                                                    .on_click(cx.listener(move |_, _, _, _| {
+                                                        crate::os_util::open_url(&url);
                                                     }))
                                                     .child(website.clone()),
                                             ),
@@ -1713,7 +1727,7 @@ impl ShellView {
                                         .text_size(px(14.5))
                                         .hover(|st| st.bg(rgb(hover)))
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            cx.open_url("https://business.zbox.vn/");
+                                            crate::os_util::open_url("https://business.zbox.vn/");
                                             this.set_note(
                                                 "Máy tính không có API sửa hồ sơ doanh nghiệp. Đã mở trang Zalo Business.",
                                             );
@@ -1794,6 +1808,471 @@ impl ShellView {
                             ),
                     )
                     .child(notice),
+            )
+    }
+
+    /// Resolves a `@mention` display name within `conv_id` (then friends/profiles)
+    /// and opens the Zalo account info dialog for that user.
+    pub(crate) fn open_user_info_by_name(
+        &mut self,
+        name: &str,
+        conv_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let needle = name.trim().to_lowercase();
+        if needle.is_empty() {
+            return;
+        }
+        let mut resolved_uid: Option<String> = None;
+        let mut resolved_name = name.trim().to_owned();
+
+        // 1. Check active conversation members / peer first.
+        if let Some(conv) = self.conv(conv_id).cloned() {
+            if !conv.is_group && conv.name.trim().to_lowercase() == needle {
+                resolved_uid = Some(conv.thread_id.clone());
+                resolved_name = conv.name.clone();
+            } else if conv.is_group {
+                if let Some(prof) = self.profiles.map.get(&conv.thread_id) {
+                    for uid in &prof.member_ids {
+                        let p_name = self
+                            .profiles
+                            .map
+                            .get(uid)
+                            .map(|p| p.name.trim().to_owned())
+                            .filter(|n| !n.is_empty())
+                            .or_else(|| {
+                                self.friends
+                                    .iter()
+                                    .find(|f| f.uid == *uid)
+                                    .map(|f| f.name.trim().to_owned())
+                            });
+                        if let Some(pn) = p_name {
+                            if pn.to_lowercase() == needle {
+                                resolved_uid = Some(uid.clone());
+                                resolved_name = pn;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 2. Check messages in this conversation by sender label.
+        if resolved_uid.is_none() {
+            if let Some(found) = self.messages_of(conv_id).iter().rev().find(|m| {
+                !m.sender_uid.is_empty() && m.sender.trim().to_lowercase() == needle
+            }) {
+                resolved_uid = Some(found.sender_uid.clone());
+                resolved_name = found.sender.trim().to_owned();
+            }
+        }
+        // 3. Check friends list and profile cache.
+        if resolved_uid.is_none() {
+            if let Some(f) = self
+                .friends
+                .iter()
+                .find(|f| !f.uid.is_empty() && f.name.trim().to_lowercase() == needle)
+            {
+                resolved_uid = Some(f.uid.clone());
+                resolved_name = f.name.trim().to_owned();
+            }
+        }
+        if resolved_uid.is_none() {
+            if let Some((uid, p)) = self.profiles.map.iter().find(|(k, p)| {
+                !k.starts_with("g_")
+                    && *k != crate::profiles::ME
+                    && p.name.trim().to_lowercase() == needle
+            }) {
+                resolved_uid = Some(uid.clone());
+                resolved_name = p.name.trim().to_owned();
+            }
+        }
+        // 4. Check self display name.
+        if resolved_uid.is_none() {
+            if self
+                .display_name
+                .as_deref()
+                .is_some_and(|me| me.trim().to_lowercase() == needle)
+            {
+                self.open_profile_dialog(cx);
+                return;
+            }
+        }
+        let uid = resolved_uid.unwrap_or_default();
+        if !uid.is_empty()
+            && (self.self_uid().is_some_and(|me| me == uid)
+                || self.uin.as_deref().is_some_and(|me| me == uid))
+        {
+            self.open_profile_dialog(cx);
+            return;
+        }
+        self.open_user_info(uid, resolved_name, cx);
+    }
+
+    /// Opens the "Thông tin tài khoản" dialog for another user (`uid`) and
+    /// fetches live details via `getprofiles/v2`.
+    pub(crate) fn open_user_info(
+        &mut self,
+        uid: String,
+        display_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let can_fetch = !cfg!(test) && self.has_session && !uid.is_empty();
+        self.dialog = Some(Dialog::UserInfo(UserInfoDlg {
+            uid: uid.clone(),
+            display_name: display_name.clone(),
+            zalo_name: String::new(),
+            gender: -1,
+            birthday: String::new(),
+            phone: String::new(),
+            status: String::new(),
+            cover_img: None,
+            loading: can_fetch,
+            error: None,
+        }));
+        if !can_fetch {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let fetch_uid = uid.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        let val = api
+                            .get_profiles_v2(&[fetch_uid.as_str()])
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let entry = val
+                            .pointer("/data/changed_profiles")
+                            .and_then(|v| v.as_object())
+                            .and_then(|m| {
+                                m.get(&fetch_uid)
+                                    .or_else(|| {
+                                        m.iter()
+                                            .find(|(k, _)| k.starts_with(&fetch_uid))
+                                            .map(|(_, v)| v)
+                                    })
+                                    .or_else(|| m.values().next())
+                            })
+                            .cloned()
+                            .unwrap_or(val);
+                        Ok::<AccountMe, String>(me_from_value(&entry))
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let mut cover_url = None;
+                if let Some(Dialog::UserInfo(d)) = view.dialog.as_mut() {
+                    if d.uid == uid {
+                        d.loading = false;
+                        match res {
+                            Ok(info) => {
+                                if !info.display_name.is_empty() {
+                                    d.display_name = info.display_name;
+                                }
+                                d.zalo_name = info.zalo_name;
+                                d.gender = info.gender;
+                                d.birthday = info.birthday;
+                                d.phone = info.phone;
+                                d.status = info.status;
+                                if !info.cover.is_empty() {
+                                    cover_url = Some(info.cover);
+                                }
+                            }
+                            Err(err) => d.error = Some(err),
+                        }
+                    }
+                }
+                if let Some(url) = cover_url {
+                    let dir2 = view.session_dir.clone();
+                    let target_uid = uid.clone();
+                    cx.spawn(async move |this2, cx| {
+                        let done = cx
+                            .background_executor()
+                            .spawn(async move {
+                                crate::fetch::run_one_with_retry(
+                                    dir2.as_deref(),
+                                    crate::fetch::Job {
+                                        msg_id: 0,
+                                        path: None,
+                                        url,
+                                        max_edge: 640,
+                                    },
+                                    false,
+                                )
+                            })
+                            .await;
+                        if let Some(img) = done.image {
+                            let _ = this2.update(cx, |v, cx| {
+                                if let Some(Dialog::UserInfo(d)) = v.dialog.as_mut() {
+                                    if d.uid == target_uid {
+                                        d.cover_img = Some(img);
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }
+                    })
+                    .detach();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn user_info_el(&self, d: &UserInfoDlg, cx: &mut Context<Self>) -> impl IntoElement {
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let subtle = token_rgb("--layer-background-subtle", "#f3f5f6");
+        let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let blue = token_rgb("--B55", "#0068ff");
+        let blue_soft = token_rgb("--B10", "#e5efff");
+        let display = if d.display_name.is_empty() {
+            d.zalo_name.clone()
+        } else {
+            d.display_name.clone()
+        };
+        let person = Person {
+            uid: d.uid.clone(),
+            name: display.clone(),
+            avatar: String::new(),
+            note: String::new(),
+        };
+        let gender = if d.gender < 0 {
+            "—".to_owned()
+        } else {
+            gender_word(d.gender).to_owned()
+        };
+        let birthday = if d.birthday.is_empty() {
+            "—".to_owned()
+        } else {
+            pretty_birthday(&d.birthday)
+        };
+        let phone = if d.phone.is_empty() {
+            "••••••••••".to_owned()
+        } else {
+            d.phone.clone()
+        };
+        let uid_chat = d.uid.clone();
+        let name_chat = display.clone();
+        let uid_call = d.uid.clone();
+        let name_call = display.clone();
+        let title = self.dialog_title_bar(str_vi("STR_ACCOUNT", "Thông tin tài khoản"), cx);
+
+        div()
+            .w(px(400.))
+            .max_h(px(620.))
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .overflow_hidden()
+            .bg(rgb(paper))
+            .text_color(rgb(ink))
+            .shadow_lg()
+            .child(title)
+            .child(
+                div()
+                    .id("user-info-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(148.))
+                            .overflow_hidden()
+                            .bg(rgb(0x6b83e8))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(74.))
+                                    .bg(rgb(0x8f8cf2)),
+                            )
+                            .when_some(d.cover_img.clone(), |el, image| {
+                                el.child(
+                                    img(image)
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full()
+                                        .object_fit(ObjectFit::Cover),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .px(px(16.))
+                            .mt(px(-36.))
+                            .gap(px(12.))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(76.))
+                                    .rounded(px(38.))
+                                    .border_2()
+                                    .border_color(rgb(paper))
+                                    .overflow_hidden()
+                                    .bg(rgb(paper))
+                                    .child(self.dialog_avatar(&person, 72.)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .pt(px(34.))
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(18.))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .truncate()
+                                            .child(display.clone()),
+                                    )
+                                    .when(!d.status.is_empty(), |col| {
+                                        col.child(
+                                            div()
+                                                .text_size(px(13.))
+                                                .text_color(rgb(muted))
+                                                .truncate()
+                                                .child(d.status.clone()),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .when(!d.uid.is_empty(), |col| {
+                        col.child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(10.))
+                                .px(px(16.))
+                                .pt(px(14.))
+                                .pb(px(12.))
+                                .child(
+                                    div()
+                                        .id("ui-call-btn")
+                                        .flex_1()
+                                        .h(px(36.))
+                                        .rounded(px(4.))
+                                        .bg(rgb(subtle))
+                                        .hover(|st| st.bg(rgb(hover)))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(6.))
+                                        .text_size(px(14.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(ink))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.dialog = None;
+                                            this.start_call_uid(
+                                                uid_call.clone(),
+                                                name_call.clone(),
+                                                false,
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .child(fonts::icon_el(ic::HDR_CALL, "☎", 16.))
+                                        .child("Gọi điện"),
+                                )
+                                .child(
+                                    div()
+                                        .id("ui-msg-btn")
+                                        .flex_1()
+                                        .h(px(36.))
+                                        .rounded(px(4.))
+                                        .bg(rgb(blue_soft))
+                                        .hover(|st| st.bg(rgb(0xd4_e6_ff)))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap(px(6.))
+                                        .text_size(px(14.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(blue))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.dialog = None;
+                                            this.open_chat_or_note(
+                                                &uid_chat,
+                                                &name_chat,
+                                                false,
+                                                "Không mở được hội thoại",
+                                                window,
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .child(fonts::icon_el(ic::CHAT, "💬", 16.))
+                                        .child("Nhắn tin"),
+                                ),
+                        )
+                    })
+                    .child(div().h(px(6.)).w_full().bg(rgb(subtle)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .px(px(16.))
+                            .pt(px(14.))
+                            .pb(px(16.))
+                            .gap(px(4.))
+                            .child(
+                                div()
+                                    .pb(px(6.))
+                                    .text_size(px(15.5))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .child(str_vi("STR_PERSONAL_INFO", "Thông tin cá nhân")),
+                            )
+                            .child(profile_kv(
+                                str_vi("STR_PROFILE_LABEL_GENDER", "Giới tính"),
+                                &gender,
+                                ink,
+                                muted,
+                            ))
+                            .child(profile_kv(
+                                str_vi("STR_PROFILE_LABEL_BIRTHDAY", "Ngày sinh"),
+                                &birthday,
+                                ink,
+                                muted,
+                            ))
+                            .child(profile_kv(
+                                str_vi("STR_PROFILE_PHONENUMBER", "Điện thoại"),
+                                &phone,
+                                ink,
+                                muted,
+                            ))
+                            .when(d.loading, |el| {
+                                el.child(
+                                    div()
+                                        .pt(px(6.))
+                                        .text_size(px(12.5))
+                                        .text_color(rgb(muted))
+                                        .child("Đang tải thông tin…"),
+                                )
+                            }),
+                    ),
             )
     }
 

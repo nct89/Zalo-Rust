@@ -17,3 +17,4 @@ workspace = true
 serde_json.workspace = true
 zcall-audio = { package = "zcall-audio-mac", path = "../zcall-audio" }
 zcall-core = { workspace = true }
+zcall-dsp = { workspace = true }

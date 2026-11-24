@@ -464,6 +464,9 @@ impl ShellView {
 
     fn header_actions(&self, conv: Option<&ChatConv>, cx: &mut Context<Self>) -> impl IntoElement {
         let is_group = conv.is_some_and(|row| row.is_group);
+        let is_cloud = conv.is_some_and(|row| {
+            crate::shell::is_my_documents(&row.name, &row.thread_id, self.send2me_id.as_deref())
+        });
         let has_conv = conv.is_some();
         div()
             .flex()
@@ -482,7 +485,7 @@ impl ShellView {
                         cx,
                     ))
                 })
-                .when(!is_group, |el| {
+                .when(!is_group && !is_cloud, |el| {
                     el.child(self.header_btn(
                         "hdr-phone",
                         ic::HDR_CALL,
@@ -492,14 +495,16 @@ impl ShellView {
                         cx,
                     ))
                 })
-                .child(self.header_btn(
-                    "hdr-video",
-                    ic::HDR_VIDEO,
-                    "▶",
-                    str_vi("STR_VIDEO_CALL", "Cuộc gọi video"),
-                    HeaderAction::Call(true),
-                    cx,
-                ))
+                .when(!is_cloud, |el| {
+                    el.child(self.header_btn(
+                        "hdr-video",
+                        ic::HDR_VIDEO,
+                        "📹",
+                        str_vi("STR_VIDEO_CALL", "Cuộc gọi video"),
+                        HeaderAction::Call(true),
+                        cx,
+                    ))
+                })
                 .child(self.header_btn(
                     "hdr-search",
                     ic::HDR_SEARCH,
@@ -607,6 +612,64 @@ impl ShellView {
             ))
     }
 
+    /// Starts replying to `msg`, auto-tagging `@Sender ` into the composer when
+    /// replying to another participant, and focuses the composer input.
+    pub(crate) fn begin_reply(
+        &mut self,
+        msg: ChatMsg,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !msg.from_me {
+            let fallback_user = str_vi("STR_ZALO_USER", "Người dùng Zalo");
+            let tag_name = (!msg.sender_uid.is_empty())
+                .then(|| {
+                    self.profiles
+                        .map
+                        .get(&msg.sender_uid)
+                        .map(|p| p.name.trim().to_owned())
+                        .filter(|n| !n.is_empty() && n != fallback_user)
+                        .or_else(|| {
+                            self.friends
+                                .iter()
+                                .find(|f| f.uid == msg.sender_uid)
+                                .map(|f| f.name.trim().to_owned())
+                                .filter(|n| !n.is_empty())
+                        })
+                })
+                .flatten()
+                .or_else(|| {
+                    let s = msg.sender.trim();
+                    (!s.is_empty() && s != fallback_user).then(|| s.to_owned())
+                })
+                .or_else(|| {
+                    self.conv(msg.conv)
+                        .filter(|c| !c.is_group)
+                        .map(|c| c.name.trim().to_owned())
+                        .filter(|n| !n.is_empty())
+                });
+            if let Some(name) = tag_name {
+                let prefix = format!("@{name} ");
+                let check = format!("@{name}");
+                let cur = self.composer.read(cx).text();
+                if !cur.trim_start().starts_with(&check) {
+                    let next = if cur.is_empty() {
+                        prefix
+                    } else {
+                        format!("{prefix}{cur}")
+                    };
+                    self.composer.update(cx, |input, cx| {
+                        input.set_text(next.clone(), cx);
+                    });
+                    self.on_composer_media_change(&next, cx);
+                }
+            }
+        }
+        self.reply_to = Some(msg);
+        let handle = gpui::Focusable::focus_handle(self.composer.read(cx), cx);
+        window.focus(&handle);
+    }
+
     fn reply_bar(&self, msg: &ChatMsg, cx: &mut Context<Self>) -> impl IntoElement {
         let blue = token_rgb("--B60", "#005ae0");
         let muted = token_rgb("--text-secondary", "#5a6981");
@@ -662,7 +725,7 @@ impl ShellView {
                         this.reply_to = None;
                         cx.notify();
                     }))
-                    .child("×"),
+                    .child(fonts::icon_el(ic::CLOSE_LINE, "×", 14.)),
             )
     }
 
@@ -721,7 +784,6 @@ impl ShellView {
             .when_some(self.quick_popup(cx), |el, pop| el.child(pop))
             .when_some(self.quick_bar(cx), |el, bar| el.child(bar))
             .when_some(self.media_strip(cx), |el, strip| el.child(strip))
-            .when_some(self.mention_strip(cx), |el, strip| el.child(strip))
             .when_some(self.format_strip(cx), |el, strip| el.child(strip))
             .when_some(reply, |el, msg| el.child(self.reply_bar(msg, cx)))
             .when(self.voice_rec.is_some(), |el| {
@@ -831,14 +893,21 @@ impl ShellView {
             .when_some(self.composer_link.clone(), |el, url| {
                 el.child(self.composer_link_bar(&url, cx))
             })
-            .child(
+            .child({
+                let vis_lines = self.composer.read(cx).visible_line_count();
+                let input_h = if vis_lines <= 1 {
+                    COMPOSER_INPUT_H
+                } else {
+                    (vis_lines as f32 * 22.5 + 20.0).max(COMPOSER_INPUT_H)
+                };
                 div()
                     .id("chatInput")
                     .flex()
                     .flex_row()
-                    .items_center()
+                    .when(vis_lines <= 1, |el| el.items_center())
+                    .when(vis_lines > 1, |el| el.items_end().py(px(8.)))
                     .flex_none()
-                    .h(px(COMPOSER_INPUT_H))
+                    .h(px(input_h))
                     .px(px(12.))
                     .border_t_1()
                     .border_color(line)
@@ -847,6 +916,50 @@ impl ShellView {
                             .id("composer-input")
                             .flex_1()
                             .min_w(px(0.))
+                            .capture_key_down(cx.listener(
+                                |this, e: &gpui::KeyDownEvent, window, cx| {
+                                    let key = e.keystroke.key.as_str();
+                                    if !matches!(key, "up" | "down" | "tab")
+                                        || e.keystroke.modifiers.control
+                                        || e.keystroke.modifiers.alt
+                                        || e.keystroke.modifiers.platform
+                                    {
+                                        return;
+                                    }
+                                    let count = this.active_mention_count(cx);
+                                    if count == 0 {
+                                        return;
+                                    }
+                                    match key {
+                                        "up" => {
+                                            this.mention_idx = if this.mention_idx == 0 {
+                                                count - 1
+                                            } else {
+                                                this.mention_idx - 1
+                                            };
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                        "down" => {
+                                            this.mention_idx = (this.mention_idx + 1) % count;
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }
+                                        "tab" => {
+                                            if this.apply_active_mention(cx) {
+                                                let handle = gpui::Focusable::focus_handle(
+                                                    this.composer.read(cx),
+                                                    cx,
+                                                );
+                                                window.focus(&handle);
+                                                cx.stop_propagation();
+                                                cx.notify();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                            ))
                             .on_mouse_down(
                                 gpui::MouseButton::Right,
                                 cx.listener(|this, e: &gpui::MouseDownEvent, window, cx| {
@@ -899,8 +1012,8 @@ impl ShellView {
                             },
                         )
                         .ml(px(6.)),
-                    ),
-            )
+                    )
+            })
             .when(!self.pending_photos.is_empty(), |el| {
                 el.child(self.photo_tray(cx))
             })
@@ -1002,7 +1115,7 @@ impl ShellView {
                         this.composer_link = None;
                         cx.notify();
                     }))
-                    .child("×"),
+                    .child(fonts::icon_el(ic::CLOSE_LINE, "×", 14.)),
             )
     }
 
@@ -1314,9 +1427,12 @@ impl ShellView {
             .cursor_pointer()
             .hover(|st| st.bg(rgb(hover)))
             .tooltip(move |_, cx| tip(label, cx))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
                 match side {
-                    ComposerSide::Like => this.send_draft("👍", cx),
+                    ComposerSide::Like => {
+                        this.send_draft("👍", cx);
+                        this.spawn_react_burst(e.position(), 0, window, cx);
+                    }
                     ComposerSide::Send => {
                         let text = this.composer.read(cx).text();
                         this.send_draft(&text, cx);
@@ -1654,27 +1770,41 @@ impl ShellView {
         &self,
         conv: &ChatConv,
         query: &str,
-    ) -> Vec<(String, Option<std::sync::Arc<gpui::RenderImage>>)> {
+    ) -> Vec<(String, String, Option<std::sync::Arc<gpui::RenderImage>>, bool)> {
         let q_lower = query.to_lowercase();
         let mut seen = std::collections::HashSet::<String>::new();
         let mut out = Vec::new();
-        let mut push = |name: String, avatar: Option<std::sync::Arc<gpui::RenderImage>>| {
+        let mut push = |name: String,
+                        key: String,
+                        avatar: Option<std::sync::Arc<gpui::RenderImage>>,
+                        is_all: bool| {
             let trimmed = name.trim();
-            if trimmed.is_empty() || out.len() >= 6 {
+            if trimmed.is_empty() || out.len() >= 24 {
                 return;
             }
             if !q_lower.is_empty() && !trimmed.to_lowercase().contains(&q_lower) {
                 return;
             }
-            if seen.insert(trimmed.to_lowercase()) {
-                out.push((trimmed.to_owned(), avatar));
+            let dedupe = if key.is_empty() {
+                format!("name:{}", trimmed.to_lowercase())
+            } else {
+                format!("uid:{key}")
+            };
+            if seen.insert(dedupe) {
+                out.push((trimmed.to_owned(), key, avatar, is_all));
             }
         };
 
         if conv.is_group {
-            push("All".to_owned(), None);
+            push("All".to_owned(), "__all__".to_owned(), None, true);
+            let mut added_member = false;
             if let Some(prof) = self.profiles.map.get(&conv.thread_id) {
                 for uid in &prof.member_ids {
+                    if self.self_uid().is_some_and(|me| me == uid)
+                        || self.uin.as_deref().is_some_and(|me| me == uid)
+                    {
+                        continue;
+                    }
                     let name = self
                         .profiles
                         .map
@@ -1688,21 +1818,75 @@ impl ShellView {
                                 .map(|f| f.name.clone())
                         });
                     if let Some(name) = name {
-                        push(name, self.avatar_of(uid));
+                        added_member = true;
+                        push(name, uid.clone(), self.avatar_of(uid), false);
                     }
                 }
             }
-            for name in self.members_of(conv) {
-                push(name, None);
+            if !added_member {
+                for name in self.members_of(conv) {
+                    push(name, String::new(), None, false);
+                }
             }
         } else {
-            push(conv.name.clone(), self.avatar_of(&conv.thread_id));
+            push(
+                conv.name.clone(),
+                conv.thread_id.clone(),
+                self.avatar_of(&conv.thread_id),
+                false,
+            );
         }
         out
     }
 
-    /// Floating `@mention` suggestion strip when `mentionSuggest` is enabled.
-    fn mention_strip(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+    pub(crate) fn active_mention_count(&self, cx: &Context<Self>) -> usize {
+        if !self.prefs.bool("mentionSuggest", true) {
+            return 0;
+        }
+        let draft = self.composer.read(cx).text();
+        let Some((_, query)) = mention_query(&draft) else {
+            return 0;
+        };
+        let Some(conv) = self.selected_conv() else {
+            return 0;
+        };
+        self.mention_candidates(&conv, query).len()
+    }
+
+    /// Inserts the highlighted `@mention` candidate into the composer. Returns
+    /// `true` if a mention popup was active and completed.
+    pub(crate) fn apply_active_mention(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.prefs.bool("mentionSuggest", true) {
+            return false;
+        }
+        let draft = self.composer.read(cx).text();
+        let Some((at_idx, query)) = mention_query(&draft) else {
+            return false;
+        };
+        let Some(conv) = self.selected_conv() else {
+            return false;
+        };
+        let candidates = self.mention_candidates(&conv, query);
+        if candidates.is_empty() {
+            return false;
+        }
+        let pick_idx = self.mention_idx.min(candidates.len() - 1);
+        let pick_name = candidates[pick_idx].0.clone();
+        let mut next = draft[..at_idx].to_owned();
+        next.push('@');
+        next.push_str(&pick_name);
+        next.push(' ');
+        self.mention_idx = 0;
+        self.composer.update(cx, |input, cx| {
+            input.set_text(next.clone(), cx);
+        });
+        self.on_composer_media_change(&next, cx);
+        true
+    }
+
+    /// Floating vertical `@mention` suggestion list anchored above the composer
+    /// (matching Zalo Electron's popup menu instead of a horizontal strip).
+    fn mention_popup(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.prefs.bool("mentionSuggest", true) {
             return None;
         }
@@ -1713,77 +1897,185 @@ impl ShellView {
         if candidates.is_empty() {
             return None;
         }
+        let active_idx = self.mention_idx.min(candidates.len() - 1);
         let line = crate::color::border_subtle();
         let paper = token_rgb("--layer-background", "#ffffff");
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+        let selected_bg = token_rgb("--layer-background-selected", "#e5efff");
         let ink = token_rgb("--text-primary", "#081c36");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let blue = token_rgb("--B55", "#0068ff");
         Some(
             div()
-                .id("mention-strip")
-                .flex()
-                .flex_row()
-                .items_center()
-                .flex_none()
-                .h(px(38.))
-                .px(px(12.))
-                .gap(px(8.))
-                .overflow_x_hidden()
+                .id("mention-popup")
+                .absolute()
+                .left(px(12.))
+                .bottom(px(8.))
+                .w(px(300.))
+                .rounded(px(8.))
                 .bg(rgb(paper))
-                .border_t_1()
+                .border_1()
                 .border_color(line)
-                .children(
-                    candidates
-                        .into_iter()
-                        .enumerate()
-                        .map(|(idx, (name, photo))| {
-                            let draft_snap = draft.clone();
-                            let label = format!("@{name}");
-                            let pick_name = name.clone();
+                .shadow_md()
+                .occlude()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(12.))
+                        .py(px(8.))
+                        .border_b_1()
+                        .border_color(line)
+                        .child(
                             div()
-                                .id(("mention-pick", idx as u64))
+                                .flex_none()
+                                .size(px(22.))
+                                .rounded(px(11.))
+                                .bg(rgb(0xf5_9e_0b))
                                 .flex()
-                                .flex_row()
                                 .items_center()
-                                .gap(px(6.))
-                                .h(px(26.))
-                                .px(px(8.))
-                                .rounded(px(13.))
-                                .cursor_pointer()
-                                .bg(rgb(hover))
-                                .hover(|st| {
-                                    st.bg(rgb(token_rgb("--layer-background-selected", "#e2e8f0")))
-                                })
-                                .when_some(photo, |el, p| {
-                                    el.child(
-                                        img(p)
-                                            .size(px(18.))
-                                            .rounded(px(9.))
-                                            .object_fit(ObjectFit::Cover),
-                                    )
-                                })
-                                .child(
+                                .justify_center()
+                                .child(fonts::fa_icon(fonts::FA_LIGHTBULB, "💡", 11., 0xff_ffff)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(12.))
+                                .line_height(px(16.))
+                                .text_color(rgb(muted))
+                                .child("Nhấn ↑, ↓ để chọn và Enter để dùng"),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("mention-popup-list")
+                        .flex()
+                        .flex_col()
+                        .max_h(px(264.))
+                        .overflow_y_scroll()
+                        .py(px(4.))
+                        .children(candidates.into_iter().enumerate().map(
+                            |(idx, (name, key, photo, is_all))| {
+                                let draft_snap = draft.clone();
+                                let pick_name = name.clone();
+                                let is_active = idx == active_idx;
+                                let avatar_el = if is_all {
                                     div()
-                                        .max_w(px(160.))
+                                        .flex_none()
+                                        .size(px(32.))
+                                        .rounded(px(16.))
+                                        .bg(rgb(blue))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(15.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(0xff_ffff))
+                                        .child("@")
+                                        .into_any_element()
+                                } else if let Some(p) = photo {
+                                    img(p)
+                                        .flex_none()
+                                        .size(px(32.))
+                                        .rounded(px(16.))
+                                        .object_fit(ObjectFit::Cover)
+                                        .into_any_element()
+                                } else {
+                                    let seed = if key.is_empty() {
+                                        name.as_str()
+                                    } else {
+                                        key.as_str()
+                                    };
+                                    let fill = crate::sidebar::avatar_color(seed);
+                                    let initials = crate::sidebar::avatar_initials(&name);
+                                    div()
+                                        .flex_none()
+                                        .size(px(32.))
+                                        .rounded(px(16.))
+                                        .bg(rgb(fill))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(12.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(0xff_ffff))
+                                        .child(initials)
+                                        .into_any_element()
+                                };
+                                let label_el = if is_all {
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .min_w(px(0.))
+                                        .flex_1()
+                                        .text_size(px(14.))
+                                        .child(
+                                            div()
+                                                .text_color(rgb(ink))
+                                                .child("Báo cho cả nhóm ·"),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(blue))
+                                                .child("@All"),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
                                         .truncate()
-                                        .text_size(px(13.))
+                                        .text_size(px(14.))
                                         .text_color(rgb(ink))
-                                        .child(label),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let mut next = draft_snap[..at_idx].to_owned();
-                                    next.push('@');
-                                    next.push_str(&pick_name);
-                                    next.push(' ');
-                                    this.composer.update(cx, |input, cx| {
-                                        input.set_text(next.clone(), cx);
-                                    });
-                                    this.on_composer_media_change(&next, cx);
-                                    let handle =
-                                        gpui::Focusable::focus_handle(this.composer.read(cx), cx);
-                                    window.focus(&handle);
-                                    cx.notify();
-                                }))
-                        }),
+                                        .child(name)
+                                        .into_any_element()
+                                };
+                                div()
+                                    .id(("mention-pick", idx as u64))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .h(px(44.))
+                                    .px(px(12.))
+                                    .cursor_pointer()
+                                    .when(is_active, |d| d.bg(rgb(selected_bg)))
+                                    .hover(|st| {
+                                        st.bg(rgb(if is_active { selected_bg } else { hover }))
+                                    })
+                                    .child(avatar_el)
+                                    .child(label_el)
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            let mut next = draft_snap[..at_idx].to_owned();
+                                            next.push('@');
+                                            next.push_str(&pick_name);
+                                            next.push(' ');
+                                            this.mention_idx = 0;
+                                            this.composer.update(cx, |input, cx| {
+                                                input.set_text(next.clone(), cx);
+                                            });
+                                            this.on_composer_media_change(&next, cx);
+                                            let handle = gpui::Focusable::focus_handle(
+                                                this.composer.read(cx),
+                                                cx,
+                                            );
+                                            window.focus(&handle);
+                                            cx.notify();
+                                        }),
+                                    )
+                            },
+                        )),
                 )
                 .into_any_element(),
         )
@@ -1911,6 +2203,7 @@ impl ShellView {
         };
         let (hidden, items) = self.build_msg_rows(row);
         self.sync_msg_list(row.id, items.len(), hidden);
+        self.chat_sel_reg.borrow_mut().begin_frame(Some(row.id));
         let items = std::rc::Rc::new(items);
         let row_owned = row.clone();
         let conv_id = row.id;
@@ -1921,12 +2214,130 @@ impl ShellView {
         )
         .and_then(|path| self.wallpaper_image(path));
         div()
+            .id("message-view")
             .relative()
             .flex()
             .flex_col()
             .flex_1()
             .w_full()
             .min_h(px(0.))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    if this.select_msgs.is_some() {
+                        return;
+                    }
+                    let hit = this.chat_sel_reg.borrow().hit_test_exact(e.position);
+                    if let Some(hit) = hit {
+                        if e.click_count >= 3 {
+                            if let Some(len) = this
+                                .chat_sel_reg
+                                .borrow()
+                                .block_text(hit.key)
+                                .map(str::len)
+                            {
+                                this.chat_sel
+                                    .select_range(conv_id, hit.key, hit.order, 0..len);
+                                this.chat_sel.suppress_next_click = true;
+                                window.focus(&this.root_focus);
+                                cx.notify();
+                            }
+                        } else if e.click_count == 2 {
+                            // Double-clicking text always selects the word instead of
+                            // triggering double-click reply.
+                            let range = this
+                                .chat_sel_reg
+                                .borrow()
+                                .block_text(hit.key)
+                                .map(|text| crate::chat_select::word_bounds_at(text, hit.offset));
+                            if let Some(range) = range {
+                                this.chat_sel
+                                    .select_range(conv_id, hit.key, hit.order, range);
+                                this.chat_sel.suppress_next_click = true;
+                                window.focus(&this.root_focus);
+                                cx.notify();
+                            }
+                        } else {
+                            this.chat_sel.begin_press(conv_id, hit, e.position);
+                            window.focus(&this.root_focus);
+                            cx.notify();
+                        }
+                    } else if this.chat_sel.has_selection() {
+                        this.chat_sel.clear();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, e: &gpui::MouseMoveEvent, _, cx| {
+                if !this.chat_sel.dragging {
+                    return;
+                }
+                if e.pressed_button != Some(gpui::MouseButton::Left) {
+                    if this.chat_sel.finish_drag() {
+                        cx.notify();
+                    }
+                    return;
+                }
+                let Some(anchor) = this.chat_sel.anchor else {
+                    return;
+                };
+                let hit = this
+                    .chat_sel_reg
+                    .borrow()
+                    .hit_test_nearest(e.position, anchor);
+                if let Some(hit) = hit {
+                    if this.chat_sel.update_drag(hit, e.position) {
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                    let was_drag = this.chat_sel.drag_moved;
+                    let had_press = this.chat_sel.dragging;
+                    let changed = this.chat_sel.finish_drag();
+                    if had_press && !was_drag && e.click_count == 1 && this.select_msgs.is_none() {
+                        let hit_text = {
+                            let reg = this.chat_sel_reg.borrow();
+                            reg.hit_test_exact(e.position).and_then(|hit| {
+                                reg.block_text(hit.key)
+                                    .map(|t| (hit.offset, t.to_owned()))
+                            })
+                        };
+                        if let Some((offset, text)) = hit_text {
+                            let known = this.mention_known_names();
+                            match crate::chat_select::interactive_span_at(&text, offset, &known) {
+                                Some(crate::chat_select::InlineHit::Url(url)) => {
+                                    this.chat_sel.suppress_next_click = true;
+                                    crate::os_util::open_url(&url);
+                                }
+                                Some(crate::chat_select::InlineHit::Mention(name)) => {
+                                    if !name.eq_ignore_ascii_case("all")
+                                        && !name.eq_ignore_ascii_case("tất cả")
+                                    {
+                                        this.chat_sel.suppress_next_click = true;
+                                        this.open_user_info_by_name(&name, conv_id, cx);
+                                        cx.notify();
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.chat_sel.finish_drag() {
+                        cx.notify();
+                    }
+                }),
+            )
             .when(self.react_picker.is_some(), |el| {
                 el.on_scroll_wheel(cx.listener(|this, _, _, cx| {
                     if this.react_picker.is_some() {
@@ -2004,6 +2415,7 @@ impl ShellView {
                                     };
                                 this.bubble(
                                     shown,
+                                    *msg_idx,
                                     is_group,
                                     *first,
                                     *last,
@@ -2028,6 +2440,73 @@ impl ShellView {
                 .w_full()
                 .min_h(px(0.)),
             )
+            .when(self.chat_scrolled_up, |el| {
+                let paper = token_rgb("--layer-background", "#ffffff");
+                let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+                let icon_col = token_rgb("--icon-secondary", "#5a6981");
+                let blue = token_rgb("--B55", "#0068ff");
+                let line = crate::color::border_subtle();
+                let badge = self.chat_unread_below;
+                el.child(
+                    div()
+                        .id("chat-scroll-bottom-wrap")
+                        .absolute()
+                        .right(px(16.))
+                        .bottom(px(14.))
+                        .child(
+                            div()
+                                .id("chat-scroll-bottom")
+                                .relative()
+                                .size(px(36.))
+                                .rounded(px(18.))
+                                .bg(rgb(paper))
+                                .border_1()
+                                .border_color(line)
+                                .shadow_sm()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_color(rgb(icon_col))
+                                .hover(|st| st.bg(rgb(hover)).text_color(rgb(blue)))
+                                .tooltip(|_, cx| tip("Cuộn xuống tin nhắn mới nhất", cx))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.chat_scrolled_up = false;
+                                    this.chat_unread_below = 0;
+                                    this.scroll_msgs_to_bottom();
+                                    cx.notify();
+                                }))
+                                .child(fonts::icon_el(ic::CHEVRON_DOUBLE_DOWN, "⌄", 19.))
+                                .when(badge > 0, |btn| {
+                                    let label = if badge > 99 {
+                                        "99+".to_owned()
+                                    } else {
+                                        badge.to_string()
+                                    };
+                                    btn.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(-7.))
+                                            .right(px(-2.))
+                                            .min_w(px(18.))
+                                            .h(px(18.))
+                                            .px(px(4.))
+                                            .rounded(px(9.))
+                                            .bg(rgb(blue))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(11.))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(0xff_ffff))
+                                            .child(label),
+                                    )
+                                }),
+                        ),
+                )
+            })
+            .when_some(self.mention_popup(cx), |el, pop| el.child(pop))
             .into_any_element()
     }
 
@@ -2223,9 +2702,11 @@ impl ShellView {
     /// radius 6, `--blue-message` / white; time inside the card on the last
     /// message of a block (12 px `#44546f`), or a dark pill under media;
     /// hover shows Quote / Share / More (24 px round) and the reaction button.
+    #[allow(clippy::too_many_arguments)]
     fn bubble(
         &self,
         msg: ChatMsg,
+        msg_idx: usize,
         is_group: bool,
         first: bool,
         last: bool,
@@ -2260,9 +2741,9 @@ impl ShellView {
         let quote_box = self.quote_card(&msg, media, cx);
         let has_quote = quote_box.is_some();
         let body = if album.len() > 1 {
-            self.album_body(album, ink, cx)
+            self.album_body(album, msg.id, msg_idx, ink, cx)
         } else {
-            self.bubble_body(&msg, fill, ink, muted, cx)
+            self.bubble_body(&msg, msg_idx, fill, ink, muted, cx)
         };
         let show_sender = is_group && !msg.from_me && first;
         let urgency = self.urgency_msgs.get(&row_id).copied().unwrap_or(0);
@@ -2321,12 +2802,31 @@ impl ShellView {
                     )
                 })
                 .when(show_sender && !media && phone.is_none(), |el| {
+                    let s_uid = msg.sender_uid.clone();
+                    let s_name = msg.sender.clone();
+                    let s_conv = msg.conv;
+                    let link_blue = token_rgb("--B55", "#0068ff");
                     el.child(
                         div()
+                            .id(("bubble-sender", row_id))
                             .mb(px(6.))
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .text_color(rgb(muted))
+                            .cursor_pointer()
+                            .hover(move |st| st.text_color(rgb(link_blue)))
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if !s_uid.is_empty() {
+                                    this.open_user_info(s_uid.clone(), s_name.clone(), cx);
+                                } else {
+                                    this.open_user_info_by_name(&s_name, s_conv, cx);
+                                }
+                                cx.notify();
+                            }))
                             .child(msg.sender.clone()),
                     )
                 })
@@ -2344,7 +2844,14 @@ impl ShellView {
                             .line_height(px(18.))
                             .text_color(rgb(token_rgb("--text-secondary", "#44546f")))
                             .child(msg.time.clone())
-                            .when(starred, |el| el.child("★"))
+                            .when(starred, |el| {
+                                el.child(fonts::fa_icon(
+                                    fonts::FA_STAR,
+                                    "★",
+                                    10.5,
+                                    token_rgb("--Y60", "#f59e0b"),
+                                ))
+                            })
                             .when(pinned, |el| el.child(fonts::icon_el(ic::PIN, "📌", 12.))),
                     )
                 })
@@ -2360,147 +2867,132 @@ impl ShellView {
         let react_summary = self
             .reactions
             .get(&row_id)
-            .filter(|v| !v.is_empty())
-            .map(|list| {
-                let mut indices: Vec<usize> = Vec::new();
-                for r in list {
-                    let idx = crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type);
-                    if !indices.contains(&idx) && indices.len() < 3 {
-                        indices.push(idx);
-                    }
-                }
-                (indices, list.len())
-            });
+            .and_then(|list| crate::read_sync::summarize_reactions(list))
+            .or_else(|| liked.then(|| (vec![0usize], 1u32)));
         let has_reacts = react_summary.is_some();
-        let my_reacted = self.my_reaction(row_id).is_some();
-        let react_hold_msg = msg.clone();
-        let react_tip = if my_reacted {
-            "Nhấn bỏ cảm xúc · Giữ để đổi"
-        } else {
-            "Nhấn để thích · Giữ để chọn cảm xúc"
-        };
-        let react_content = match react_summary {
-            Some((indices, total)) => div()
+        let picker_on_this = self
+            .react_picker
+            .as_ref()
+            .is_some_and(|p| p.msg.id == row_id);
+        let react_bg = crate::color::token_rgb("--reaction-background", "#ffffff");
+        let react_border = crate::color::border_subtle();
+        let react_hover_msg = msg.clone();
+        let summary_click_msg = msg.clone();
+        let summary_pill = react_summary.map(|(indices, total)| {
+            div()
+                .id(("react-summary", row_id))
+                .h(px(22.))
+                .px(px(6.))
+                .rounded(px(11.))
+                .bg(rgb(react_bg))
+                .border_1()
+                .border_color(react_border)
+                .shadow_sm()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(2.))
+                .cursor_pointer()
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_react_picker(summary_click_msg.clone(), e.position, window, false);
+                        cx.notify();
+                    }),
+                )
                 .children(indices.into_iter().map(|idx| {
                     match media::reaction_icon_by_index(idx) {
                         Some(image) => img(image)
-                            .size(px(15.))
+                            .size(px(14.))
                             .object_fit(ObjectFit::Contain)
                             .into_any_element(),
                         None => div()
-                            .text_size(px(12.))
-                            .line_height(px(18.))
+                            .text_size(px(11.5))
+                            .line_height(px(16.))
                             .text_color(rgb(ink))
                             .child(crate::read_sync::REACTION_PRESETS[idx].0)
                             .into_any_element(),
                     }
                 }))
-                .when(total > 1, |el| {
-                    el.child(
-                        div()
-                            .ml(px(2.))
-                            .text_size(px(11.5))
-                            .line_height(px(16.))
-                            .text_color(rgb(ink))
-                            .child(total.to_string()),
-                    )
-                })
-                .into_any_element(),
-            None => like_el(15.).into_any_element(),
+                .child(
+                    div()
+                        .ml(px(2.))
+                        .text_size(px(11.5))
+                        .line_height(px(16.))
+                        .font_family(FAMILY_SEMIBOLD)
+                        .text_color(rgb(ink))
+                        .child(total.to_string()),
+                )
+        });
+        let my_react_idx = self.my_reaction_preset(row_id);
+        let trigger_icon = match my_react_idx {
+            Some(idx) => match media::reaction_icon_by_index(idx) {
+                Some(image) => img(image)
+                    .size(px(14.))
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                None => div()
+                    .text_size(px(12.))
+                    .child(crate::read_sync::REACTION_PRESETS[idx].0)
+                    .into_any_element(),
+            },
+            None => like_el(14.),
         };
-        let react = div()
+        let like_trigger = div()
             .id(("react", row_id))
-            .absolute()
-            .right(px(4.))
-            .bottom(px(4.))
-            .h(px(24.))
-            .min_w(px(24.))
-            .when(has_reacts, |el| el.px(px(6.)))
-            .when(!has_reacts, |el| el.w(px(24.)))
-            .rounded(px(12.))
-            .bg(rgb(crate::color::token_rgb(
-                "--reaction-background",
-                "#ffffff",
-            )))
+            .size(px(22.))
+            .rounded(px(11.))
+            .bg(rgb(react_bg))
+            .border_1()
+            .border_color(react_border)
             .shadow_sm()
             .flex()
             .items_center()
             .justify_center()
             .cursor_pointer()
-            .when(!liked && !has_reacts, |el| {
+            .when(!has_reacts && !picker_on_this, |el| {
                 el.invisible().group_hover(group.clone(), |st| st.visible())
             })
-            .tooltip(move |_, cx| tip(react_tip, cx))
+            .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, window, cx| {
+                if this.react_picker.as_ref().is_some_and(|p| p.msg.id == row_id) {
+                    return;
+                }
+                if this.menu.is_some() || this.chat_sel.dragging {
+                    return;
+                }
+                this.open_react_picker_hover(react_hover_msg.clone(), e.position, window);
+                cx.notify();
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    this.react_hold_msg = Some(row_id);
-                    this.react_hold_opened = false;
-                    this.react_hold_gen = this.react_hold_gen.wrapping_add(1);
-                    let gen = this.react_hold_gen;
-                    let press_pos = e.position;
-                    let hold_target = react_hold_msg.clone();
-                    let weak = cx.weak_entity();
-                    window
-                        .spawn(cx, async move |cx| {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(200))
-                                .await;
-                            let _ = weak.update_in(cx, |view, window, cx| {
-                                if view.react_hold_gen == gen
-                                    && view.react_hold_msg == Some(row_id)
-                                {
-                                    view.react_hold_opened = true;
-                                    view.open_react_picker(hold_target, press_pos, window, true);
-                                    cx.notify();
-                                }
-                            });
-                        })
-                        .detach();
-                }),
-            )
-            .on_mouse_up(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    let was_quick =
-                        this.react_hold_msg == Some(row_id) && !this.react_hold_opened;
-                    this.react_hold_gen = this.react_hold_gen.wrapping_add(1);
-                    this.react_hold_msg = None;
-                    if was_quick {
-                        if let Some(m) = this
-                            .messages
-                            .get(&click_msg.conv)
-                            .and_then(|l| l.iter().find(|m| m.id == click_msg.id))
-                            .cloned()
-                        {
-                            this.apply_like(&m);
-                        }
-                        this.close_react_picker();
-                    } else if this.react_hold_opened {
-                        this.react_hold_opened = false;
-                        if let Some(p) = this.react_picker.as_mut() {
-                            p.holding = false;
-                        }
+                    if let Some(m) = this
+                        .messages
+                        .get(&click_msg.conv)
+                        .and_then(|l| l.iter().find(|m| m.id == click_msg.id))
+                        .cloned()
+                    {
+                        let idx = this.apply_active_reaction(&m);
+                        this.spawn_react_burst(e.position, idx, window, cx);
                     }
+                    this.close_react_picker();
                     cx.notify();
                 }),
             )
-            .on_mouse_up_out(
-                gpui::MouseButton::Left,
-                cx.listener(move |this, _, _, _| {
-                    if this.react_hold_msg == Some(row_id) && !this.react_hold_opened {
-                        this.react_hold_msg = None;
-                        this.react_hold_gen = this.react_hold_gen.wrapping_add(1);
-                    }
-                }),
-            )
-            .child(react_content);
+            .child(trigger_icon);
+        let react = div()
+            .id(("react-cluster", row_id))
+            .absolute()
+            .right(px(8.))
+            .bottom(px(-11.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .when_some(summary_pill, |el, pill| el.child(pill))
+            .child(like_trigger);
         let menu_msg = msg.clone();
         let selecting = self
             .select_msgs
@@ -2523,7 +3015,7 @@ impl ShellView {
             .when(last && media && status_pill.is_none(), |el| {
                 el.child(
                     div()
-                        .mt(px(6.))
+                        .mt(px(if has_reacts { 14. } else { 8. }))
                         .px(px(8.))
                         .h(px(20.))
                         .rounded(px(10.))
@@ -2538,7 +3030,7 @@ impl ShellView {
                 let show_clock = card_clock || (last && media);
                 el.child(
                     div()
-                        .mt(px(if card_clock { 8. } else { 6. }))
+                        .mt(px(if has_reacts { 14. } else if card_clock { 10. } else { 8. }))
                         .flex()
                         .flex_row()
                         .items_center()
@@ -2577,6 +3069,7 @@ impl ShellView {
             .flex_none()
             .w_full()
             .pt(px(if first { 12. } else { 4. }))
+            .pb(px(if has_reacts { 14. } else { 12. }))
             .when(selecting.is_some(), |el| el.pl(px(40.)))
             .when(msg.from_me, |el| el.justify_end().pl(px(88.)))
             .when(!msg.from_me, |el| {
@@ -2601,9 +3094,33 @@ impl ShellView {
                 } else {
                     msg.sender.as_str()
                 };
+                let click_uid = avatar_uid.to_owned();
+                let click_name = avatar_name.to_owned();
+                let click_conv = msg.conv;
                 el.justify_start().pr(px(48.)).child(
                     div().flex_none().w(px(40.)).mr(px(10.)).when(first, |el| {
-                        el.child(small_avatar(avatar_name, avatar_uid, avatar_photo))
+                        el.child(
+                            div()
+                                .id(("bubble-ava", row_id))
+                                .cursor_pointer()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if !click_uid.is_empty() {
+                                        this.open_user_info(
+                                            click_uid.clone(),
+                                            click_name.clone(),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.open_user_info_by_name(&click_name, click_conv, cx);
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(small_avatar(avatar_name, avatar_uid, avatar_photo)),
+                        )
                     }),
                 )
             })
@@ -2611,12 +3128,13 @@ impl ShellView {
                 if event.standard_click()
                     && event.click_count() == 2
                     && this.select_msgs.is_none()
+                    && !this.chat_sel.drag_moved
+                    && !this.chat_sel.suppress_next_click
+                    && !this.chat_sel.has_selection()
                     && !dbl_msg.recalled
                     && this.prefs.bool("dblReply", true)
                 {
-                    this.reply_to = Some(dbl_msg.clone());
-                    let handle = gpui::Focusable::focus_handle(this.composer.read(cx), cx);
-                    window.focus(&handle);
+                    this.begin_reply(dbl_msg.clone(), window, cx);
                     cx.notify();
                 }
             }))
@@ -2856,8 +3374,8 @@ impl ShellView {
             )))
             .child(
                 mk("mqa-quote", ic::MSG_QUOTE, "Trả lời").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.reply_to = Some(reply.clone());
+                    move |this, _, window, cx| {
+                        this.begin_reply(reply.clone(), window, cx);
                         cx.notify();
                     },
                 )),
@@ -3949,13 +4467,7 @@ impl ShellView {
                                 .child(label),
                         )
                         .when(on, |d| {
-                            d.child(
-                                div()
-                                    .text_size(px(12.))
-                                    .font_family(FAMILY_SEMIBOLD)
-                                    .text_color(rgb(chip_active_ink))
-                                    .child("✓"),
-                            )
+                            d.child(fonts::fa_icon(fonts::FA_CHECK, "✓", 11., chip_active_ink))
                         })
                         .into_any_element()
                 })
@@ -4049,7 +4561,7 @@ impl ShellView {
                                 this.msg_search.update(cx, |i, cx| i.clear(cx));
                                 cx.notify();
                             }))
-                            .child("×"),
+                            .child(fonts::icon_el(ic::CLOSE_LINE, "×", 16.)),
                     ),
             )
             // Search input box + "Filter by: Sender ▾ | Date ▾"
@@ -4107,7 +4619,7 @@ impl ShellView {
                                             this.msg_search.update(cx, |i, cx| i.clear(cx));
                                             this.update_msg_search(String::new(), cx);
                                         }))
-                                        .child("×"),
+                                        .child(fonts::icon_el(ic::TEXTBOX_CLEAR, "×", 13.)),
                                 )
                             }),
                     )
@@ -4302,10 +4814,305 @@ impl ShellView {
             .when_some(date_popover, |d, pop| d.child(pop))
     }
 
+    /// Extract the currently drag-selected chat text across one or more bubbles.
+    pub(crate) fn selected_chat_text(&self) -> Option<String> {
+        self.chat_sel_reg.borrow().extract_selected(&self.chat_sel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn selectable_text(
+        &self,
+        msg_id: u64,
+        msg_idx: usize,
+        part: u8,
+        text: &str,
+        max_w: f32,
+        font_px: f32,
+        line_h: f32,
+        color: u32,
+        semibold: bool,
+    ) -> gpui::AnyElement {
+        let key = crate::chat_select::TextBlockKey { msg_id, part };
+        let order = msg_idx.saturating_mul(8) + part as usize;
+        let selectable = self.select_msgs.is_none();
+        let sel_range = self.chat_sel.range_for_block(key, order, text.len());
+        let interactive = crate::chat_select::find_url_spans(text);
+        crate::chat_select::SelectableTextElement::plain(
+            key,
+            order,
+            text.to_owned(),
+            max_w,
+            font_px,
+            line_h,
+            rgb(color).into(),
+            if semibold {
+                bubble_semibold_font()
+            } else {
+                bubble_font()
+            },
+            semibold,
+            selectable,
+            sel_range,
+            std::rc::Rc::clone(&self.chat_sel_reg),
+        )
+        .with_interactive_spans(interactive)
+        .into_any_element()
+    }
+
+    /// Known display names in the open conversation for accurate `@mention`
+    /// highlighting (group members, conversation title, self display name).
+    fn mention_known_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Some(me) = self.display_name.as_deref().filter(|s| !s.trim().is_empty()) {
+            names.push(me.trim().to_owned());
+        }
+        if let Some(conv) = self.selected_conv() {
+            if !conv.name.trim().is_empty() {
+                names.push(conv.name.trim().to_owned());
+            }
+            if conv.is_group {
+                if let Some(prof) = self.profiles.map.get(&conv.thread_id) {
+                    for uid in &prof.member_ids {
+                        if let Some(p) = self.profiles.map.get(uid) {
+                            if !p.name.trim().is_empty() {
+                                names.push(p.name.trim().to_owned());
+                            }
+                        } else if let Some(f) = self.friends.iter().find(|f| f.uid == *uid) {
+                            if !f.name.trim().is_empty() {
+                                names.push(f.name.trim().to_owned());
+                            }
+                        }
+                    }
+                }
+                for member in self.members_of(&conv) {
+                    if !member.trim().is_empty() {
+                        names.push(member);
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    fn selectable_bubble_text(
+        &self,
+        msg_id: u64,
+        msg_idx: usize,
+        part: u8,
+        text: &str,
+        color: u32,
+        max_w: f32,
+    ) -> gpui::AnyElement {
+        let link_blue = token_rgb("--B55", "#0068ff");
+        let is_link = media::first_link(text).is_some_and(|u| text.trim() == u);
+        let color = if is_link { link_blue } else { color };
+        let mut colored_spans: Vec<(std::ops::Range<usize>, gpui::Hsla)> = Vec::new();
+        let mut interactive_spans: Vec<std::ops::Range<usize>> = Vec::new();
+        if is_link {
+            interactive_spans = crate::chat_select::find_url_spans(text);
+            if interactive_spans.is_empty() && !text.is_empty() {
+                interactive_spans.push(0..text.len());
+            }
+        } else {
+            let link_hsla: gpui::Hsla = rgb(link_blue).into();
+            if text.contains('@') {
+                let known = self.mention_known_names();
+                for r in crate::chat_select::find_mention_spans(text, &known) {
+                    interactive_spans.push(r.clone());
+                    colored_spans.push((r, link_hsla));
+                }
+            }
+            for range in crate::chat_select::find_url_spans(text) {
+                if !colored_spans
+                    .iter()
+                    .any(|(r, _)| r.start < range.end && range.start < r.end)
+                {
+                    interactive_spans.push(range.clone());
+                    colored_spans.push((range, link_hsla));
+                }
+            }
+            colored_spans.sort_by_key(|(r, _)| r.start);
+            interactive_spans.sort_by_key(|r| r.start);
+        }
+        let has_tiles = crate::emoji::split_pictograms(text)
+            .iter()
+            .any(|p| matches!(p, crate::emoji::PictogramPart::Tile(_)));
+        let key = crate::chat_select::TextBlockKey { msg_id, part };
+        let order = msg_idx.saturating_mul(8) + part as usize;
+        let selectable = self.select_msgs.is_none();
+        let sel_range = self.chat_sel.range_for_block(key, order, text.len());
+        if has_tiles {
+            crate::chat_select::SelectableTextElement::rich(
+                key,
+                order,
+                text.to_owned(),
+                max_w,
+                15.0,
+                22.0,
+                rgb(color).into(),
+                bubble_font(),
+                selectable,
+                sel_range,
+                std::rc::Rc::clone(&self.chat_sel_reg),
+            )
+            .with_colored_spans(colored_spans)
+            .with_interactive_spans(interactive_spans)
+            .into_any_element()
+        } else {
+            crate::chat_select::SelectableTextElement::plain(
+                key,
+                order,
+                text.to_owned(),
+                max_w,
+                15.0,
+                22.0,
+                rgb(color).into(),
+                bubble_font(),
+                false,
+                selectable,
+                sel_range,
+                std::rc::Rc::clone(&self.chat_sel_reg),
+            )
+            .with_colored_spans(colored_spans)
+            .with_interactive_spans(interactive_spans)
+            .into_any_element()
+        }
+    }
+
+    /// Render a text message containing fenced or auto-detected source code blocks:
+    /// clean monospace text directly on the chat bubble fill (no inner box fill),
+    /// with preserved indentation/newlines, drag selection, and a one-click Copy button.
+    fn code_segments_body(
+        &self,
+        msg_id: u64,
+        msg_idx: usize,
+        segments: Vec<crate::code_detect::MessageSegment>,
+        ink: u32,
+        muted: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let dark = crate::color::is_dark();
+        let copy_hover = if dark { 0x30_36_3d } else { 0xd8_de_e4 };
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .max_w(px(media::BUBBLE_INNER));
+        for (seg_idx, seg) in segments.into_iter().enumerate() {
+            let part = (seg_idx as u8).min(7);
+            match seg {
+                crate::code_detect::MessageSegment::Text(t) => {
+                    col = col.child(self.selectable_bubble_text(
+                        msg_id,
+                        msg_idx,
+                        part,
+                        &t,
+                        ink,
+                        media::BUBBLE_INNER,
+                    ));
+                }
+                crate::code_detect::MessageSegment::Code { lang, code } => {
+                    let copy_text = code.clone();
+                    let key = crate::chat_select::TextBlockKey { msg_id, part };
+                    let order = msg_idx.saturating_mul(8) + part as usize;
+                    let selectable = self.select_msgs.is_none();
+                    let sel_range = self.chat_sel.range_for_block(key, order, code.len());
+                    let code_el = crate::chat_select::SelectableTextElement::plain(
+                        key,
+                        order,
+                        code,
+                        media::BUBBLE_INNER,
+                        13.0,
+                        19.5,
+                        rgb(ink).into(),
+                        code_font(),
+                        false,
+                        selectable,
+                        sel_range,
+                        std::rc::Rc::clone(&self.chat_sel_reg),
+                    );
+                    col = col.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.))
+                            .max_w(px(media::BUBBLE_INNER))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(12.))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(muted))
+                                            .child(lang),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("code-copy", msg_id.wrapping_mul(17).wrapping_add(seg_idx as u64)))
+                                            .px(px(6.))
+                                            .py(px(1.))
+                                            .rounded(px(4.))
+                                            .cursor_pointer()
+                                            .text_size(px(11.5))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                                            .hover(move |st| st.bg(rgb(copy_hover)))
+                                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation();
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                crate::clip::copy_text(cx, copy_text.clone());
+                                                this.set_note("Đã sao chép mã nguồn");
+                                                cx.notify();
+                                            }))
+                                            .child("Sao chép"),
+                                    ),
+                            )
+                            .child(code_el),
+                    );
+                }
+            }
+        }
+        col.into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn selectable_link_card(
+        &self,
+        msg_id: u64,
+        msg_idx: usize,
+        _host: &str,
+        href: &str,
+        blue: u32,
+        _muted: u32,
+        _field: u32,
+    ) -> gpui::AnyElement {
+        // Plain URL rendered directly inside the bubble without a nested grey box.
+        self.selectable_text(
+            msg_id,
+            msg_idx,
+            0,
+            href,
+            media::BUBBLE_INNER,
+            15.,
+            22.,
+            blue,
+            false,
+        )
+    }
+
     /// One Electron `.card--group-photo`: cells in a row, caption once underneath.
     fn album_body(
         &self,
         album: &[ChatMsg],
+        msg_id: u64,
+        msg_idx: usize,
         ink: u32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -4330,7 +5137,10 @@ impl ShellView {
                 div()
                     .px(px(8.))
                     .py(px(6.))
-                    .child(render_wrapped_lines(
+                    .child(self.selectable_text(
+                        msg_id,
+                        msg_idx,
+                        0,
                         &caption,
                         MAX_W - 16.0,
                         14.0,
@@ -4352,6 +5162,7 @@ impl ShellView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let open = msg.clone();
+        let right_msg = msg.clone();
         let image = self.media_bitmaps.get(&msg.id).cloned();
         div()
             .id(("album-cell", msg.id))
@@ -4362,6 +5173,14 @@ impl ShellView {
             .rounded(px(4.))
             .bg(rgb(field))
             .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_menu(MenuKind::Message(right_msg.clone()), event.position, window);
+                    cx.notify();
+                }),
+            )
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.open_viewer(open.clone(), window, cx);
                 cx.notify();
@@ -4379,6 +5198,7 @@ impl ShellView {
     fn bubble_body(
         &self,
         msg: &ChatMsg,
+        msg_idx: usize,
         fill: u32,
         ink: u32,
         muted: u32,
@@ -4410,7 +5230,14 @@ impl ShellView {
                         div()
                             .px(px(8.))
                             .pb(px(6.))
-                            .child(wrapped_text_max(&msg.text, ink, (col_w - 16.0).max(160.0))),
+                            .child(self.selectable_bubble_text(
+                                msg.id,
+                                msg_idx,
+                                0,
+                                &msg.text,
+                                ink,
+                                (col_w - 16.0).max(160.0),
+                            )),
                     );
                 }
                 col.into_any_element()
@@ -4602,13 +5429,18 @@ impl ShellView {
                 div()
                     .id(("link-card", msg.id))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, _cx| {
+                        if this.chat_sel.drag_moved || this.chat_sel.take_suppress_click() {
+                            return;
+                        }
                         if event.standard_click() && href.starts_with("http") {
-                            cx.open_url(&href);
+                            crate::os_util::open_url(&href);
                         }
                     }))
                     .map(|el| match preview {
-                        None => el.child(link_card(&host, &msg.href, blue, muted, field)),
+                        None => el.child(self.selectable_link_card(
+                            msg.id, msg_idx, &host, &msg.href, blue, muted, field,
+                        )),
                         Some(p) => {
                             let url_trim = msg.href.trim();
                             let title_is_url = p.title.trim().is_empty()
@@ -4625,7 +5457,9 @@ impl ShellView {
                                 || p.thumb.contains("placeholder");
                             let show_thumb = if generic_thumb { None } else { thumb };
                             if title_is_url && desc_is_dup && show_thumb.is_none() {
-                                return el.child(link_card(&host, &msg.href, blue, muted, field));
+                                return el.child(self.selectable_link_card(
+                                    msg.id, msg_idx, &host, &msg.href, blue, muted, field,
+                                ));
                             }
                             let display_title = if title_is_url {
                                 host.clone()
@@ -4636,8 +5470,8 @@ impl ShellView {
                                 .flex_col()
                                 .w(px(300.))
                                 .gap(px(6.))
-                                .child(render_wrapped_lines(
-                                    &msg.href, 296., 14., 20., blue, false,
+                                .child(self.selectable_text(
+                                    msg.id, msg_idx, 0, &msg.href, 296., 14., 20., blue, false,
                                 ))
                                 .child(
                                     div()
@@ -4665,7 +5499,10 @@ impl ShellView {
                                                 .flex_col()
                                                 .gap(px(4.))
                                                 .p(px(10.))
-                                                .child(render_wrapped_lines(
+                                                .child(self.selectable_text(
+                                                    msg.id,
+                                                    msg_idx,
+                                                    1,
                                                     &display_title,
                                                     278.,
                                                     14.,
@@ -4674,8 +5511,12 @@ impl ShellView {
                                                     true,
                                                 ))
                                                 .when(!desc_is_dup, |el| {
-                                                    el.child(render_wrapped_lines(
-                                                        &clip_chars(&p.desc, 110),
+                                                    let desc_clipped = clip_chars(&p.desc, 110);
+                                                    el.child(self.selectable_text(
+                                                        msg.id,
+                                                        msg_idx,
+                                                        2,
+                                                        &desc_clipped,
                                                         278.,
                                                         13.,
                                                         18.,
@@ -4701,41 +5542,52 @@ impl ShellView {
                     .into_any_element()
             }
             MsgKind::Call | MsgKind::MissedCall => {
-                // Zalo PC `.call-msg`: bold title, icon + kind, divider,
-                // "Call back" in blue.
+                // Zalo PC `.call-msg`: bold title, icon + duration/kind, divider,
+                // "Gọi lại" in blue. Video calls use the camcorder icon.
                 let missed = msg.kind == MsgKind::MissedCall;
                 let conv_of_call = msg.conv;
                 let red = token_rgb("--text-errors", "#c31818");
-                let group = msg.file_name == "Cuộc gọi nhóm";
-                let title = if group {
-                    "Cuộc gọi nhóm".to_owned()
+                let green = token_rgb("--G60", "#15a85f");
+                let group = msg.file_name == "Cuộc gọi nhóm"
+                    || crate::media::is_group_call_body(&msg.text);
+                let video =
+                    msg.call_video || crate::media::is_video_call_text(&msg.text, &msg.file_name);
+                let (title, sub, _preview, missed_red) = crate::media::call_display_texts(
+                    msg.kind,
+                    msg.from_me,
+                    video,
+                    group,
+                    msg.call_reason,
+                    msg.file_size,
+                );
+                let (icon, icon_color) = if group {
+                    (fonts::ic::HDR_VIDEO, green)
+                } else if video {
+                    (
+                        fonts::ic::CALL_VIDEO,
+                        if missed_red || (missed && msg.call_reason != 4) {
+                            red
+                        } else if missed {
+                            muted
+                        } else {
+                            green
+                        },
+                    )
                 } else if missed {
-                    if msg.from_me {
-                        "Người nhận bị nhỡ"
-                    } else {
-                        "Bạn bị nhỡ"
-                    }
-                    .to_owned()
-                } else if msg.from_me {
-                    "Cuộc gọi thoại đi".to_owned()
-                } else {
-                    "Cuộc gọi thoại đến".to_owned()
-                };
-                let (icon, icon_color, sub) = if missed {
-                    (fonts::ic::CALL_MISS, red, "Cuộc gọi thoại")
-                } else if msg.from_me {
                     (
-                        fonts::ic::CALL_OUT,
-                        token_rgb("--G60", "#15a85f"),
-                        "Cuộc gọi thoại",
+                        fonts::ic::CALL_MISS,
+                        if missed_red || msg.call_reason != 4 {
+                            red
+                        } else {
+                            muted
+                        },
                     )
+                } else if msg.from_me {
+                    (fonts::ic::CALL_OUT, green)
                 } else {
-                    (
-                        fonts::ic::CALL_IN,
-                        token_rgb("--G60", "#15a85f"),
-                        "Cuộc gọi thoại",
-                    )
+                    (fonts::ic::CALL_IN, green)
                 };
+                let call_back_video = video || group;
                 div()
                     .flex()
                     .flex_col()
@@ -4754,12 +5606,18 @@ impl ShellView {
                             .items_center()
                             .gap(px(6.))
                             .mt(px(6.))
-                            .text_size(px(14.))
+                            .text_size(px(13.5))
+                            .line_height(px(18.))
                             .text_color(rgb(muted))
                             .child(
                                 div()
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .mt(px(2.))
                                     .text_color(rgb(icon_color))
-                                    .child(fonts::icon_el(icon, "", 18.)),
+                                    .child(fonts::icon_el(icon, "", 14.)),
                             )
                             .child(sub),
                     )
@@ -4781,7 +5639,7 @@ impl ShellView {
                             .font_family(fonts::FAMILY_SEMIBOLD)
                             .text_color(rgb(blue))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.start_call(conv_of_call, false, cx);
+                                this.start_call(conv_of_call, call_back_video, cx);
                                 cx.notify();
                             }))
                             .child("Gọi lại"),
@@ -4887,9 +5745,8 @@ impl ShellView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_color(rgb(0xffffff))
-                                    .text_size(px(18.))
-                                    .child("▶"),
+                                    .pl(px(2.))
+                                    .child(fonts::fa_icon(fonts::FA_PLAY, "▶", 16., 0xffffff)),
                             ),
                     )
                     .when(msg.file_size > 0, |el| {
@@ -4977,32 +5834,45 @@ impl ShellView {
                     )
                     .into_any_element()
             }
-            MsgKind::Poll => self.poll_bubble(msg, ink, muted, field, blue, cx),
+            MsgKind::Poll => self.poll_bubble(msg, msg_idx, ink, muted, field, blue, cx),
             MsgKind::Location => place_card(msg, "Vị trí", "Mở bản đồ", ink, muted, blue, cx),
             MsgKind::Ecard => place_card(msg, "Thiệp", "Mở liên kết", ink, muted, blue, cx),
             MsgKind::Text => {
                 if let Some(note) = media::phone_note(&msg.text) {
-                    self.phone_link_card(msg, &note, ink, muted, cx)
+                    self.phone_link_card(msg, msg_idx, &note, ink, muted, cx)
+                } else if let Some(segments) = crate::code_detect::parse_message_segments(&msg.text)
+                {
+                    self.code_segments_body(msg.id, msg_idx, segments, ink, muted, cx)
                 } else if let Some(url) =
                     media::first_link(&msg.text).filter(|url| msg.text.trim() != url)
                 {
-                    self.text_with_link(msg, &url, ink, muted, blue, field, cx)
+                    self.text_with_link(msg, msg_idx, &url, ink, muted, blue, field, cx)
                 } else {
-                    bubble_text(&msg.text, ink)
+                    self.selectable_bubble_text(
+                        msg.id,
+                        msg_idx,
+                        0,
+                        &msg.text,
+                        ink,
+                        media::BUBBLE_INNER,
+                    )
                 }
             }
         }
     }
 
-    /// Sentence that contains a URL: the text, then a small link card.
+    /// Sentence that contains a URL: the text (with blue inline URL), plus a
+    /// rich preview card only when `parselink` returned real preview metadata.
+    #[allow(clippy::too_many_arguments)]
     fn text_with_link(
         &self,
         msg: &ChatMsg,
+        msg_idx: usize,
         url: &str,
         ink: u32,
         muted: u32,
         blue: u32,
-        field: u32,
+        _field: u32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let preview = self
@@ -5015,6 +5885,7 @@ impl ShellView {
             .and_then(|p| self.link_thumbs.get(&p.thumb).cloned());
         let host = media::host_of(url).to_owned();
         let href = url.to_owned();
+        let click_href = href.clone();
         let title = preview
             .as_ref()
             .map(|p| p.title.clone())
@@ -5025,73 +5896,96 @@ impl ShellView {
             .flex_col()
             .gap(px(6.))
             .max_w(px(media::BUBBLE_INNER))
-            .child(bubble_text(&msg.text, ink))
             .child(
                 div()
-                    .id(("inline-link", msg.id))
+                    .id(("inline-link-text", msg.id))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         cx.stop_propagation();
-                        if event.standard_click() && href.starts_with("http") {
-                            cx.open_url(&href);
+                        if this.chat_sel.drag_moved || this.chat_sel.take_suppress_click() {
+                            return;
+                        }
+                        if event.standard_click() && click_href.starts_with("http") {
+                            crate::os_util::open_url(&click_href);
                         }
                     }))
-                    .child(if preview.is_some() {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w(px(280.))
-                            .rounded(px(6.))
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(rgb(token_rgb("--border-subtle", "#000000")))
-                            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
-                            .when_some(thumb, |el, image| {
-                                el.child(
-                                    img(image)
-                                        .w(px(280.))
-                                        .h(px(120.))
-                                        .object_fit(ObjectFit::Cover),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .p(px(8.))
-                                    .when(!title.is_empty(), |el| {
-                                        el.child(
-                                            div()
-                                                .text_size(px(13.))
-                                                .font_family(FAMILY_SEMIBOLD)
-                                                .text_color(rgb(ink))
-                                                .truncate()
-                                                .child(title),
-                                        )
-                                    })
-                                    .when(!desc.is_empty(), |el| {
-                                        el.child(
+                    .child(self.selectable_bubble_text(
+                        msg.id,
+                        msg_idx,
+                        0,
+                        &msg.text,
+                        ink,
+                        media::BUBBLE_INNER,
+                    )),
+            )
+            .when(preview.is_some(), |el| {
+                el.child(
+                    div()
+                        .id(("inline-link", msg.id))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            if this.chat_sel.drag_moved || this.chat_sel.take_suppress_click() {
+                                return;
+                            }
+                            if event.standard_click() && href.starts_with("http") {
+                                cx.open_url(&href);
+                            }
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .w(px(280.))
+                                .rounded(px(6.))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(crate::color::border_subtle())
+                                .bg(rgb(token_rgb("--layer-background", "#ffffff")))
+                                .when_some(thumb, |el, image| {
+                                    el.child(
+                                        img(image)
+                                            .w(px(280.))
+                                            .h(px(120.))
+                                            .object_fit(ObjectFit::Cover),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.))
+                                        .p(px(8.))
+                                        .when(!title.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .text_size(px(13.))
+                                                    .font_family(FAMILY_SEMIBOLD)
+                                                    .text_color(rgb(ink))
+                                                    .truncate()
+                                                    .child(title),
+                                            )
+                                        })
+                                        .when(!desc.is_empty(), |el| {
+                                            el.child(
+                                                div()
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(muted))
+                                                    .truncate()
+                                                    .child(desc),
+                                            )
+                                        })
+                                        .child(
                                             div()
                                                 .text_size(px(12.))
-                                                .text_color(rgb(muted))
+                                                .text_color(rgb(blue))
                                                 .truncate()
-                                                .child(desc),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .text_size(px(12.))
-                                            .text_color(rgb(blue))
-                                            .truncate()
-                                            .child(host),
-                                    ),
-                            )
-                            .into_any_element()
-                    } else {
-                        link_card(&host, url, blue, muted, field)
-                    }),
-            )
+                                                .child(host),
+                                        ),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -5100,6 +5994,7 @@ impl ShellView {
     fn phone_link_card(
         &self,
         msg: &ChatMsg,
+        msg_idx: usize,
         note: &media::PhoneNote,
         ink: u32,
         muted: u32,
@@ -5159,17 +6054,19 @@ impl ShellView {
                     .child(shown),
             )
             .when(!caption.is_empty(), |el| {
-                el.child(div().mt(px(2.)).child(render_wrapped_lines(
-                    &caption, 220., 14., 20., muted, false,
+                el.child(div().mt(px(2.)).child(self.selectable_text(
+                    msg.id, msg_idx, 1, &caption, 220., 14., 20., muted, false,
                 )))
             })
             .into_any_element()
     }
 
     /// `group.poll` card: question, one vote per row, closed subtitle.
+    #[allow(clippy::too_many_arguments)]
     fn poll_bubble(
         &self,
         msg: &ChatMsg,
+        msg_idx: usize,
         ink: u32,
         muted: u32,
         field: u32,
@@ -5201,7 +6098,9 @@ impl ShellView {
             .w(px(308.))
             .max_w(px(308.))
             .gap(px(6.))
-            .child(render_wrapped_lines(&question, 296., 15., 22., ink, true));
+            .child(self.selectable_text(
+                msg.id, msg_idx, 0, &question, 296., 15., 22., ink, true,
+            ));
         if closed {
             col = col.child(
                 div()
@@ -5303,17 +6202,32 @@ impl ShellView {
         field: u32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let failed = self.media_failed.contains(&msg.id);
+        let retry_id = msg.id;
+        let retry_conv = msg.conv;
         let placeholder = div()
+            .id(("photo-ph", msg.id))
             .w(px(w))
             .h(px(h))
             .rounded(px(zalo_design::CARD_RADIUS))
             .bg(rgb(field))
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
+            .gap(px(4.))
             .text_size(px(12.))
             .text_color(rgb(token_rgb("--text-secondary", "#5a6981")))
-            .child(if self.media_failed.contains(&msg.id) {
+            .when(failed, |el| {
+                el.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.media_failed.remove(&retry_id);
+                        this.media_pending.remove(&retry_id);
+                        this.warm_media(retry_conv);
+                        cx.notify();
+                    }))
+            })
+            .child(if failed {
                 str_vi("STR_CLOUD_PHOTO_EXPIRED", "Ảnh đã hết hạn")
             } else if self.media_pending.contains(&msg.id) {
                 str_vi("STR_LOADING", "Đang tải...")
@@ -5327,6 +6241,14 @@ impl ShellView {
                     MsgKind::Doodle => "Vẽ hình",
                     _ => str_vi("STR_PHOTO", "Hình ảnh"),
                 }
+            })
+            .when(failed && !msg.media_url.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                        .child("Nhấn để tải lại"),
+                )
             });
         if let Some(image) = self.media_bitmaps.get(&msg.id).cloned() {
             let open = msg.clone();
@@ -5393,9 +6315,9 @@ fn place_card(
         .gap(px(4.))
         .when(open, |el| {
             el.cursor_pointer()
-                .on_click(cx.listener(move |_, event: &ClickEvent, _, cx| {
+                .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
                     if event.standard_click() {
-                        cx.open_url(&href);
+                        crate::os_util::open_url(&href);
                     }
                 }))
         })
@@ -5433,6 +6355,24 @@ fn place_card(
         .into_any_element()
 }
 
+fn code_font() -> Font {
+    Font {
+        family: "JetBrains Mono".into(),
+        features: FontFeatures::default(),
+        fallbacks: Some(FontFallbacks::from_fonts(vec![
+            "Cascadia Mono".into(),
+            "Consolas".into(),
+            "SF Mono".into(),
+            "DejaVu Sans Mono".into(),
+            "Liberation Mono".into(),
+            "monospace".into(),
+            FAMILY_TEXT.into(),
+        ])),
+        weight: FontWeight::NORMAL,
+        style: FontStyle::Normal,
+    }
+}
+
 fn bubble_font() -> Font {
     Font {
         family: FAMILY_TEXT.into(),
@@ -5461,105 +6401,6 @@ fn bubble_semibold_font() -> Font {
         weight: FontWeight::SEMIBOLD,
         style: FontStyle::Normal,
     }
-}
-
-fn bubble_text(text: &str, color: u32) -> gpui::AnyElement {
-    use crate::emoji::PictogramPart;
-    let parts = crate::emoji::split_pictograms(text);
-    if parts
-        .iter()
-        .all(|part| matches!(part, PictogramPart::Text(_)))
-    {
-        return wrapped_text(text, color);
-    }
-    pictogram_parts(parts, color)
-}
-
-fn pictogram_parts(parts: Vec<crate::emoji::PictogramPart>, color: u32) -> gpui::AnyElement {
-    use crate::emoji::PictogramPart;
-    // Group into explicit newline-separated rows; within each row paint each
-    // word as `whitespace_nowrap()` so GPUI 0.2.2 never splits Vietnamese words
-    // on diacritics while still letting inline emoji tiles flow naturally.
-    let mut rows: Vec<Vec<gpui::AnyElement>> = vec![Vec::new()];
-    let mut elem_idx: u64 = 0;
-    for part in parts {
-        match part {
-            PictogramPart::Text(run) => {
-                for (li, seg) in run.split('\n').enumerate() {
-                    if li > 0 {
-                        rows.push(Vec::new());
-                    }
-                    for word in seg.split_inclusive(' ') {
-                        let wrapped = media::wrap_bubble_text(word, media::BUBBLE_INNER);
-                        for (wi, chunk) in wrapped.split('\n').enumerate() {
-                            if wi > 0 {
-                                rows.push(Vec::new());
-                            }
-                            if chunk.is_empty() {
-                                continue;
-                            }
-                            elem_idx += 1;
-                            rows.last_mut().unwrap().push(
-                                div()
-                                    .id(("emo-run", elem_idx))
-                                    .whitespace_nowrap()
-                                    .min_h(px(22.))
-                                    .child(chunk.to_owned())
-                                    .into_any_element(),
-                            );
-                        }
-                    }
-                }
-            }
-            PictogramPart::Tile(item) => {
-                elem_idx += 1;
-                if let Some(tile) = crate::emoji::tile_image(item) {
-                    rows.last_mut().unwrap().push(
-                        div()
-                            .id(("emo-tile", elem_idx))
-                            .flex_none()
-                            .mr(px(2.))
-                            .child(img(tile).size(px(20.)).object_fit(ObjectFit::Contain))
-                            .into_any_element(),
-                    );
-                } else {
-                    rows.last_mut().unwrap().push(
-                        div()
-                            .id(("emo-run", elem_idx))
-                            .whitespace_nowrap()
-                            .min_h(px(22.))
-                            .child(item.insert.clone())
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
-    }
-    div()
-        .max_w(px(media::BUBBLE_INNER))
-        .min_w(px(0.))
-        .flex()
-        .flex_col()
-        .text_size(px(15.))
-        .line_height(px(22.))
-        .text_color(rgb(color))
-        .font(bubble_font())
-        .children(rows.into_iter().map(|items| {
-            if items.is_empty() {
-                div().h(px(22.)).into_any_element()
-            } else {
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .items_end()
-                    .max_w(px(media::BUBBLE_INNER))
-                    .min_w(px(0.))
-                    .children(items)
-                    .into_any_element()
-            }
-        }))
-        .into_any_element()
 }
 
 fn render_wrapped_lines(
@@ -5923,34 +6764,6 @@ fn clip_chars(text: &str, max: usize) -> String {
     out
 }
 
-fn link_card(host: &str, href: &str, blue: u32, muted: u32, field: u32) -> gpui::AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(2.))
-        .w(px(300.))
-        .px(px(10.))
-        .py(px(8.))
-        .bg(rgb(field))
-        .rounded(px(zalo_design::CARD_RADIUS))
-        .child(
-            div()
-                .text_size(px(13.))
-                .line_height(px(18.))
-                .text_color(rgb(blue))
-                .truncate()
-                .child(host.to_owned()),
-        )
-        .child(
-            div()
-                .text_size(px(11.5))
-                .text_color(rgb(muted))
-                .truncate()
-                .child(href.to_owned()),
-        )
-        .into_any_element()
-}
-
 /// Solid cover over a bubble while "Privacy Cover" is on. Hover reveals it.
 fn peek_cover(group: &SharedString, fill: u32) -> gpui::AnyElement {
     div()
@@ -6223,6 +7036,11 @@ impl ShellView {
         None => ("Zalo".to_owned(), "Z".to_owned(), 0x0068ff),
     };
     let is_group = conv.is_some_and(|row| row.is_group);
+    let peer_click = conv
+        .filter(|row| !row.is_group)
+        .map(|row| (row.thread_id.clone(), name.clone(), cloud));
+    let peer_click_ava = peer_click.clone();
+    let peer_click_name = peer_click;
     let faces = if is_group && photo.is_none() && !cloud {
         conv.map(|row| self.group_collage_faces(&row.thread_id))
             .unwrap_or_default()
@@ -6237,9 +7055,21 @@ impl ShellView {
         .min_w(px(0.))
         .child(
             div()
+                .id("hdr-avatar")
                 .relative()
                 .size(px(48.))
                 .flex_none()
+                .when_some(peer_click_ava, |el, (uid, disp, is_cloud)| {
+                    el.cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if is_cloud {
+                                this.open_profile_dialog(cx);
+                            } else {
+                                this.open_user_info(uid.clone(), disp.clone(), cx);
+                            }
+                            cx.notify();
+                        }))
+                })
                 .when(paint == crate::sidebar::AvatarPaint::Photo, |el| {
                     el.when_some(photo.clone(), |el, p| {
                         el.child(
@@ -6302,12 +7132,25 @@ impl ShellView {
                         .min_w(px(0.))
                         .child(
                             div()
+                                .id("hdr-title")
                                 .min_w(px(0.))
                                 .text_size(px(18.))
                                 .line_height(px(27.))
                                 .font_family(FAMILY_SEMIBOLD)
                                 .text_color(rgb(ink))
                                 .truncate()
+                                .when_some(peer_click_name, |el, (uid, disp, is_cloud)| {
+                                    el.cursor_pointer()
+                                        .hover(move |st| st.text_color(rgb(blue)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if is_cloud {
+                                                this.open_profile_dialog(cx);
+                                            } else {
+                                                this.open_user_info(uid.clone(), disp.clone(), cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                })
                                 .child(name),
                         )
                         .when(is_stranger, |el| {

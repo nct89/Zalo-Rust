@@ -508,6 +508,7 @@ impl ShellView {
         self.menu = None;
         self.dialog = None;
         self.viewer = None;
+        self.chat_sel.clear();
         self.close_settings();
         self.lock_input.update(cx, |i, cx| i.clear(cx));
         self.lock_error = false;

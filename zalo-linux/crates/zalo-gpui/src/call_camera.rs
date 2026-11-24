@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, Level,
-    Profile, QpRange, RateControlMode, UsageType,
+    Profile, QpRange, RateControlMode, SpsPpsStrategy, UsageType,
 };
 use openh264::formats::YUVBuffer;
 use openh264::{OpenH264API, Timestamp};
@@ -63,15 +63,75 @@ struct EncoderKey {
     fps_rounded: u32,
 }
 
+/// OpenH264 C API option IDs (`openh264-sys2` `ENCODER_OPTION`).
+const ENCODER_OPTION_FRAME_RATE: i32 = 4;
+const ENCODER_OPTION_BITRATE: i32 = 5;
+const ENCODER_OPTION_MAX_BITRATE: i32 = 6;
+const SPATIAL_LAYER_0: std::os::raw::c_int = 0;
+const SPATIAL_LAYER_ALL: std::os::raw::c_int = 4;
+
+/// C ABI layout matching OpenH264 `SBitrateInfo` (`TagBitrateInfo`).
+#[repr(C)]
+struct OpenH264BitrateInfo {
+    layer: std::os::raw::c_int,
+    bitrate: std::os::raw::c_int,
+}
+
+/// Minimum interval between local self-view BGRA preview updates (~15 fps).
+const LOCAL_PREVIEW_INTERVAL: Duration = Duration::from_millis(66);
+
 fn needs_encoder_reopen(cur: Option<EncoderKey>, want: EncoderKey) -> bool {
     match cur {
-        Some(prev) => {
-            prev.width != want.width
-                || prev.height != want.height
-                || prev.bitrate_bps != want.bitrate_bps
-                || u32::abs_diff(prev.fps_rounded, want.fps_rounded) > prev.fps_rounded / 2
-        }
+        Some(prev) => prev.width != want.width || prev.height != want.height,
         None => true,
+    }
+}
+
+/// Updates OpenH264 target bitrate, max bitrate, and max frame rate live via
+/// `SetOption` without destroying encoder reference state or forcing an IDR.
+fn update_encoder_rate(enc: &mut Encoder, bitrate_bps: u32, fps: u32) -> bool {
+    let target_bps = bitrate_bps.clamp(80_000, 4_000_000) as std::os::raw::c_int;
+    let max_bps = (bitrate_bps.saturating_mul(5) / 4).clamp(100_000, 5_000_000) as std::os::raw::c_int;
+    let mut fps_val = fps.clamp(5, 30) as f32;
+    let mut max_all = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_ALL,
+        bitrate: max_bps,
+    };
+    let mut max_l0 = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_0,
+        bitrate: max_bps,
+    };
+    let mut tgt_all = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_ALL,
+        bitrate: target_bps,
+    };
+    let mut tgt_l0 = OpenH264BitrateInfo {
+        layer: SPATIAL_LAYER_0,
+        bitrate: target_bps,
+    };
+    unsafe {
+        let raw = enc.raw_api();
+        let ok_max_all = raw.set_option(
+            ENCODER_OPTION_MAX_BITRATE,
+            std::ptr::addr_of_mut!(max_all).cast(),
+        ) == 0;
+        let _ = raw.set_option(
+            ENCODER_OPTION_MAX_BITRATE,
+            std::ptr::addr_of_mut!(max_l0).cast(),
+        );
+        let ok_tgt_all = raw.set_option(
+            ENCODER_OPTION_BITRATE,
+            std::ptr::addr_of_mut!(tgt_all).cast(),
+        ) == 0;
+        let _ = raw.set_option(
+            ENCODER_OPTION_BITRATE,
+            std::ptr::addr_of_mut!(tgt_l0).cast(),
+        );
+        let ok_fps = raw.set_option(
+            ENCODER_OPTION_FRAME_RATE,
+            std::ptr::addr_of_mut!(fps_val).cast(),
+        ) == 0;
+        ok_max_all && ok_tgt_all && ok_fps
     }
 }
 
@@ -328,9 +388,11 @@ fn try_v4l(
     let mut tried_big = profile.capture_big || profile.width > 640 || profile.height > 480;
     let mut encoder: Option<Encoder> = None;
     let mut enc_key: Option<EncoderKey> = None;
+    let mut enc_initialized = false;
     let mut produced = false;
     let mut force_key = true;
     let mut last_key = Instant::now() - Duration::from_secs(3);
+    let mut last_preview = Instant::now() - LOCAL_PREVIEW_INTERVAL;
     let mut next_due = Instant::now();
     let mut last_cap_at: Option<Instant> = None;
     let mut cap_fps_seeded = false;
@@ -424,6 +486,7 @@ fn try_v4l(
                 Ok(enc) => {
                     encoder = Some(enc);
                     enc_key = Some(desired_key);
+                    enc_initialized = false;
                     force_key = true;
                     eprintln!(
                         "zalo-gpui call: encoder {}x{} @{}fps {} kbps (rung {})",
@@ -440,6 +503,22 @@ fn try_v4l(
                     } else {
                         Attempt::Failed
                     }
+                }
+            }
+        } else if let (Some(enc), Some(prev)) = (encoder.as_mut(), enc_key) {
+            if (prev.bitrate_bps != desired_key.bitrate_bps
+                || prev.fps_rounded != desired_key.fps_rounded)
+                && enc_initialized
+                && update_encoder_rate(enc, desired_key.bitrate_bps, desired_key.fps_rounded)
+            {
+                enc_key = Some(desired_key);
+                if crate::call::call_log_enabled() {
+                    eprintln!(
+                        "zalo-gpui call: encoder rate -> {} kbps @{}fps (live, rung {})",
+                        desired_key.bitrate_bps / 1000,
+                        desired_key.fps_rounded,
+                        profile.rung
+                    );
                 }
             }
         }
@@ -459,14 +538,18 @@ fn try_v4l(
         } else {
             scale_i420(&cropped, cw, ch, enc_w, enc_h)
         };
-        if let Ok(mut slot) = preview.lock() {
-            *slot = preview_from_i420(&yuv, enc_w, enc_h);
+        if last_preview.elapsed() >= LOCAL_PREVIEW_INTERVAL {
+            if let Ok(mut slot) = preview.lock() {
+                *slot = preview_from_i420(&yuv, enc_w, enc_h);
+            }
+            last_preview = now;
         }
         let picture = YUVBuffer::from_vec(yuv, enc_w, enc_h);
         let ts_ms = now.duration_since(opened).as_millis() as u64;
         let Ok(bitstream) = enc.encode_at(&picture, Timestamp::from_millis(ts_ms)) else {
             continue;
         };
+        enc_initialized = true;
         if bitstream.frame_type() == FrameType::Skip {
             tx_stats.skipped += 1;
             tx_stats.maybe_report(now, desired_key, *profile);
@@ -870,16 +953,25 @@ fn yuyv_to_i420(src: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut out = vec![0_u8; y_len + c_len * 2];
     let (y, rest) = out.split_at_mut(y_len);
     let (u, v) = rest.split_at_mut(c_len);
-    for row in 0..height {
+    let cw = width / 2;
+    let row_bytes = width * 2;
+    for row in (0..height).step_by(2) {
+        let s0 = row * row_bytes;
+        let s1 = s0 + row_bytes;
+        let y0 = row * width;
+        let y1 = y0 + width;
+        let c_row = (row / 2) * cw;
         for col in (0..width).step_by(2) {
-            let i = (row * width + col) * 2;
-            y[row * width + col] = src[i];
-            y[row * width + col + 1] = src[i + 2];
-            if row % 2 == 0 {
-                let c = (row / 2) * (width / 2) + col / 2;
-                u[c] = src[i + 1];
-                v[c] = src[i + 3];
-            }
+            let off = col * 2;
+            y[y0 + col] = src[s0 + off];
+            y[y0 + col + 1] = src[s0 + off + 2];
+            y[y1 + col] = src[s1 + off];
+            y[y1 + col + 1] = src[s1 + off + 2];
+            // Average vertical chroma pairs (4:2:2 -> 4:2:0) instead of dropping
+            // odd rows, preventing color fringes on horizontal edges.
+            let c = c_row + col / 2;
+            u[c] = ((u16::from(src[s0 + off + 1]) + u16::from(src[s1 + off + 1]) + 1) >> 1) as u8;
+            v[c] = ((u16::from(src[s0 + off + 3]) + u16::from(src[s1 + off + 3]) + 1) >> 1) as u8;
         }
     }
     out
@@ -1055,8 +1147,10 @@ fn try_device(
     let mut cap_fps_est = 30.0_f64;
     let mut next_due = Instant::now();
     let mut last_key_at = Instant::now();
+    let mut last_preview = Instant::now() - LOCAL_PREVIEW_INTERVAL;
     let mut force_key = true;
     let mut enc_key: Option<EncoderKey> = None;
+    let mut enc_initialized = false;
     let mut encoder: Option<Encoder> = None;
     let started_at = Instant::now();
     let mut cap_fps_seeded = false;
@@ -1203,10 +1297,27 @@ fn try_device(
                     );
                     encoder = Some(new_enc);
                     enc_key = Some(desired_key);
+                    enc_initialized = false;
                     force_key = true;
                 }
                 Err(_) => {
                     return finish(produced);
+                }
+            }
+        } else if let (Some(enc), Some(prev)) = (encoder.as_mut(), enc_key) {
+            if (prev.bitrate_bps != desired_key.bitrate_bps
+                || prev.fps_rounded != desired_key.fps_rounded)
+                && enc_initialized
+                && update_encoder_rate(enc, desired_key.bitrate_bps, desired_key.fps_rounded)
+            {
+                enc_key = Some(desired_key);
+                if crate::call::call_log_enabled() {
+                    eprintln!(
+                        "zalo-gpui call: encoder rate -> {} kbps @{}fps (live, rung {})",
+                        desired_key.bitrate_bps / 1000,
+                        desired_key.fps_rounded,
+                        profile.rung
+                    );
                 }
             }
         }
@@ -1226,14 +1337,18 @@ fn try_device(
         } else {
             scale_i420(&source_frame, spec.cap_w, spec.cap_h, enc_w, enc_h)
         };
-        if let Ok(mut slot) = preview.lock() {
-            *slot = preview_from_i420(&encode_yuv, enc_w, enc_h);
+        if last_preview.elapsed() >= LOCAL_PREVIEW_INTERVAL {
+            if let Ok(mut slot) = preview.lock() {
+                *slot = preview_from_i420(&encode_yuv, enc_w, enc_h);
+            }
+            last_preview = now;
         }
         let picture = YUVBuffer::from_vec(encode_yuv, enc_w, enc_h);
         let ts_ms = now.duration_since(started_at).as_millis() as u64;
         let Ok(bitstream) = enc.encode_at(&picture, Timestamp::from_millis(ts_ms)) else {
             continue;
         };
+        enc_initialized = true;
         if bitstream.frame_type() == FrameType::Skip {
             tx_stats.skipped += 1;
             tx_stats.maybe_report(now, desired_key, *profile);
@@ -1554,6 +1669,13 @@ fn open_encoder(
     } else {
         Complexity::Medium
     };
+    let qp = if bitrate_bps <= 350_000 {
+        QpRange::new(16, 42)
+    } else if bitrate_bps <= 750_000 {
+        QpRange::new(14, 38)
+    } else {
+        QpRange::new(12, 36)
+    };
     let config = EncoderConfig::new()
         .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
@@ -1563,11 +1685,14 @@ fn open_encoder(
         .profile(Profile::Baseline)
         .level(level)
         .complexity(complexity)
-        .qp(QpRange::new(14, 38))
+        .qp(qp)
+        .sps_pps_strategy(SpsPpsStrategy::ConstantId)
+        .max_slice_len(1060)
         .adaptive_quantization(true)
         .background_detection(true)
-        .scene_change_detect(false)
-        // Keeping skip off + Bitrate RC + QP cap 38 prevents OpenH264 VBV frame drops and macroblock blur on phones.
+        .scene_change_detect(true)
+        // Keeping skip off + Bitrate RC + MTU-sized slices prevents VBV drops,
+        // macroblock blur, and full-frame corruption on single UDP loss.
         .skip_frames(false)
         .num_threads(if width * height > 640 * 360 { 2 } else { 1 });
     Encoder::with_api_config(api, config)
@@ -1877,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    fn needs_encoder_reopen_detects_bitrate_and_size_changes() {
+    fn needs_encoder_reopen_only_reopens_on_size_changes() {
         let base = EncoderKey {
             width: 640,
             height: 360,
@@ -1886,10 +2011,18 @@ mod tests {
         };
         assert!(needs_encoder_reopen(None, base));
         assert!(!needs_encoder_reopen(Some(base), base));
-        assert!(needs_encoder_reopen(
+        // Bitrate and FPS changes update live via SetOption without reopening.
+        assert!(!needs_encoder_reopen(
             Some(base),
             EncoderKey {
                 bitrate_bps: 500_000,
+                ..base
+            }
+        ));
+        assert!(!needs_encoder_reopen(
+            Some(base),
+            EncoderKey {
+                fps_rounded: 24,
                 ..base
             }
         ));
@@ -1901,20 +2034,40 @@ mod tests {
                 ..base
             }
         ));
-        assert!(!needs_encoder_reopen(
-            Some(base),
-            EncoderKey {
-                fps_rounded: 13,
-                ..base
-            }
-        ));
-        assert!(needs_encoder_reopen(
-            Some(base),
-            EncoderKey {
-                fps_rounded: 24,
-                ..base
-            }
-        ));
+    }
+
+    #[test]
+    fn live_bitrate_and_fps_update_works_without_reopen_or_idr() {
+        let (w, h) = (320, 180);
+        let mut enc = open_encoder(w, h, 350_000, 15).expect("open encoder");
+        let frame = YUVBuffer::from_vec(vec![128_u8; w * h * 3 / 2], w, h);
+        let first = enc
+            .encode_at(&frame, Timestamp::from_millis(0))
+            .expect("first frame");
+        assert_eq!(first.frame_type(), FrameType::IDR);
+        // Update bitrate and FPS live without reopening encoder.
+        assert!(update_encoder_rate(&mut enc, 750_000, 24));
+        let second = enc
+            .encode_at(&frame, Timestamp::from_millis(42))
+            .expect("second frame");
+        assert_eq!(
+            second.frame_type(),
+            FrameType::P,
+            "live rate update must not force an unexpected IDR spike"
+        );
+    }
+
+    #[test]
+    fn yuyv_to_i420_averages_vertical_chroma() {
+        // 2x2 YUYV: row0 has U=100, V=200; row1 has U=140, V=160 -> avg U=120, V=180.
+        let src = [
+            50_u8, 100, 60, 200, // row 0: Y0 U0 Y1 V0
+            70, 140, 80, 160, // row 1: Y2 U1 Y3 V1
+        ];
+        let out = yuyv_to_i420(&src, 2, 2);
+        assert_eq!(&out[0..4], &[50, 60, 70, 80]);
+        assert_eq!(out[4], 120);
+        assert_eq!(out[5], 180);
     }
 
     #[test]

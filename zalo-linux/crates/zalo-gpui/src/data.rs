@@ -111,6 +111,10 @@ pub struct ChatMsg {
     /// Electron `params.group_layout_id` for one cell of a multi-photo send.
     /// `0` means the row has no album id.
     pub group_layout_id: i64,
+    /// True when a `MsgKind::Call` / `MsgKind::MissedCall` is a video call (`calltype == 1`).
+    pub call_video: bool,
+    /// Zalo `recommened.misscall` reason code (`2` rejected, `4` cancelled, `5` busy, `0` missed).
+    pub call_reason: u8,
 }
 
 impl ChatMsg {
@@ -160,8 +164,189 @@ impl ChatMsg {
             poll_closed: false,
             poll_options: Vec::new(),
             group_layout_id: 0,
+            call_video: false,
+            call_reason: 0,
         }
     }
+}
+
+/// Returns true when two messages represent the same logical bubble (same server
+/// `global_msg_id`, same non-zero `cli_msg_id`, or duplicate text echo with
+/// identical timestamp / missing server id within 5 s).
+#[must_use]
+pub(crate) fn is_duplicate_msg(
+    existing: &ChatMsg,
+    global_msg_id: Option<i64>,
+    cli_msg_id: Option<i64>,
+    from_me: bool,
+    sender_uid: &str,
+    kind: MsgKind,
+    text: &str,
+    at_ms: i64,
+) -> bool {
+    if let (Some(a), Some(b)) = (existing.global_msg_id, global_msg_id) {
+        if a > 0 && a == b {
+            return true;
+        }
+    }
+    if let (Some(a), Some(b)) = (existing.cli_msg_id, cli_msg_id) {
+        if a > 0 && a == b && existing.from_me == from_me {
+            return true;
+        }
+    }
+    if existing.from_me == from_me
+        && existing.kind == kind
+        && kind == MsgKind::Text
+        && existing.at_ms > 0
+        && at_ms > 0
+    {
+        let same_sender = from_me
+            || existing.sender_uid == sender_uid
+            || existing.sender_uid.is_empty()
+            || sender_uid.is_empty();
+        let a_txt = existing.text.trim();
+        let b_txt = text.trim();
+        if same_sender && !a_txt.is_empty() && a_txt == b_txt {
+            let gap = (existing.at_ms - at_ms).abs();
+            // Exact same timestamp (e.g. ZDB backup + realtime/sync2 overlap) OR
+            // at least one copy lacks a server id within 5 seconds.
+            let missing_gid =
+                existing.global_msg_id.unwrap_or(0) <= 0 || global_msg_id.unwrap_or(0) <= 0;
+            if gap == 0 || (missing_gid && gap <= 5_000) || gap <= 1_000 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Merge richer metadata from `other` into `keep`.
+fn merge_duplicate_msg(keep: &mut ChatMsg, other: ChatMsg) {
+    if keep.global_msg_id.unwrap_or(0) <= 0 && other.global_msg_id.unwrap_or(0) > 0 {
+        keep.global_msg_id = other.global_msg_id;
+    }
+    if keep.cli_msg_id.unwrap_or(0) <= 0 && other.cli_msg_id.unwrap_or(0) > 0 {
+        keep.cli_msg_id = other.cli_msg_id;
+    }
+    if keep.kind == MsgKind::Text && other.kind != MsgKind::Text {
+        keep.kind = other.kind;
+        if !other.text.is_empty() {
+            keep.text = other.text;
+        }
+    }
+    if keep.media_url.is_empty() && !other.media_url.is_empty() {
+        keep.media_url = other.media_url;
+    }
+    if keep.media_path.is_none() && other.media_path.is_some() {
+        keep.media_path = other.media_path;
+    }
+    if keep.media_w == 0 && other.media_w > 0 {
+        keep.media_w = other.media_w;
+    }
+    if keep.media_h == 0 && other.media_h > 0 {
+        keep.media_h = other.media_h;
+    }
+    if keep.href.is_empty() && !other.href.is_empty() {
+        keep.href = other.href;
+    }
+    if keep.file_name.is_empty() && !other.file_name.is_empty() {
+        keep.file_name = other.file_name;
+    }
+    if keep.file_size == 0 && other.file_size > 0 {
+        keep.file_size = other.file_size;
+    }
+    if keep.quote_text.is_empty() && !other.quote_text.is_empty() {
+        keep.quote_sender = other.quote_sender;
+        keep.quote_text = other.quote_text;
+        keep.quote_global_id = other.quote_global_id;
+        keep.quote_cli_id = other.quote_cli_id;
+    }
+    if keep.group_layout_id == 0 && other.group_layout_id != 0 {
+        keep.group_layout_id = other.group_layout_id;
+    }
+    keep.call_video |= other.call_video;
+    if keep.call_reason == 0 && other.call_reason != 0 {
+        keep.call_reason = other.call_reason;
+    }
+    if keep.sender_uid.is_empty() && !other.sender_uid.is_empty() {
+        keep.sender_uid = other.sender_uid;
+        if !other.sender.is_empty() {
+            keep.sender = other.sender;
+        }
+    }
+    keep.liked |= other.liked;
+    keep.recalled |= other.recalled;
+}
+
+/// Deduplicate a sorted message list in place while preserving chronological order.
+/// Uses O(1) id hash lookups plus a bounded 5-second tail window so even threads
+/// with tens of thousands of synced messages load in milliseconds.
+pub(crate) fn dedupe_messages(msgs: &mut Vec<ChatMsg>) {
+    let mut out: Vec<ChatMsg> = Vec::with_capacity(msgs.len());
+    let mut by_global: HashMap<i64, usize> = HashMap::with_capacity(msgs.len());
+    let mut by_cli: HashMap<i64, usize> = HashMap::with_capacity(msgs.len());
+    for msg in msgs.drain(..) {
+        let mut dup_pos = msg
+            .global_msg_id
+            .filter(|&g| g > 0)
+            .and_then(|g| by_global.get(&g).copied());
+        if dup_pos.is_none() {
+            dup_pos = msg
+                .cli_msg_id
+                .filter(|&c| c > 0)
+                .and_then(|c| by_cli.get(&c).copied());
+        }
+        if dup_pos.is_none() {
+            // Text-echo fallback only applies within a 5 s window; since `msgs`
+            // is sorted by `at_ms`, scanning backwards stops as soon as the gap
+            // exceeds 5 s (or after 32 rows for zero-timestamp test fixtures).
+            let mut checked = 0usize;
+            for (idx, existing) in out.iter().enumerate().rev() {
+                if msg.at_ms > 0
+                    && existing.at_ms > 0
+                    && (msg.at_ms - existing.at_ms).abs() > 5_000
+                {
+                    break;
+                }
+                checked += 1;
+                if checked > 32 {
+                    break;
+                }
+                if is_duplicate_msg(
+                    existing,
+                    msg.global_msg_id,
+                    msg.cli_msg_id,
+                    msg.from_me,
+                    &msg.sender_uid,
+                    msg.kind,
+                    &msg.text,
+                    msg.at_ms,
+                ) {
+                    dup_pos = Some(idx);
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = dup_pos {
+            merge_duplicate_msg(&mut out[idx], msg);
+            if let Some(g) = out[idx].global_msg_id.filter(|&g| g > 0) {
+                by_global.entry(g).or_insert(idx);
+            }
+            if let Some(c) = out[idx].cli_msg_id.filter(|&c| c > 0) {
+                by_cli.entry(c).or_insert(idx);
+            }
+        } else {
+            let idx = out.len();
+            if let Some(g) = msg.global_msg_id.filter(|&g| g > 0) {
+                by_global.entry(g).or_insert(idx);
+            }
+            if let Some(c) = msg.cli_msg_id.filter(|&c| c > 0) {
+                by_cli.entry(c).or_insert(idx);
+            }
+            out.push(msg);
+        }
+    }
+    *msgs = out;
 }
 
 /// Exclusive end of a horizontal photo album that starts at `start`.
@@ -909,6 +1094,8 @@ fn record_to_chat_msg(
         poll_closed: meta.poll_closed,
         poll_options: meta.poll_options,
         group_layout_id: meta.group_layout_id,
+        call_video: meta.call_video,
+        call_reason: meta.call_reason,
     }
 }
 
@@ -980,6 +1167,7 @@ pub fn search_thread_messages_filtered(
             })
             .collect();
         out.sort_by_key(|m| m.at_ms);
+        dedupe_messages(&mut out);
         out
     }
 }
@@ -1023,6 +1211,7 @@ fn map_store(store: &LocalStore, self_uids: &HashSet<String>) -> Snapshot {
                 you,
             ));
         }
+        dedupe_messages(&mut msgs);
         let last = msgs.last();
         let preview_line = last
             .map(|m| {
@@ -1379,5 +1568,67 @@ mod tests {
         assert!(!a.join("session.json").is_file());
         assert_eq!(std::fs::read(b.join("store.db")).unwrap(), b"b-only");
         let _ = std::fs::remove_dir_all(&machine);
+    }
+
+    #[test]
+    fn dedupe_messages_collapses_duplicate_group_rows() {
+        let mut a = ChatMsg::text_msg(
+            1,
+            10,
+            "g_1".into(),
+            false,
+            "Nhân viên".into(),
+            "u_1".into(),
+            "Em đi sớm 30p nha ghi nhận dùm em @Trường".into(),
+            "11:30".into(),
+            1_700_000_000_000,
+            Some(555),
+            None,
+        );
+        let b = ChatMsg::text_msg(
+            2,
+            10,
+            "g_1".into(),
+            false,
+            "Nhân viên".into(),
+            "u_1".into(),
+            "Em đi sớm 30p nha ghi nhận dùm em @Trường".into(),
+            "11:30".into(),
+            1_700_000_000_500,
+            Some(999),
+            Some(888_888),
+        );
+        let c = ChatMsg::text_msg(
+            3,
+            10,
+            "g_1".into(),
+            false,
+            "Nhân viên".into(),
+            "u_1".into(),
+            "ok".into(),
+            "11:31".into(),
+            1_700_000_010_000,
+            Some(1001),
+            Some(888_889),
+        );
+        let d = ChatMsg::text_msg(
+            4,
+            10,
+            "g_1".into(),
+            false,
+            "Nhân viên".into(),
+            "u_1".into(),
+            "ok".into(),
+            "11:31".into(),
+            1_700_000_012_000,
+            Some(1002),
+            Some(888_890),
+        );
+        a.quote_text = "quote".into();
+        let mut list = vec![a, b, c, d];
+        dedupe_messages(&mut list);
+        assert_eq!(list.len(), 3, "duplicate collapsed, distinct sends kept");
+        assert_eq!(list[0].global_msg_id, Some(888_888));
+        assert_eq!(list[0].quote_text, "quote");
     }
 }

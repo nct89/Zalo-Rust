@@ -4,8 +4,7 @@
 //! only when the thread is not a preview fixture and a session exists.
 
 use gpui::{
-    div, prelude::*, px, rgb, Context, Focusable, InteractiveElement, IntoElement, ParentElement,
-    Pixels, Point, StatefulInteractiveElement, Styled,
+    div, prelude::*, px, rgb, Context, InteractiveElement, IntoElement, ParentElement, Pixels, Point, StatefulInteractiveElement, Styled,
 };
 
 use crate::bridge::{self, LiveAction};
@@ -30,6 +29,18 @@ pub struct OpenMenu {
     pub view_h: f32,
 }
 
+/// Active firework particle burst spawned when clicking Like or an emoji reaction.
+#[derive(Clone, Debug)]
+pub(crate) struct ReactBurst {
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub preset_idx: usize,
+    pub started_at: std::time::Instant,
+    pub seed: u32,
+}
+
+const REACT_BURST_MS: f32 = 720.0;
+
 /// Floating multi-emoji reaction bar (`👍 ❤️ 😆 😮 😢 😠`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReactPicker {
@@ -48,6 +59,9 @@ pub struct ReactPicker {
     pub has_my: bool,
     /// True while left mouse button is still held from long-pressing the Like icon.
     pub holding: bool,
+    /// True when opened by hovering the Like button (auto-dismisses when pointer
+    /// leaves the bar + trigger button corridor; clicking the trigger button toggles Like).
+    pub hover_mode: bool,
     /// Emoji index (`0..REACTION_PRESETS.len()`) currently hovered or slid over.
     pub hovered_idx: Option<usize>,
     /// True when the clear `✕` button is hovered or slid over.
@@ -61,15 +75,15 @@ pub struct ReactPicker {
 }
 
 const REACT_COUNT: usize = 6;
-const REACT_PAD_X: f32 = 10.0;
-const REACT_SLOT_W: f32 = 42.0;
-const REACT_SLOT_GAP: f32 = 4.0;
-const REACT_CLEAR_W: f32 = 28.0;
-const REACT_BAR_H: f32 = 44.0;
-const REACT_POP_HEADROOM: f32 = 34.0;
-const REACT_ICON_BASE: f32 = 28.0;
-const REACT_ICON_GAIN: f32 = 11.0;
-const REACT_LIFT_MAX: f32 = 7.0;
+const REACT_PAD_X: f32 = 8.0;
+const REACT_SLOT_W: f32 = 34.0;
+const REACT_SLOT_GAP: f32 = 2.0;
+const REACT_CLEAR_W: f32 = 24.0;
+const REACT_BAR_H: f32 = 38.0;
+const REACT_POP_HEADROOM: f32 = 30.0;
+const REACT_ICON_BASE: f32 = 24.0;
+const REACT_ICON_GAIN: f32 = 9.0;
+const REACT_LIFT_MAX: f32 = 6.0;
 
 fn react_slot_at(picker: &ReactPicker, cx_pos: f32, cy_pos: f32) -> (Option<usize>, bool) {
     // Cover the pill plus the lifted emoji rim so moving directly onto a lifted
@@ -428,6 +442,29 @@ impl ShellView {
         window: &gpui::Window,
         holding: bool,
     ) {
+        self.open_react_picker_mode(msg, pos, window, holding, false);
+    }
+
+    /// Opens the floating 6-emoji reaction picker by hovering the Like button
+    /// (Zalo PC style): moving off the bar+button dismisses it automatically,
+    /// while clicking directly on the Like button toggles Like immediately.
+    pub(crate) fn open_react_picker_hover(
+        &mut self,
+        msg: ChatMsg,
+        pos: Point<Pixels>,
+        window: &gpui::Window,
+    ) {
+        self.open_react_picker_mode(msg, pos, window, false, true);
+    }
+
+    fn open_react_picker_mode(
+        &mut self,
+        msg: ChatMsg,
+        pos: Point<Pixels>,
+        window: &gpui::Window,
+        holding: bool,
+        hover_mode: bool,
+    ) {
         let (raw_x, raw_y) = crate::window_frame::window_to_chrome(window, pos);
         let view = window.viewport_size();
         let csd = if crate::window_frame::CsdCorners::from_window(window).any_pad() {
@@ -437,22 +474,37 @@ impl ShellView {
         };
         let view_w = f32::from(view.width) - csd;
         let view_h = f32::from(view.height) - csd;
-        let has_my = self.my_reaction(msg.id).is_some();
+        let has_my = false;
         let count = crate::read_sync::REACTION_PRESETS.len() as f32;
-        let bar_w = REACT_PAD_X * 2.0
-            + count * REACT_SLOT_W
-            + (count - 1.0) * REACT_SLOT_GAP
-            + if has_my {
-                REACT_SLOT_GAP + REACT_CLEAR_W
-            } else {
-                0.0
-            };
-        let x = (raw_x - bar_w * 0.5).clamp(8.0, (view_w - bar_w - 8.0).max(8.0));
-        let min_y = REACT_POP_HEADROOM + 6.0;
-        let y = if raw_y - REACT_BAR_H - 16.0 >= min_y {
-            raw_y - REACT_BAR_H - 16.0
+        let bar_w = REACT_PAD_X * 2.0 + count * REACT_SLOT_W + (count - 1.0) * REACT_SLOT_GAP;
+        let preferred_x = if hover_mode {
+            // Right-align bar cleanly above the Like button just like Zalo PC.
+            raw_x - bar_w + 22.0
         } else {
-            (raw_y + 18.0).clamp(min_y, (view_h - REACT_BAR_H - 8.0).max(min_y))
+            raw_x - bar_w * 0.5
+        };
+        // Keep the floating reaction bar strictly inside the chat column so it
+        // never overflows left into the conversation list or right into docked panels.
+        let chat_left = if self.solo.is_some() {
+            8.0
+        } else {
+            zalo_design::MAIN_TAB_W + zalo_design::CONV_LIST_INNER_W + 12.0
+        };
+        let right_dock = if self.msg_search_open || (self.info_open && !self.info_overlay) {
+            crate::info::INFO_PANEL_W
+        } else {
+            0.0
+        };
+        let chat_right = (view_w - right_dock - 12.0).max(chat_left + bar_w);
+        let x = preferred_x.clamp(chat_left, (chat_right - bar_w).max(chat_left));
+        let min_y = REACT_POP_HEADROOM + 6.0;
+        // Keep the floating emoji pill clearly above the 22 px Like button so it
+        // never overlaps or obscures the Like button underneath.
+        let gap = if hover_mode { 20.0 } else { 18.0 };
+        let y = if raw_y - REACT_BAR_H - gap >= min_y {
+            raw_y - REACT_BAR_H - gap
+        } else {
+            (raw_y + 22.0).clamp(min_y, (view_h - REACT_BAR_H - 8.0).max(min_y))
         };
         self.menu = None;
         self.forward_of = None;
@@ -466,12 +518,188 @@ impl ShellView {
             bar_w,
             has_my,
             holding,
+            hover_mode,
             hovered_idx: None,
             hovered_clear: false,
             cursor_x: None,
             lifts: [0.0; REACT_COUNT],
             anim_running: false,
         });
+    }
+
+    /// Spawns a Zalo-style radial firework burst of miniature reaction icons
+    /// and confetti sparkles at `pos`, driving a 60 FPS loop until all bursts fade.
+    pub(crate) fn spawn_react_burst(
+        &mut self,
+        pos: gpui::Point<gpui::Pixels>,
+        preset_idx: usize,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (x, y) = crate::window_frame::window_to_chrome(window, pos);
+        let now = std::time::Instant::now();
+        self.react_bursts
+            .retain(|b| now.duration_since(b.started_at).as_millis() < REACT_BURST_MS as u128);
+        if self.react_bursts.len() >= 6 {
+            self.react_bursts.remove(0);
+        }
+        let seed = (self.react_bursts.len() as u32)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((x as u32).wrapping_mul(31))
+            .wrapping_add((y as u32).wrapping_mul(17))
+            .wrapping_add(preset_idx as u32);
+        self.react_bursts.push(ReactBurst {
+            origin_x: x,
+            origin_y: y,
+            preset_idx: preset_idx.min(5),
+            started_at: now,
+            seed,
+        });
+        if self.react_burst_anim {
+            return;
+        }
+        self.react_burst_anim = true;
+        let weak = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                let mut keep_going = false;
+                let res = weak.update(cx, |this, cx| {
+                    let now = std::time::Instant::now();
+                    this.react_bursts.retain(|b| {
+                        (now.duration_since(b.started_at).as_secs_f32() * 1000.0) < REACT_BURST_MS
+                    });
+                    if this.react_bursts.is_empty() {
+                        this.react_burst_anim = false;
+                    } else {
+                        keep_going = true;
+                    }
+                    cx.notify();
+                });
+                if res.is_err() || !keep_going {
+                    break;
+                }
+            })
+            .detach();
+    }
+
+    /// Non-blocking overlay rendering active Like / reaction firework bursts.
+    pub(crate) fn react_burst_overlay(&self) -> impl IntoElement {
+        if self.react_bursts.is_empty() {
+            return div().into_any_element();
+        }
+        let now = std::time::Instant::now();
+        let palette: [u32; 6] = [
+            0x00_68_ff, // Like blue
+            0xff_3b_5c, // Heart rose
+            0xff_b7_03, // Haha gold
+            0x00_b4_d8, // Wow cyan
+            0x2e_c4_b6, // Cry teal
+            0xff_6b_00, // Angry orange
+        ];
+        let mut layer = div().absolute().inset_0();
+        for burst in &self.react_bursts {
+            let elapsed_ms = now.duration_since(burst.started_at).as_secs_f32() * 1000.0;
+            let t = (elapsed_ms / REACT_BURST_MS).clamp(0.0, 1.0);
+            if t >= 1.0 {
+                continue;
+            }
+            let ease = 1.0 - (1.0 - t).powi(3);
+            let alpha = if t < 0.12 {
+                t / 0.12
+            } else {
+                (1.0 - ((t - 0.12) / 0.88).powf(1.45)).clamp(0.0, 1.0)
+            };
+            let accent = palette[burst.preset_idx % palette.len()];
+
+            // 1. Expanding pulse ring right at the burst origin.
+            if t < 0.55 {
+                let rt = t / 0.55;
+                let r_size = 16.0 + 46.0 * (1.0 - (1.0 - rt).powi(2));
+                let r_alpha = (1.0 - rt) * 0.55;
+                let mut ring_col: gpui::Hsla = rgb(accent).into();
+                ring_col.a = r_alpha;
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .left(px(burst.origin_x - r_size * 0.5))
+                        .top(px(burst.origin_y - r_size * 0.5))
+                        .size(px(r_size))
+                        .rounded(px(r_size * 0.5))
+                        .border_2()
+                        .border_color(ring_col),
+                );
+            }
+
+            // 2. 10 miniature reaction icon particles shooting upward & outward.
+            let icon_img = crate::media::reaction_icon_by_index(burst.preset_idx);
+            let emoji_fb = crate::read_sync::REACTION_PRESETS
+                .get(burst.preset_idx)
+                .map(|p| p.0)
+                .unwrap_or("👍");
+            for i in 0..10u32 {
+                let phase = ((burst.seed.wrapping_add(i.wrapping_mul(197))) % 360) as f32;
+                let base_angle =
+                    -std::f32::consts::FRAC_PI_2 + ((i as f32 - 4.5) / 4.5) * 2.35 + (phase * 0.0012);
+                let speed = 42.0 + ((burst.seed.wrapping_add(i * 53)) % 34) as f32;
+                let dx = base_angle.cos() * speed * ease;
+                let dy = base_angle.sin() * speed * ease - 18.0 * ease + 42.0 * t * t;
+                let pop = if t < 0.22 {
+                    0.55 + (t / 0.22) * 0.55
+                } else {
+                    1.10 - ((t - 0.22) / 0.78) * 0.50
+                };
+                let sz = (16.5 * pop).max(7.0);
+                let px_x = burst.origin_x + dx - sz * 0.5;
+                let px_y = burst.origin_y + dy - sz * 0.5;
+                let particle = match icon_img.clone() {
+                    Some(image) => gpui::img(image)
+                        .size(px(sz))
+                        .object_fit(gpui::ObjectFit::Contain)
+                        .into_any_element(),
+                    None => div()
+                        .text_size(px(sz * 0.85))
+                        .child(emoji_fb)
+                        .into_any_element(),
+                };
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .left(px(px_x))
+                        .top(px(px_y))
+                        .size(px(sz))
+                        .opacity(alpha)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(particle),
+                );
+            }
+
+            // 3. 10 crisp colorful firework confetti sparks in an outer ring.
+            for i in 0..10u32 {
+                let angle = (i as f32 / 10.0) * std::f32::consts::TAU
+                    + ((burst.seed % 62) as f32) * 0.01;
+                let dist = (48.0 + ((i * 29 + burst.seed) % 28) as f32) * ease;
+                let dx = angle.cos() * dist;
+                let dy = angle.sin() * dist - 14.0 * ease + 34.0 * t * t;
+                let dot_sz = (5.5 * (1.0 - t * 0.55)).max(2.0);
+                let col = palette[(burst.preset_idx + i as usize) % palette.len()];
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .left(px(burst.origin_x + dx - dot_sz * 0.5))
+                        .top(px(burst.origin_y + dy - dot_sz * 0.5))
+                        .size(px(dot_sz))
+                        .rounded(px(dot_sz * 0.5))
+                        .bg(rgb(col))
+                        .opacity(alpha),
+                );
+            }
+        }
+        layer.into_any_element()
     }
 
     pub(crate) fn close_react_picker(&mut self) {
@@ -543,8 +771,6 @@ impl ShellView {
         let dark = crate::color::is_dark();
         let paper = token_rgb("--layer-background", "#ffffff");
         let active_bg = token_rgb("--B10", "#e5efff");
-        let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
-        let muted = token_rgb("--text-secondary", "#5a6981");
         let line = crate::color::border_subtle();
         let my_type = self.my_reaction(picker.msg.id).map(|r| r.r_type);
         let wrap_top = (picker.y - REACT_POP_HEADROOM).max(2.0);
@@ -569,18 +795,21 @@ impl ShellView {
                         if let Some(&(_, r_icon, r_type, _)) =
                             crate::read_sync::REACTION_PRESETS.get(idx)
                         {
-                            let already = this
-                                .my_reaction(p.msg.id)
-                                .is_some_and(|r| r.r_type == r_type);
-                            if already {
-                                this.apply_reaction(&p.msg, "", -1);
-                            } else {
-                                this.apply_reaction(&p.msg, r_icon, r_type);
-                            }
+                            this.apply_reaction(&p.msg, r_icon, r_type);
+                            this.spawn_react_burst(e.position, idx, window, cx);
                         }
                         this.close_react_picker();
                     } else if hit_clear {
                         this.apply_reaction(&p.msg, "", -1);
+                        this.close_react_picker();
+                    } else if p.hover_mode
+                        && (cx_pos - p.anchor_x).abs() <= 22.0
+                        && (cy_pos - p.anchor_y).abs() <= 20.0
+                    {
+                        // Clicking directly on the reaction trigger while the hover
+                        // picker is visible repeats/increments the active emoji.
+                        let idx = this.apply_active_reaction(&p.msg);
+                        this.spawn_react_burst(e.position, idx, window, cx);
                         this.close_react_picker();
                     } else {
                         let inside_pill = cx_pos >= p.x
@@ -605,23 +834,46 @@ impl ShellView {
                 let (cx_pos, cy_pos) = crate::window_frame::window_to_chrome(window, e.position);
                 let mut need_anim = false;
                 let mut need_notify = false;
+                let mut should_close = false;
                 if let Some(p) = this.react_picker.as_mut() {
-                    let (next_idx, next_clear) = react_slot_at(p, cx_pos, cy_pos);
-                    let next_cursor_x = next_idx.map(|_| cx_pos);
-                    if p.hovered_idx != next_idx || p.hovered_clear != next_clear {
-                        p.hovered_idx = next_idx;
-                        p.hovered_clear = next_clear;
-                        need_notify = true;
+                    if p.hover_mode && !p.holding {
+                        let in_bar = cx_pos >= p.x - 16.0
+                            && cx_pos <= p.x + p.bar_w + 16.0
+                            && cy_pos >= p.y - REACT_POP_HEADROOM
+                            && cy_pos <= p.y + REACT_BAR_H + 20.0;
+                        let in_anchor = (cx_pos - p.anchor_x).abs() <= 26.0
+                            && (cy_pos - p.anchor_y).abs() <= 22.0;
+                        let in_bridge = cx_pos >= p.x.min(p.anchor_x - 24.0) - 8.0
+                            && cx_pos <= (p.x + p.bar_w).max(p.anchor_x + 24.0) + 8.0
+                            && cy_pos >= (p.y + REACT_BAR_H).min(p.anchor_y) - 6.0
+                            && cy_pos <= (p.y + REACT_BAR_H).max(p.anchor_y) + 24.0;
+                        if !in_bar && !in_anchor && !in_bridge {
+                            should_close = true;
+                        }
                     }
-                    let cursor_moved = match (p.cursor_x, next_cursor_x) {
-                        (Some(a), Some(b)) => (a - b).abs() > 0.5,
-                        (None, None) => false,
-                        _ => true,
-                    };
-                    if cursor_moved {
-                        p.cursor_x = next_cursor_x;
-                        need_anim = true;
+                    if !should_close {
+                        let (next_idx, next_clear) = react_slot_at(p, cx_pos, cy_pos);
+                        let next_cursor_x = next_idx.map(|_| cx_pos);
+                        if p.hovered_idx != next_idx || p.hovered_clear != next_clear {
+                            p.hovered_idx = next_idx;
+                            p.hovered_clear = next_clear;
+                            need_notify = true;
+                        }
+                        let cursor_moved = match (p.cursor_x, next_cursor_x) {
+                            (Some(a), Some(b)) => (a - b).abs() > 0.5,
+                            (None, None) => false,
+                            _ => true,
+                        };
+                        if cursor_moved {
+                            p.cursor_x = next_cursor_x;
+                            need_anim = true;
+                        }
                     }
+                }
+                if should_close {
+                    this.close_react_picker();
+                    cx.notify();
+                    return;
                 }
                 if need_anim {
                     this.ensure_react_anim(window, cx);
@@ -648,14 +900,8 @@ impl ShellView {
                         if let Some(&(_, r_icon, r_type, _)) =
                             crate::read_sync::REACTION_PRESETS.get(idx)
                         {
-                            let already = this
-                                .my_reaction(p.msg.id)
-                                .is_some_and(|r| r.r_type == r_type);
-                            if already {
-                                this.apply_reaction(&p.msg, "", -1);
-                            } else {
-                                this.apply_reaction(&p.msg, r_icon, r_type);
-                            }
+                            this.apply_reaction(&p.msg, r_icon, r_type);
+                            this.spawn_react_burst(e.position, idx, window, cx);
                         }
                         this.close_react_picker();
                     } else if chosen_clear {
@@ -700,7 +946,6 @@ impl ShellView {
                             .bg(rgb(paper))
                             .border_1()
                             .border_color(line)
-                            .shadow_lg()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -712,7 +957,7 @@ impl ShellView {
                                     let is_peak = picker.hovered_idx == Some(idx);
                                     let icon_size = REACT_ICON_BASE + REACT_ICON_GAIN * lift;
                                     let rise_px = REACT_LIFT_MAX * lift;
-                                    let halo_size = icon_size + 6.0;
+                                    let halo_size = icon_size + 4.0;
                                     let icon_bottom = (REACT_BAR_H - halo_size) * 0.5 + rise_px;
                                     let label_bottom = icon_bottom + halo_size + 3.0;
                                     let icon_el = match crate::media::reaction_icon_by_index(idx) {
@@ -739,7 +984,6 @@ impl ShellView {
                                                 .size(px(halo_size))
                                                 .rounded(px(halo_size * 0.5))
                                                 .when(picked, |d| d.bg(rgb(active_bg)))
-                                                .when(lift > 0.35, |d| d.shadow_md())
                                                 .flex()
                                                 .items_center()
                                                 .justify_center()
@@ -770,7 +1014,6 @@ impl ShellView {
                                                             } else {
                                                                 gpui::transparent_black()
                                                             })
-                                                            .shadow_sm()
                                                             .text_size(px(10.5))
                                                             .line_height(px(13.))
                                                             .whitespace_nowrap()
@@ -783,25 +1026,7 @@ impl ShellView {
                                             )
                                         })
                                 },
-                            ))
-                            .when(picker.has_my, |el| {
-                                let clear_pop = picker.hovered_clear;
-                                el.child(
-                                    div()
-                                        .id("react-pick-clear")
-                                        .size(px(REACT_CLEAR_W))
-                                        .rounded(px(REACT_CLEAR_W / 2.0))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_size(px(12.))
-                                        .text_color(rgb(muted))
-                                        .cursor_pointer()
-                                        .when(clear_pop, |d| d.bg(rgb(hover_bg)))
-                                        .tooltip(|_, cx| crate::widgets::tip("Bỏ cảm xúc", cx))
-                                        .child("✕"),
-                                )
-                            }),
+                            )),
                     ),
             )
             .into_any_element()
@@ -1073,13 +1298,25 @@ impl ShellView {
             MenuKind::Message(msg) => {
                 let cloud = self.cloud_id() == Some(msg.conv);
                 let my_react = self.my_reaction(msg.id).map(|r| r.r_type);
-                message_rows(
+                let mut rows = message_rows(
                     msg,
                     cloud,
                     self.starred.contains(&msg.id),
                     self.pinned_msgs.contains(&msg.id),
                     my_react,
-                )
+                );
+                if let Some(selected) = self.selected_chat_text() {
+                    rows.insert(0, Row::Sep);
+                    rows.insert(
+                        0,
+                        icon_item(
+                            mi::COPY,
+                            "Sao chép đoạn đã chọn",
+                            MenuAction::Copy(selected),
+                        ),
+                    );
+                }
+                rows
             }
             MenuKind::Contact {
                 name,
@@ -1382,6 +1619,7 @@ impl ShellView {
                 self.save_starred();
             }
             MenuAction::SelectMulti(msg) => {
+                self.chat_sel.clear();
                 self.select_msgs = Some((msg.conv, vec![msg.id]));
                 self.reply_to = None;
             }
@@ -1504,9 +1742,7 @@ impl ShellView {
                 self.apply_reaction(&msg, r_icon, r_type);
             }
             MenuAction::Reply(msg) => {
-                self.reply_to = Some(msg);
-                let handle = self.composer.read(cx).focus_handle(cx);
-                window.focus(&handle);
+                self.begin_reply(msg, window, cx);
             }
             MenuAction::Copy(text) => {
                 crate::clip::copy_text(cx, text);
@@ -1632,7 +1868,7 @@ impl ShellView {
             }
             MenuAction::RenameAlias { uid, name } => self.open_alias(uid, name, cx),
             MenuAction::RemoveFriend { uid, name } => self.open_remove_friend(uid, name),
-            MenuAction::OpenUrl(url) => cx.open_url(url),
+            MenuAction::OpenUrl(url) => crate::os_util::open_url(url),
             MenuAction::OpenSettingsPage(page) => {
                 self.settings_page = page;
                 self.set_rail(crate::rail::Rail::Settings);
@@ -1687,15 +1923,32 @@ impl ShellView {
         build_thread_msg_ref(conv, self.messages_of(id), self.self_uid())
     }
 
-    /// Returns this user's active reaction on `msg_id`, if any.
+    /// Returns this user's most recently selected reaction on `msg_id`, if any.
     pub(crate) fn my_reaction(&self, msg_id: u64) -> Option<&crate::read_sync::MsgReaction> {
         let uid = self.self_uid();
         let uin = self.uin.as_deref();
-        self.reactions.get(&msg_id)?.iter().find(|r| {
+        self.reactions.get(&msg_id)?.iter().rfind(|r| {
             r.sender_uid == "me"
                 || uid.is_some_and(|u| r.sender_uid == u)
                 || uin.is_some_and(|u| r.sender_uid == u)
         })
+    }
+
+    /// Preset index (`0..6`) of this user's active reaction on `msg_id`, if any.
+    pub(crate) fn my_reaction_preset(&self, msg_id: u64) -> Option<usize> {
+        self.my_reaction(msg_id)
+            .map(|r| crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type))
+    }
+
+    /// Repeats/increments the user's currently shown emoji on `msg` (or Like if none yet),
+    /// returning the preset index `0..6` for the burst animation.
+    pub(crate) fn apply_active_reaction(&mut self, msg: &ChatMsg) -> usize {
+        let idx = self.my_reaction_preset(msg.id).unwrap_or(0);
+        let &(_, r_icon, r_type, _) = crate::read_sync::REACTION_PRESETS
+            .get(idx)
+            .unwrap_or(&crate::read_sync::REACTION_PRESETS[0]);
+        self.apply_reaction(msg, r_icon, r_type);
+        idx
     }
 
     /// Sends or clears a specific Zalo reaction on `msg` and updates local state immediately.
@@ -1706,14 +1959,35 @@ impl ShellView {
             .or(self.uin.as_deref())
             .unwrap_or("me")
             .to_owned();
-        crate::read_sync::update_reaction(
-            &mut self.reactions,
+        self.recent_my_reacts.push((
             msg.id,
-            &sender,
-            r_icon,
-            r_type,
-            cleared,
-        );
+            if cleared { -1 } else { r_type },
+            std::time::Instant::now(),
+        ));
+        if cleared {
+            let uid = self.self_uid().map(str::to_owned);
+            let uin = self.uin.clone();
+            if let Some(list) = self.reactions.get_mut(&msg.id) {
+                list.retain(|r| {
+                    r.sender_uid != "me"
+                        && r.sender_uid != sender
+                        && !uid.as_deref().is_some_and(|u| r.sender_uid == u)
+                        && !uin.as_deref().is_some_and(|u| r.sender_uid == u)
+                });
+                if list.is_empty() {
+                    self.reactions.remove(&msg.id);
+                }
+            }
+        } else {
+            crate::read_sync::update_reaction(
+                &mut self.reactions,
+                msg.id,
+                &sender,
+                r_icon,
+                r_type,
+                false,
+            );
+        }
         let has_any = self.reactions.get(&msg.id).is_some_and(|v| !v.is_empty());
         if let Some(list) = self.messages.get_mut(&msg.conv) {
             if let Some(found) = list.iter_mut().find(|row| row.id == msg.id) {
@@ -1738,12 +2012,9 @@ impl ShellView {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn apply_like(&mut self, msg: &ChatMsg) {
-        if self.my_reaction(msg.id).is_some() {
-            self.apply_reaction(msg, "", -1);
-        } else {
-            self.apply_reaction(msg, "/-strong", 3);
-        }
+        self.apply_reaction(msg, "/-strong", 3);
     }
 
     fn apply_recall(&mut self, msg: &ChatMsg) {
@@ -2972,6 +3243,7 @@ mod tests {
             bar_w: 324.0,
             has_my: true,
             holding: true,
+            hover_mode: false,
             hovered_idx: None,
             hovered_clear: false,
             cursor_x: None,
