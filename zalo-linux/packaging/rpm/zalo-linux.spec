@@ -1,5 +1,5 @@
 Name:           zalo-linux
-Version:        0.3.3
+Version:        0.3.4
 Release:        1%{?dist}
 Summary:        Native Rust Zalo Desktop client (GPUI)
 License:        MIT
