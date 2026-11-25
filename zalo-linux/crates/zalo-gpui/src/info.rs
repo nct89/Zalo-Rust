@@ -425,6 +425,7 @@ enum InfoAct {
     AddMember,
     CreateGroup,
     Manage,
+    AutoDelete,
     Pending,
     Hide,
     Clear,
@@ -437,11 +438,12 @@ enum InfoAct {
 
 /// Electron-style permission switch. The parent row owns the click.
 pub(crate) fn switch_pill(on: bool) -> gpui::AnyElement {
-    let off_bg = if crate::color::is_dark() {
-        0x4b_53_5e
+    let track = if on {
+        crate::color::accent_bg()
     } else {
-        0xc5_ca_d3
+        crate::color::switch_off_bg()
     };
+    let knob = crate::color::switch_knob_fg(on);
     div()
         .flex_none()
         .w(px(36.))
@@ -450,14 +452,10 @@ pub(crate) fn switch_pill(on: bool) -> gpui::AnyElement {
         .rounded(px(10.))
         .flex()
         .items_center()
-        .bg(rgb(if on {
-            token_rgb("--B55", "#0068ff")
-        } else {
-            off_bg
-        }))
+        .bg(rgb(track))
         .when(on, |el| el.justify_end())
         .when(!on, |el| el.justify_start())
-        .child(div().size(px(16.)).rounded(px(8.)).bg(rgb(0xffffff)))
+        .child(div().size(px(16.)).rounded(px(8.)).bg(rgb(knob)))
         .into_any_element()
 }
 
@@ -470,7 +468,7 @@ pub(crate) fn check_box(on: bool) -> gpui::AnyElement {
         .border_1()
         .border_color(crate::color::border_subtle())
         .bg(rgb(if on {
-            token_rgb("--B55", "#0068ff")
+            crate::color::accent_bg()
         } else {
             token_rgb("--layer-background", "#ffffff")
         }))
@@ -478,7 +476,7 @@ pub(crate) fn check_box(on: bool) -> gpui::AnyElement {
         .items_center()
         .justify_center()
         .text_size(px(11.))
-        .text_color(rgb(0xffffff))
+        .text_color(rgb(crate::color::on_accent_fg()))
         .child(if on { "✓" } else { "" })
         .into_any_element()
 }
@@ -561,7 +559,7 @@ impl ShellView {
                 }))
                 .child({
                     let circle_bg = if crate::color::is_dark() {
-                        0x2f_35_3d
+                        0x26_26_26
                     } else {
                         token_rgb("--layer-background-subtle", "#ebecf0")
                     };
@@ -678,7 +676,7 @@ impl ShellView {
             crate::sidebar::AvatarPaint::Cloud => div()
                 .size(px(56.))
                 .rounded(px(28.))
-                .bg(rgb(token_rgb("--B55", "#0068ff")))
+                .bg(rgb(crate::color::neutral_avatar_bg()))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -694,7 +692,7 @@ impl ShellView {
             crate::sidebar::AvatarPaint::Letter => crate::sidebar::letter_disc(
                 &crate::sidebar::avatar_initials(&conv.name),
                 if is_group {
-                    0x0068ff
+                    crate::color::neutral_avatar_bg()
                 } else {
                     crate::sidebar::avatar_color(&conv.thread_id)
                 },
@@ -1014,17 +1012,17 @@ impl ShellView {
                         "STR_SETTINGS_PRIVACY_2",
                         "Thiết lập bảo mật",
                     )))
+                    .child(self.info_stack_row(
+                        "info-vanish",
+                        g::CLOCK,
+                        crate::color::str_vi("STR_VANISH_MSGS", "Tin nhắn tự xóa"),
+                        &self.thread_ttl_label(&conv.thread_id),
+                        id,
+                        InfoAct::AutoDelete,
+                        cx,
+                    ))
                     .when(is_group, |el| {
                         el.child(self.info_stack_row(
-                            "info-vanish",
-                            g::CLOCK,
-                            crate::color::str_vi("STR_VANISH_MSGS", "Tin nhắn tự xóa"),
-                            crate::color::str_vi("STR_NEVER", "Không bao giờ"),
-                            id,
-                            InfoAct::Manage,
-                            cx,
-                        ))
-                        .child(self.info_stack_row(
                             "info-block-share",
                             g::SHARE,
                             crate::color::str_vi("STR_BLOCK_SHARING_STATUS_TITLE", "Chặn chia sẻ"),
@@ -1187,6 +1185,7 @@ impl ShellView {
             }
             InfoAct::CreateGroup => self.open_group_picker(None, cx),
             InfoAct::Manage => self.open_group_manage(id, cx),
+            InfoAct::AutoDelete => self.open_auto_delete(id, cx),
             InfoAct::Pending => {
                 self.open_group_manage_tab(id, crate::account::GroupManageTab::Pending, cx)
             }
@@ -1436,19 +1435,27 @@ impl ShellView {
         .detach();
     }
 
-    /// Reads the product catalog once. Does not create products and does not run in preview.
+    /// Forces a fresh reload of the product catalog from `/api/prodcatalog/catalog/list`.
+    pub(crate) fn reload_catalog(&mut self, cx: &mut Context<Self>) {
+        self.catalog_loaded = false;
+        self.warm_catalog(cx);
+    }
+
+    /// Reads the product catalog once. Does not run in preview.
     pub(crate) fn warm_catalog(&mut self, cx: &mut Context<Self>) {
         if self.catalog_loaded || self.catalog_busy {
             return;
         }
         if cfg!(test) || !self.has_session {
             self.catalog_loaded = true;
-            self.catalog_note = "Chưa đăng nhập. Danh sách lấy từ /api/prodcatalog/catalog/list khi có phiên. Máy này không tạo sản phẩm.".to_owned();
+            self.catalog_note =
+                "Đăng nhập để xem danh mục sản phẩm trên tài khoản Zalo Business.".to_owned();
             return;
         }
         let Some(dir) = self.session_dir.clone() else {
             self.catalog_loaded = true;
-            self.catalog_note = "Chưa đăng nhập. Danh sách lấy từ /api/prodcatalog/catalog/list khi có phiên. Máy này không tạo sản phẩm.".to_owned();
+            self.catalog_note =
+                "Đăng nhập để xem danh mục sản phẩm trên tài khoản Zalo Business.".to_owned();
             return;
         };
         self.catalog_busy = true;
@@ -1800,7 +1807,7 @@ impl ShellView {
         key: &'static str,
         code: char,
         title: &'static str,
-        sub: &'static str,
+        sub: &str,
         id: u64,
         act: InfoAct,
         cx: &mut Context<Self>,
@@ -2288,22 +2295,81 @@ impl ShellView {
             grid = grid.children(cloud.into_iter().enumerate().map(|(i, item)| {
                 let thumb = self.store_thumb(&item.id);
                 let open = item.clone();
+                let del_id = item.id.clone();
+                let can_del = !del_id.is_empty();
                 let thread_open = thread_open.clone();
-                square_photo(
-                    ("shelf-cloud-photo", i as u64),
-                    cell,
-                    thumb,
-                    subtle,
-                    muted,
-                    cx,
-                    move |this, _, window, cx| {
-                        this.open_store_item(&open, id, &thread_open, window, cx);
-                        cx.notify();
-                    },
-                )
+                let thread_del = thread_open.clone();
+                div()
+                    .relative()
+                    .size(px(cell))
+                    .child(square_photo(
+                        ("shelf-cloud-photo", i as u64),
+                        cell,
+                        thumb,
+                        subtle,
+                        muted,
+                        cx,
+                        move |this, _, window, cx| {
+                            this.open_store_item(&open, id, &thread_open, window, cx);
+                            cx.notify();
+                        },
+                    ))
+                    .when(can_del, |tile| {
+                        tile.child(
+                            div()
+                                .id(("shelf-cloud-photo-del", i as u64))
+                                .absolute()
+                                .top(px(3.))
+                                .right(px(3.))
+                                .size(px(18.))
+                                .rounded(px(9.))
+                                .bg(gpui::hsla(0., 0., 0., 0.62))
+                                .hover(|s| s.bg(rgb(token_rgb("--R60", "#c31818"))))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_size(px(11.))
+                                .text_color(rgb(0xff_ff_ff))
+                                .tooltip(|_, cx| crate::widgets::tip("Xóa khỏi kho lưu trữ", cx))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.remove_media_store_item(
+                                        &thread_del,
+                                        "media",
+                                        del_id.clone(),
+                                        cx,
+                                    );
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        )
+                    })
             }));
         }
-        grid.into_any_element()
+        let can_more = self.media_store_can_load_more(thread, "media");
+        let loading_more = self.media_shelf.loading_more;
+        let thread_more = thread.to_owned();
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .child(grid)
+            .when(can_more, |col| {
+                col.child(self.shelf_load_more_btn(
+                    "shelf-more-media",
+                    if loading_more {
+                        "Đang tải…"
+                    } else {
+                        "Tải thêm ảnh/video"
+                    },
+                    !loading_more,
+                    thread_more,
+                    "media",
+                    cx,
+                ))
+            })
+            .into_any_element()
     }
 
     fn shelf_file_list(
@@ -2354,6 +2420,8 @@ impl ShellView {
             }
         } else {
             let thread_open = thread.to_owned();
+            let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+            let danger = token_rgb("--R60", "#c31818");
             col = col.children(cloud.into_iter().enumerate().map(|(i, item)| {
                 let name = if item.title.is_empty() {
                     crate::color::str_vi("STR_FILE", "File").to_owned()
@@ -2361,25 +2429,77 @@ impl ShellView {
                     item.title.clone()
                 };
                 let open = item.clone();
+                let del_id = item.id.clone();
+                let can_del = !del_id.is_empty();
                 let thread_open = thread_open.clone();
-                dated_row(
-                    ("shelf-cloud-file", i as u64),
-                    file_mark(&name),
-                    name,
-                    if item.file_size > 0 {
-                        crate::media::format_file_size(item.file_size)
-                    } else {
-                        String::new()
-                    },
-                    true,
-                    shelf_ymd(item.sent_ms),
-                    cx,
-                    move |this, _, window, cx| {
-                        this.open_store_item(&open, id, &thread_open, window, cx);
-                        cx.notify();
-                    },
-                )
+                let thread_del = thread_open.clone();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(dated_row(
+                            ("shelf-cloud-file", i as u64),
+                            file_mark(&name),
+                            name,
+                            if item.file_size > 0 {
+                                crate::media::format_file_size(item.file_size)
+                            } else {
+                                String::new()
+                            },
+                            true,
+                            shelf_ymd(item.sent_ms),
+                            cx,
+                            move |this, _, window, cx| {
+                                this.open_store_item(&open, id, &thread_open, window, cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(can_del, |row| {
+                        row.child(
+                            div()
+                                .id(("shelf-cloud-file-del", i as u64))
+                                .flex_none()
+                                .mr(px(10.))
+                                .size(px(26.))
+                                .rounded(px(13.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_color(rgb(muted))
+                                .hover(move |s| s.bg(rgb(hover)).text_color(rgb(danger)))
+                                .tooltip(|_, cx| crate::widgets::tip("Xóa khỏi kho lưu trữ", cx))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.remove_media_store_item(
+                                        &thread_del,
+                                        "file",
+                                        del_id.clone(),
+                                        cx,
+                                    );
+                                    cx.notify();
+                                }))
+                                .child(fonts::icon_el(g::TRASH, "×", 14.)),
+                        )
+                    })
             }));
+        }
+        if self.media_store_can_load_more(thread, "file") {
+            let loading_more = self.media_shelf.loading_more;
+            col = col.child(self.shelf_load_more_btn(
+                "shelf-more-file",
+                if loading_more {
+                    "Đang tải…"
+                } else {
+                    "Tải thêm file"
+                },
+                !loading_more,
+                thread.to_owned(),
+                "file",
+                cx,
+            ));
         }
         col.into_any_element()
     }
@@ -2433,6 +2553,8 @@ impl ShellView {
             }
         } else {
             let thread_open = thread.to_owned();
+            let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+            let danger = token_rgb("--R60", "#c31818");
             col = col.children(cloud.into_iter().enumerate().map(|(i, item)| {
                 let host = link_host_label(&item.url);
                 let title = if item.title.trim().is_empty() || item.title == item.url {
@@ -2441,23 +2563,113 @@ impl ShellView {
                     item.title.clone()
                 };
                 let open = item.clone();
+                let del_id = item.id.clone();
+                let can_del = !del_id.is_empty();
                 let thread_open = thread_open.clone();
-                dated_row(
-                    ("shelf-cloud-link", i as u64),
-                    link_mark(),
-                    title,
-                    host,
-                    false,
-                    shelf_ymd(item.sent_ms),
-                    cx,
-                    move |this, _, window, cx| {
-                        this.open_store_item(&open, id, &thread_open, window, cx);
-                        cx.notify();
-                    },
-                )
+                let thread_del = thread_open.clone();
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .w_full()
+                    .child(
+                        div().flex_1().min_w(px(0.)).child(dated_row(
+                            ("shelf-cloud-link", i as u64),
+                            link_mark(),
+                            title,
+                            host,
+                            false,
+                            shelf_ymd(item.sent_ms),
+                            cx,
+                            move |this, _, window, cx| {
+                                this.open_store_item(&open, id, &thread_open, window, cx);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(can_del, |row| {
+                        row.child(
+                            div()
+                                .id(("shelf-cloud-link-del", i as u64))
+                                .flex_none()
+                                .mr(px(10.))
+                                .size(px(26.))
+                                .rounded(px(13.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_color(rgb(muted))
+                                .hover(move |s| s.bg(rgb(hover)).text_color(rgb(danger)))
+                                .tooltip(|_, cx| crate::widgets::tip("Xóa khỏi kho lưu trữ", cx))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.remove_media_store_item(
+                                        &thread_del,
+                                        "link",
+                                        del_id.clone(),
+                                        cx,
+                                    );
+                                    cx.notify();
+                                }))
+                                .child(fonts::icon_el(g::TRASH, "×", 14.)),
+                        )
+                    })
             }));
         }
+        if self.media_store_can_load_more(thread, "link") {
+            let loading_more = self.media_shelf.loading_more;
+            col = col.child(self.shelf_load_more_btn(
+                "shelf-more-link",
+                if loading_more {
+                    "Đang tải…"
+                } else {
+                    "Tải thêm link"
+                },
+                !loading_more,
+                thread.to_owned(),
+                "link",
+                cx,
+            ));
+        }
         col.into_any_element()
+    }
+
+    fn shelf_load_more_btn(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+        thread: String,
+        media_type: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let bg = token_rgb("--layer-background-subtle", "#eaedf0");
+        let hover = token_rgb("--layer-background-hover", "#dfe2e7");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        div()
+            .id(id)
+            .mx(px(16.))
+            .mt(px(10.))
+            .mb(px(8.))
+            .h(px(34.))
+            .rounded(px(4.))
+            .bg(rgb(bg))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(13.))
+            .font_family(FAMILY_SEMIBOLD)
+            .text_color(rgb(if enabled { ink } else { muted }))
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .hover(move |s| s.bg(rgb(hover)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.load_more_media_store(&thread, media_type, cx);
+                        cx.notify();
+                    }))
+            })
+            .child(label)
     }
 
     /// `#conversation-info` "Members": back, "Add Members", list with roles.
@@ -2677,7 +2889,7 @@ impl ShellView {
                                                 action_btn(
                                                     gpui::SharedString::from(format!("role-{role_uid}")),
                                                     role_label,
-                                                    token_rgb("--blue", "#0068ff"),
+                                                    token_rgb("--B55", "#0068ff"),
                                                 )
                                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                                     cx.stop_propagation();

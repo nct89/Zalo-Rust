@@ -342,12 +342,12 @@ impl ShellView {
             "light"
         };
         let mini_half = |dark: bool, w_rail: f32, show_bubbles: bool| {
-            let rail_bg = if dark { 0x12_14_16 } else { 0x00_68_ff };
-            let list_bg = if dark { 0x22_26_2b } else { 0xff_ff_ff };
-            let chat_bg = if dark { 0x16_19_1d } else { 0xeb_ec_f0 };
-            let bar_bg = if dark { 0x38_3e_47 } else { 0xdc_e1_e8 };
-            let in_bub = if dark { 0x26_2a_30 } else { 0xff_ff_ff };
-            let out_bub = if dark { 0x1a_3a_64 } else { 0xe5_f1_ff };
+            let rail_bg = if dark { 0x0d_0d_0d } else { 0x00_68_ff };
+            let list_bg = if dark { 0x18_18_18 } else { 0xff_ff_ff };
+            let chat_bg = if dark { 0x12_12_12 } else { 0xeb_ec_f0 };
+            let bar_bg = if dark { 0x30_30_30 } else { 0xdc_e1_e8 };
+            let in_bub = if dark { 0x21_21_21 } else { 0xff_ff_ff };
+            let out_bub = if dark { 0x2e_2e_2e } else { 0xe5_f1_ff };
             div()
                 .flex()
                 .flex_row()
@@ -534,10 +534,9 @@ impl ShellView {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let blue = token_rgb("--B55", "#0068ff");
-        let dark = crate::color::is_dark();
-        let card_bg = if dark { 0x2a_2c_31 } else { 0xf4_f6_f8 };
-        let card_border = if dark { 0x3a_3e_46 } else { 0xe1_e5_ea };
-        let hover = if dark { 0x32_35_3b } else { 0xea_ee_f4 };
+        let card_bg = crate::color::card_bg();
+        let card_border = crate::color::card_border();
+        let hover = crate::color::card_hover_bg();
         let card = |key: &'static str,
                     art: gpui::AnyElement,
                     title: &'static str,
@@ -665,7 +664,11 @@ impl ShellView {
         let muted = token_rgb("--text-secondary", "#5a6981");
         let paper = token_rgb("--layer-background", "#ffffff");
         let blue = token_rgb("--B55", "#0068ff");
-        let sky = 0x29_b6_f6;
+        let sky = if crate::color::is_dark() {
+            0x66_66_66
+        } else {
+            0x29_b6_f6
+        };
         let c = self.settings_cache.clone().unwrap_or_default();
         let zalo = c.media + c.cache + c.system;
         let total = c.fs_total.max(1) as f32;
@@ -824,7 +827,11 @@ impl ShellView {
                     .overflow_hidden()
                     .flex()
                     .flex_row()
-                    .bg(rgb(0x5a_69_81))
+                    .bg(rgb(if crate::color::is_dark() {
+                        0x2e_2e_2e
+                    } else {
+                        0x5a_69_81
+                    }))
                     .child(div().h_full().w(gpui::relative(zalo_frac)).bg(rgb(blue)))
                     .child(div().h_full().w(gpui::relative(other_frac)).bg(rgb(sky))),
             )
@@ -1401,11 +1408,13 @@ impl ShellView {
                             vec![
                                 SRow { label: "Mã PIN".into(), desc: Some(format!("Đã đặt · {} trò chuyện ẩn (đang mở)", self.hidden.len())), ctl: Ctl::Button("Đổi mã PIN", SAction::HiddenPin) },
                                 SRow { label: "Ẩn lại trò chuyện".into(), desc: Some("Ẩn các trò chuyện riêng tư khỏi danh sách".into()), ctl: Ctl::Button("Ẩn lại", SAction::LockHidden) },
+                                SRow { label: "Đặt lại mã PIN".into(), desc: Some("Xóa mã PIN hiện tại và bỏ ẩn toàn bộ trò chuyện đã ẩn".into()), ctl: Ctl::Button("Đặt lại", SAction::ResetHiddenPin) },
                             ]
                         } else {
                             vec![
                                 SRow { label: "Mã PIN".into(), desc: Some(format!("Đã đặt · {} trò chuyện ẩn", self.hidden.len())), ctl: Ctl::Button("Đổi mã PIN", SAction::HiddenPin) },
                                 SRow { label: "Hiện trò chuyện ẩn".into(), desc: Some("Nhập mã PIN để xem trong lần dùng này".into()), ctl: Ctl::Button("Nhập PIN", SAction::ShowHidden) },
+                                SRow { label: "Đặt lại mã PIN".into(), desc: Some("Xóa mã PIN hiện tại và bỏ ẩn toàn bộ trò chuyện đã ẩn".into()), ctl: Ctl::Button("Đặt lại", SAction::ResetHiddenPin) },
                             ]
                         },
                     ),
@@ -1794,6 +1803,7 @@ impl ShellView {
             }
             SAction::ShowHidden => self.open_pin(PinMode::Unlock { conv: None }, cx),
             SAction::LockHidden => self.lock_hidden_chats(),
+            SAction::ResetHiddenPin => self.open_pin(PinMode::ResetHidden, cx),
             SAction::QuickMessages => self.open_quick_messages(cx),
             SAction::AutoReply => self.open_auto_reply(cx),
             SAction::ClearCache => {
@@ -1949,7 +1959,7 @@ impl ShellView {
                     "Thông báo mẫu".into(),
                     "Kéo thẻ này để đặt vị trí trên màn hình.".into(),
                     "Z".into(),
-                    0x0068ff,
+                    crate::color::neutral_avatar_bg(),
                     None,
                     Vec::new(),
                 );
@@ -2058,6 +2068,7 @@ enum SAction {
     HiddenPin,
     ShowHidden,
     LockHidden,
+    ResetHiddenPin,
     QuickMessages,
     AutoReply,
     /// Kept so the decrypt dialog in `account.rs` still has a call site.
@@ -2732,49 +2743,31 @@ fn build_chat_backup_json(
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_owned())
 }
 
-/// Settings switch for other modules (auto-reply rows).
+/// Settings switch for other modules (auto-reply rows, quick messages).
 pub(crate) fn switch_el(on: bool) -> impl IntoElement {
-    // The glyph takes the text colour: blue when on, neutral disabled grey when off.
-    let off = token_rgb("--text-disabled", "#8b96a7");
-    div()
-        .text_color(rgb(if on {
-            token_rgb("--B55", "#0068ff")
-        } else {
-            off
-        }))
-        .child(toggle_el(on))
+    toggle_el(on)
 }
 
-/// `fa-toggle-checked-24` / `-unchecked-24` with the white knob.
+/// Crisp vector toggle switch (blue in light mode, pure neutral in dark mode).
 fn toggle_el(on: bool) -> impl IntoElement {
+    let track = if on {
+        crate::color::accent_bg()
+    } else {
+        crate::color::switch_off_bg()
+    };
+    let knob = crate::color::switch_knob_fg(on);
     div()
-        .relative()
+        .flex_none()
         .w(px(38.))
-        .h(px(24.))
-        .child(
-            div()
-                .absolute()
-                .top(px(4.))
-                .left(px(4.))
-                .w(px(30.))
-                .h(px(16.))
-                .rounded(px(10.))
-                .bg(rgb(0xffffff)),
-        )
-        .child(
-            // The glyph is 38 × 24 at 24 px: no square clip (unlike `icon_el`).
-            div()
-                .absolute()
-                .inset(px(0.))
-                .w(px(38.))
-                .h(px(24.))
-                .text_size(px(24.))
-                .line_height(px(24.))
-                .when(fonts::icon_loaded(), |el| {
-                    el.font_family(crate::fonts::FAMILY_ICON)
-                })
-                .child(fonts::glyph(if on { '\u{EDBE}' } else { '\u{EDC0}' }, "◯")),
-        )
+        .h(px(22.))
+        .px(px(2.))
+        .rounded(px(11.))
+        .flex()
+        .items_center()
+        .bg(rgb(track))
+        .when(on, |el| el.justify_end())
+        .when(!on, |el| el.justify_start())
+        .child(div().size(px(18.)).rounded(px(9.)).bg(rgb(knob)))
 }
 
 fn sync_dash(blue: u32) -> gpui::AnyElement {

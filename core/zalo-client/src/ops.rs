@@ -347,6 +347,222 @@ pub fn delete_group_payload(
     })
 }
 
+/// One `@mention` span inside a group message (`mentionInfo` entry).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionItem {
+    /// UTF-16 code-unit start offset inside `message`.
+    pub pos: usize,
+    /// Mentioned user UID, or `"-1"` for `@All`.
+    pub uid: String,
+    /// UTF-16 code-unit length of the mention span (including `@`).
+    pub len: usize,
+    /// `0` for an individual user, `1` for `@All`.
+    pub kind: i64,
+}
+
+/// Fields for sending a rich link card (`/api/message/link` or `/api/group/sendlink`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkSendInfo {
+    /// Message text containing the URL.
+    pub msg: String,
+    /// Target hyperlink URL.
+    pub href: String,
+    /// Site / host label (`src`).
+    pub src: String,
+    /// Preview card title (falls back to `href`).
+    pub title: String,
+    /// Preview description.
+    pub desc: String,
+    /// Preview thumbnail URL.
+    pub thumb: String,
+    /// Raw JSON string for `media` (e.g. `"{}"` or `{thumb, type, ...}`).
+    pub media: String,
+    /// Link card type (`0` for standard web links).
+    pub link_type: i64,
+}
+
+/// One message reference inside `/api/message/multi_undo` or `/api/group/multi_undomsg`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiUndoItem {
+    /// Fresh client id for this recall operation (`cliMsgId`).
+    pub cli_msg_id: u64,
+    /// Original client message id being recalled (`cliMsgIdUndo`).
+    pub cli_msg_id_undo: i64,
+    /// Server global message id (`globalMsgId`).
+    pub global_msg_id: i64,
+}
+
+/// Serializes [`MentionItem`] slice into Zalo's `mentionInfo` JSON array string.
+#[must_use]
+pub fn mention_info_json(mentions: &[MentionItem]) -> String {
+    let arr: Vec<Value> = mentions
+        .iter()
+        .map(|m| {
+            json!({
+                "pos": m.pos,
+                "uid": m.uid,
+                "len": m.len,
+                "type": m.kind,
+            })
+        })
+        .collect();
+    Value::Array(arr).to_string()
+}
+
+/// Group `@mention` message body (`/api/group/mention`, cmd 11198).
+#[must_use]
+pub fn group_mention_payload(
+    grid: &str,
+    message: &str,
+    mentions: &[MentionItem],
+    client_id: u64,
+    language: &str,
+    imei: &str,
+) -> Value {
+    json!({
+        "grid": strip_group(grid),
+        "message": message,
+        "clientId": client_id,
+        "mentionInfo": mention_info_json(mentions),
+        "language": if language.is_empty() { "vi" } else { language },
+        "visibility": 0,
+        "imei": imei,
+    })
+}
+
+/// Rich link message body (`/api/message/link` cmd 11286 or `/api/group/sendlink` cmd 11193).
+#[must_use]
+pub fn link_message_payload(
+    thread_id: &str,
+    is_group: bool,
+    info: &LinkSendInfo,
+    mentions: &[MentionItem],
+    client_id: u64,
+    language: &str,
+    imei: &str,
+) -> Value {
+    let title = if info.title.trim().is_empty() {
+        info.href.as_str()
+    } else {
+        info.title.as_str()
+    };
+    let media = if info.media.trim().is_empty() {
+        "{}".to_owned()
+    } else {
+        info.media.clone()
+    };
+    let lang = if language.is_empty() { "vi" } else { language };
+    if is_group {
+        json!({
+            "grid": strip_group(thread_id),
+            "msg": info.msg,
+            "href": info.href,
+            "src": info.src,
+            "title": title,
+            "desc": info.desc,
+            "language": lang,
+            "thumb": info.thumb,
+            "type": info.link_type,
+            "media": media,
+            "clientId": client_id,
+            "mentionInfo": mention_info_json(mentions),
+            "imei": imei,
+            "visibility": 0,
+        })
+    } else {
+        json!({
+            "toId": thread_id,
+            "msg": info.msg,
+            "href": info.href,
+            "src": info.src,
+            "title": title,
+            "desc": info.desc,
+            "language": lang,
+            "thumb": info.thumb,
+            "type": info.link_type,
+            "media": media,
+            "clientId": client_id,
+            "mentionInfo": "",
+            "imei": imei,
+        })
+    }
+}
+
+/// Multi-message recall body (`/api/message/multi_undo` cmd 12115 or `/api/group/multi_undomsg` cmd 12116).
+#[must_use]
+pub fn multi_undo_payload(thread_id: &str, is_group: bool, items: &[MultiUndoItem]) -> Value {
+    let msgs: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            json!({
+                "cliMsgId": it.cli_msg_id,
+                "cliMsgIdUndo": it.cli_msg_id_undo,
+                "globalMsgId": it.global_msg_id,
+            })
+        })
+        .collect();
+    if is_group {
+        json!({
+            "grid": strip_group(thread_id),
+            "msgs": msgs,
+        })
+    } else {
+        json!({
+            "toid": thread_id,
+            "msgs": msgs,
+        })
+    }
+}
+
+/// Multi-target text forward 1-1 (`/api/message/mforward`, cmd 12440).
+///
+/// Zalo PC `MSG_TYPE_MULTI_FW.TEXT` is `"1"` (string), unlike single-target
+/// `/api/message/forward` which sends numeric `MSG_TEXT` (`1`).
+#[must_use]
+pub fn forward_multi_direct_payload(
+    targets: &[(String, u64)],
+    text: &str,
+    imei: &str,
+) -> Value {
+    let to_ids: Vec<Value> = targets
+        .iter()
+        .map(|(uid, cid)| {
+            json!({
+                "toUid": uid,
+                "clientId": cid,
+            })
+        })
+        .collect();
+    json!({
+        "toIds": to_ids,
+        "imei": imei,
+        "msgType": "1",
+        "totalIds": targets.len(),
+        "msgInfo": json!({ "message": text }).to_string(),
+    })
+}
+
+/// Multi-target text forward group (`/api/group/mforward`, cmd 12442).
+#[must_use]
+pub fn forward_multi_group_payload(targets: &[(String, u64)], text: &str) -> Value {
+    let grids: Vec<Value> = targets
+        .iter()
+        .map(|(grid, cid)| {
+            json!({
+                "grid": strip_group(grid),
+                "clientId": cid,
+                "visibility": 0,
+            })
+        })
+        .collect();
+    json!({
+        "grids": grids,
+        "msgType": "1",
+        "totalIds": targets.len(),
+        "msgInfo": json!({ "message": text }).to_string(),
+    })
+}
+
 /// Text forward 1-1 (`/api/message/forward`).
 #[must_use]
 pub fn forward_direct_payload(to_uid: &str, text: &str, client_id: u64, imei: &str) -> Value {
@@ -1039,6 +1255,128 @@ impl ZaloApi {
             self.post_encrypted(&self.chat_base(), "/api/message/undo", &payload)
                 .await
         }
+    }
+
+    /// Recalls multiple messages in one call (`/api/message/multi_undo` or `/api/group/multi_undomsg`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn undo_multi_messages(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        items: &[MultiUndoItem],
+    ) -> Result<Value, ClientError> {
+        let payload = multi_undo_payload(thread_id, is_group, items);
+        if is_group {
+            self.post_encrypted(&self.group_base(), "/api/group/multi_undomsg", &payload)
+                .await
+        } else {
+            self.post_encrypted(&self.chat_base(), "/api/message/multi_undo", &payload)
+                .await
+        }
+    }
+
+    /// Sends a group message with structured `@mention` metadata (`/api/group/mention`, cmd 11198).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn send_group_mention(
+        &self,
+        grid: &str,
+        message: &str,
+        mentions: &[MentionItem],
+        client_id: u64,
+        language: &str,
+    ) -> Result<Value, ClientError> {
+        let payload = group_mention_payload(
+            grid,
+            message,
+            mentions,
+            client_id,
+            language,
+            &self.device.imei,
+        );
+        self.post_encrypted(&self.group_base(), "/api/group/mention", &payload)
+            .await
+    }
+
+    /// Sends a rich link preview message (`/api/message/link` or `/api/group/sendlink`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn send_link_message(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        info: &LinkSendInfo,
+        mentions: &[MentionItem],
+        client_id: u64,
+        language: &str,
+    ) -> Result<Value, ClientError> {
+        let payload = link_message_payload(
+            thread_id,
+            is_group,
+            info,
+            mentions,
+            client_id,
+            language,
+            &self.device.imei,
+        );
+        if is_group {
+            self.post_encrypted(&self.group_base(), "/api/group/sendlink", &payload)
+                .await
+        } else {
+            self.post_encrypted(&self.chat_base(), "/api/message/link", &payload)
+                .await
+        }
+    }
+
+    /// Forwards one text payload to multiple direct and/or group conversations using
+    /// `/api/message/mforward` (cmd 12440) and `/api/group/mforward` (cmd 12442).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn forward_multi_text(
+        &self,
+        targets: &[(String, bool)],
+        text: &str,
+        base_client_id: u64,
+    ) -> Result<Vec<Value>, ClientError> {
+        let mut direct: Vec<(String, u64)> = Vec::new();
+        let mut groups: Vec<(String, u64)> = Vec::new();
+        for (i, (tid, is_group)) in targets.iter().enumerate() {
+            let cid = base_client_id.saturating_add(i as u64);
+            if *is_group || tid.starts_with("g_") {
+                groups.push((tid.clone(), cid));
+            } else {
+                direct.push((tid.clone(), cid));
+            }
+        }
+        let host = self
+            .file_host
+            .clone()
+            .unwrap_or_else(|| "https://tt-files-wpa.chat.zalo.me".to_owned());
+        let mut replies = Vec::new();
+        if !direct.is_empty() {
+            let payload = forward_multi_direct_payload(&direct, text, &self.device.imei);
+            replies.push(
+                self.post_encrypted(&host, "/api/message/mforward", &payload)
+                    .await?,
+            );
+        }
+        if !groups.is_empty() {
+            let payload = forward_multi_group_payload(&groups, text);
+            replies.push(
+                self.post_encrypted(&host, "/api/group/mforward", &payload)
+                    .await?,
+            );
+        }
+        Ok(replies)
     }
 
     /// Deletes messages (`/api/message/delete` or `/api/group/deletemsg`).
@@ -1794,5 +2132,70 @@ mod tests {
         assert_eq!(preview.files[0].sent_ms, 1_731_283_200_000);
         assert_eq!(preview.links[0].url, "https://example.com");
         assert_eq!(MEDIA_ERR_GONE, 212);
+    }
+
+    #[test]
+    fn p0_mention_link_multi_undo_and_mforward_payloads() {
+        let mentions = vec![
+            MentionItem {
+                pos: 0,
+                uid: "123".into(),
+                len: 5,
+                kind: 0,
+            },
+            MentionItem {
+                pos: 6,
+                uid: "-1".into(),
+                len: 4,
+                kind: 1,
+            },
+        ];
+        let mp = group_mention_payload("g_77", "@An @All hi", &mentions, 9001, "vi", "im1");
+        assert_eq!(mp["grid"], "77");
+        assert_eq!(mp["clientId"], 9001);
+        assert_eq!(mp["visibility"], 0);
+        let parsed_mentions: Value =
+            serde_json::from_str(mp["mentionInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_mentions[0]["uid"], "123");
+        assert_eq!(parsed_mentions[1]["type"], 1);
+
+        let link_info = LinkSendInfo {
+            msg: "Xem https://example.com".into(),
+            href: "https://example.com".into(),
+            src: "example.com".into(),
+            title: "Example".into(),
+            desc: "Mô tả".into(),
+            thumb: "https://example.com/og.png".into(),
+            media: "{}".into(),
+            link_type: 0,
+        };
+        let lp1 = link_message_payload("55", false, &link_info, &[], 9002, "vi", "im1");
+        assert_eq!(lp1["toId"], "55");
+        assert_eq!(lp1["href"], "https://example.com");
+        assert_eq!(lp1["mentionInfo"], "");
+        let lp2 = link_message_payload("g_77", true, &link_info, &mentions, 9003, "vi", "im1");
+        assert_eq!(lp2["grid"], "77");
+        assert!(lp2["mentionInfo"].as_str().unwrap().contains("\"uid\":\"123\""));
+
+        let undo_items = vec![MultiUndoItem {
+            cli_msg_id: 1001,
+            cli_msg_id_undo: 88,
+            global_msg_id: 999,
+        }];
+        let u1 = multi_undo_payload("55", false, &undo_items);
+        assert_eq!(u1["toid"], "55");
+        assert_eq!(u1["msgs"][0]["globalMsgId"], 999);
+        let u2 = multi_undo_payload("g_77", true, &undo_items);
+        assert_eq!(u2["grid"], "77");
+        assert_eq!(u2["msgs"][0]["cliMsgIdUndo"], 88);
+
+        let fm1 = forward_multi_direct_payload(&[("11".into(), 1), ("22".into(), 2)], "hi", "im1");
+        assert_eq!(fm1["totalIds"], 2);
+        assert_eq!(fm1["msgType"], "1");
+        assert_eq!(fm1["toIds"][0]["toUid"], "11");
+        let fm2 = forward_multi_group_payload(&[("g_88".into(), 3)], "hi");
+        assert_eq!(fm2["totalIds"], 1);
+        assert_eq!(fm2["msgType"], "1");
+        assert_eq!(fm2["grids"][0]["grid"], "88");
     }
 }

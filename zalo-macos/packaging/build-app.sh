@@ -52,5 +52,7 @@ codesign --force --deep --sign - "$STAGE"
 ZIP="$ROOT/dist/Zalo-${VERSION}-macos-${RUST_TARGET}.zip"
 rm -f "$ZIP"
 ditto -c -k --keepParent "$STAGE" "$ZIP"
+(cd "$ROOT/dist" && shasum -a 256 "$(basename "$ZIP")" > SHA256SUMS-macos.txt)
 echo "wrote $STAGE"
 echo "wrote $ZIP"
+echo "wrote $ROOT/dist/SHA256SUMS-macos.txt"

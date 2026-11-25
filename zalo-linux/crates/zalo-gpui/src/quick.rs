@@ -438,7 +438,7 @@ impl ShellView {
     ) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let blue = token_rgb("--B55", "#0068ff");
+        let blue = crate::color::link_fg();
         let red = token_rgb("--R60", "#c31818");
         let chip_bg = token_rgb("--N20", "#eaedf0");
         let line = crate::color::border_subtle();

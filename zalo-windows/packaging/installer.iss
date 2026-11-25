@@ -27,6 +27,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#MyOutputDir}
 OutputBaseFilename=Zalo-{#MyAppVersion}-windows-{#MyArch}-setup
 WizardStyle=modern
+CloseApplications=yes
+RestartApplications=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

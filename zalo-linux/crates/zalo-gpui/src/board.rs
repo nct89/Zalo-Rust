@@ -125,6 +125,10 @@ pub struct BoardDlg {
     pub(crate) poll_add: bool,
     /// Hide voter names.
     pub(crate) poll_anon: bool,
+    /// Poll id currently showing the inline "+ Thêm phương án" input.
+    pub(crate) adding_poll_id: Option<i64>,
+    /// Inline input for adding a new option to an existing poll.
+    pub(crate) add_poll_opt_input: Entity<LineInput>,
     /// Set while "Edit" is rewriting an existing group note or reminder.
     pub(crate) editing_id: Option<String>,
     /// Topic type of the item being edited.
@@ -445,6 +449,7 @@ impl ShellView {
             cx.new(|cx| LineInput::new(cx, "Phương án 2")),
             cx.new(|cx| LineInput::new(cx, "Phương án 3 (tuỳ chọn)")),
         ];
+        let add_poll_opt_input = cx.new(|cx| LineInput::new(cx, "Nhập phương án mới…"));
         let dlg = BoardDlg {
             thread_id: conv.thread_id.clone(),
             is_group: conv.is_group,
@@ -462,6 +467,8 @@ impl ShellView {
             poll_multi: false,
             poll_add: true,
             poll_anon: false,
+            adding_poll_id: None,
+            add_poll_opt_input,
             editing_id: None,
             editing_type: 0,
             editing_start: 0,
@@ -858,6 +865,82 @@ impl ShellView {
         .detach();
     }
 
+    /// Adds one new option to an existing open poll via `/api/poll/vote`.
+    pub(crate) fn submit_add_poll_option(&mut self, poll_id: i64, cx: &mut Context<Self>) {
+        let Some(crate::dialogs::Dialog::Board(d)) = &mut self.dialog else {
+            return;
+        };
+        let text = d.add_poll_opt_input.read(cx).text().trim().to_owned();
+        if text.is_empty() {
+            d.error = Some("Vui lòng nhập nội dung phương án mới".into());
+            return;
+        }
+        let voted_ids: Vec<i64> = d
+            .items
+            .iter()
+            .find(|it| it.poll_id == Some(poll_id))
+            .map(|it| {
+                it.options
+                    .iter()
+                    .filter(|o| o.voted && o.id > 0)
+                    .map(|o| o.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !self.has_session || cfg!(test) {
+            if let Some(item) = d.items.iter_mut().find(|it| it.poll_id == Some(poll_id)) {
+                let next_id = item.options.iter().map(|o| o.id).max().unwrap_or(0) + 1;
+                item.options.push(PollOption {
+                    id: next_id,
+                    content: text,
+                    votes: 0,
+                    voted: false,
+                });
+            }
+            d.add_poll_opt_input.update(cx, |i, cx| i.clear(cx));
+            d.adding_poll_id = None;
+            d.error = None;
+            self.set_note("Đã thêm phương án bình chọn");
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let key = poll_id.to_string();
+        d.busy_ids.insert(key.clone());
+        d.error = None;
+        cx.spawn(async move |this, cx| {
+            let new_opts = vec![text];
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.add_poll_options(poll_id, &new_opts, &voted_ids)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(crate::dialogs::Dialog::Board(d)) = &mut view.dialog {
+                    d.busy_ids.remove(&key);
+                    match result {
+                        Ok(()) => {
+                            d.add_poll_opt_input.update(cx, |i, cx| i.clear(cx));
+                            d.adding_poll_id = None;
+                            view.set_note("Đã thêm phương án bình chọn");
+                            view.refresh_board_dialog(cx);
+                        }
+                        Err(e) => d.error = Some(e),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Open the create form prefilled so "Save" calls `updatev2` instead of create.
     pub(crate) fn begin_board_edit(&mut self, item: &BoardItem, cx: &mut Context<Self>) {
         let Some(crate::dialogs::Dialog::Board(b)) = &mut self.dialog else {
@@ -1110,7 +1193,11 @@ impl ShellView {
                             .text_size(px(12.))
                             .font_family(FAMILY_SEMIBOLD)
                             .bg(rgb(if on { blue } else { subtle }))
-                            .text_color(rgb(if on { 0xffffff } else { ink }))
+                            .text_color(rgb(if on {
+                                crate::color::on_accent_fg()
+                            } else {
+                                ink
+                            }))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 if let Some(crate::dialogs::Dialog::Board(b)) = &mut this.dialog {
                                     b.tab = tab;
@@ -1198,7 +1285,11 @@ impl ShellView {
                                         .rounded(px(6.))
                                         .cursor_pointer()
                                         .bg(rgb(if on { blue } else { subtle }))
-                                        .text_color(rgb(if on { 0xffffff } else { ink }))
+                                        .text_color(rgb(if on {
+                                            crate::color::on_accent_fg()
+                                        } else {
+                                            ink
+                                        }))
                                         .text_size(px(12.5))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Some(crate::dialogs::Dialog::Board(b)) =
@@ -1237,7 +1328,11 @@ impl ShellView {
                                         .rounded(px(6.))
                                         .cursor_pointer()
                                         .bg(rgb(if on { blue } else { subtle }))
-                                        .text_color(rgb(if on { 0xffffff } else { ink }))
+                                        .text_color(rgb(if on {
+                                            crate::color::on_accent_fg()
+                                        } else {
+                                            ink
+                                        }))
                                         .text_size(px(12.5))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             if let Some(crate::dialogs::Dialog::Board(b)) =
@@ -1531,7 +1626,11 @@ impl ShellView {
                                                         .hover(|s| s.bg(rgb(if on { blue } else { hover })))
                                                         .cursor_pointer()
                                                         .text_size(px(11.5))
-                                                        .text_color(rgb(if on { 0xffffff } else { blue }))
+                                                        .text_color(rgb(if on {
+                                                            crate::color::on_accent_fg()
+                                                        } else {
+                                                            blue
+                                                        }))
                                                         .on_click(cx.listener(move |this, _, _, cx| {
                                                             this.respond_board_event(&event_id, status, cx);
                                                             cx.notify();
@@ -1552,7 +1651,7 @@ impl ShellView {
                                                         .hover(|s| s.bg(rgb(hover)))
                                                         .cursor_pointer()
                                                         .text_size(px(11.5))
-                                                        .text_color(rgb(blue))
+                                                        .text_color(rgb(crate::color::link_fg()))
                                                         .on_click(cx.listener(move |this, _, _, cx| {
                                                             this.begin_board_edit(&edit_item, cx);
                                                             cx.notify();
@@ -1582,6 +1681,8 @@ impl ShellView {
                             .when(!item.options.is_empty(), |el| {
                                 let pid = item.poll_id;
                                 let closed = item.closed;
+                                let is_adding = pid.is_some() && d.adding_poll_id == pid;
+                                let add_input = d.add_poll_opt_input.clone();
                                 el.children(item.options.iter().enumerate().map(|(oi, opt)| {
                                     let oid = opt.id;
                                     let voted = opt.voted;
@@ -1615,6 +1716,97 @@ impl ShellView {
                                         .child(div().text_size(px(13.)).text_color(rgb(ink)).child(opt.content.clone()))
                                         .child(div().text_size(px(12.)).text_color(rgb(muted)).child(format!("{} phiếu", opt.votes)))
                                 }))
+                                .when(!closed && pid.is_some() && !is_adding, |el| {
+                                    let poll_id = pid.unwrap_or(0);
+                                    el.child(
+                                        div()
+                                            .id(("poll-add-open", i as u64))
+                                            .mt(px(2.))
+                                            .px(px(10.))
+                                            .py(px(5.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(paper))
+                                            .hover(|s| s.bg(rgb(hover)))
+                                            .border_1()
+                                            .border_color(border_subtle())
+                                            .cursor_pointer()
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(crate::color::link_fg()))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(crate::dialogs::Dialog::Board(b)) =
+                                                    &mut this.dialog
+                                                {
+                                                    b.adding_poll_id = Some(poll_id);
+                                                    b.add_poll_opt_input
+                                                        .update(cx, |inp, cx| inp.clear(cx));
+                                                    b.error = None;
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child("+ Thêm phương án"),
+                                    )
+                                })
+                                .when(is_adding, |el| {
+                                    let poll_id = pid.unwrap_or(0);
+                                    el.child(
+                                        div()
+                                            .mt(px(4.))
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .px(px(8.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(paper))
+                                                    .border_1()
+                                                    .border_color(border_subtle())
+                                                    .child(add_input),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("poll-add-save", i as u64))
+                                                    .px(px(10.))
+                                                    .py(px(6.))
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(crate::color::accent_bg()))
+                                                    .text_color(rgb(crate::color::on_accent_fg()))
+                                                    .text_size(px(12.))
+                                                    .font_family(FAMILY_SEMIBOLD)
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.submit_add_poll_option(poll_id, cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .child("Thêm"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("poll-add-cancel", i as u64))
+                                                    .px(px(8.))
+                                                    .py(px(6.))
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(paper))
+                                                    .hover(|s| s.bg(rgb(hover)))
+                                                    .text_color(rgb(muted))
+                                                    .text_size(px(12.))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        if let Some(crate::dialogs::Dialog::Board(b)) =
+                                                            &mut this.dialog
+                                                        {
+                                                            b.adding_poll_id = None;
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("Hủy"),
+                                            ),
+                                    )
+                                })
                             })
                     }))
                     .into_any_element()

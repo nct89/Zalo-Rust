@@ -506,9 +506,11 @@ async fn run_sync_job(
         .await;
 
         if let Err(e) = conv_out {
-            conv_db
-                .close(transport.as_ref(), DisposeReason::Error)
-                .await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                conv_db.close(transport.as_ref(), DisposeReason::Error),
+            )
+            .await;
             return Err(e);
         }
 
@@ -561,6 +563,16 @@ async fn run_sync_job(
             g2pc.len(),
             thread_records.len()
         );
+        let latest_by_thread: HashMap<String, i64> = {
+            let sp = store_path.clone();
+            tokio::task::spawn_blocking(move || {
+                LocalStore::open(&sp)
+                    .and_then(|s| s.latest_sent_at_by_thread())
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default()
+        };
         if !thread_records.is_empty() {
             let store_path_threads = store_path.clone();
             let _ = tokio::task::spawn_blocking(move || {
@@ -576,186 +588,192 @@ async fn run_sync_job(
                 }
             })
             .await;
-            let _ = ui_tx.unbounded_send(SyncUiEvent::DataUpdated);
+            if latest_by_thread.is_empty() {
+                let _ = ui_tx.unbounded_send(SyncUiEvent::DataUpdated);
+            }
         }
 
         // Build MissingMessageRange list for Step 2 (`sync_other_messages_macro`).
-        let ranges: Vec<MissingMessageRange> = all_convs
-            .iter()
-            .filter_map(|c| {
-                let pc_tid = g2pc.get(&c.conv_id)?.clone();
-                let is_group = c.conv_type == ConvType::Group;
-                Some(MissingMessageRange {
-                    conv_id: pc_tid,
-                    global_noised_id: c.conv_id.clone(),
-                    is_group,
-                    from_ts: 0,
-                    to_ts: JS_MAX_SAFE_INTEGER,
-                })
-            })
-            .collect();
-
-        if ranges.is_empty() {
-            return Ok((all_convs.len(), 0usize));
-        }
-
-        // Dedicated serialized SQLite writer thread: opens `LocalStore` ONCE, commits each batch
-        // in a single transaction (no per-message fsync storm or SQLITE_BUSY contention), never
-        // blocks Tokio worker threads, and throttles `DataUpdated` UI refreshes to <= 1 per 2s.
-        let (db_tx, db_rx) = std::sync::mpsc::channel::<Vec<(MessageRecord, Option<String>)>>();
-        let store_path_writer = store_path.clone();
-        let ui_data = ui_tx.clone();
-        let writer_handle = std::thread::Builder::new()
-            .name("zalo-sync-db-writer".into())
-            .spawn(move || -> usize {
-                let mut store = match LocalStore::open(&store_path_writer) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        eprintln!("zalo-gpui sync2: open store for messages failed: {err}");
-                        return 0;
-                    }
-                };
-                let mut total_inserted = 0usize;
-                let mut pending_notify = false;
-                let mut last_notify = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(5))
-                    .unwrap_or_else(std::time::Instant::now);
-                while let Ok(batch) = db_rx.recv() {
-                    match store.insert_messages_batch(&batch) {
-                        Ok(n) => {
-                            if n > 0 {
-                                total_inserted += n;
-                                pending_notify = true;
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("zalo-gpui sync2: insert_messages_batch failed: {err}");
-                        }
-                    }
-                    if pending_notify
-                        && last_notify.elapsed() >= std::time::Duration::from_secs(2)
-                    {
-                        let _ = ui_data.unbounded_send(SyncUiEvent::DataUpdated);
-                        pending_notify = false;
-                        last_notify = std::time::Instant::now();
-                    }
-                }
-                if pending_notify {
-                    let _ = ui_data.unbounded_send(SyncUiEvent::DataUpdated);
-                }
-                total_inserted
-            })
-            .ok();
-
-        // Async sender-ID resolver stage between `on_messages` and the SQLite writer thread:
-        // resolves unknown group-member global noise IDs via `/api/gid/decrypt` (cached across
-        // batches) so synced group messages keep real PC sender UIDs instead of raw global IDs.
-        let (raw_tx, mut raw_rx) = tokio_mpsc::unbounded_channel::<(String, bool, Vec<SyncMessage>)>();
-        let api_resolve = Arc::clone(&api);
-        let self_uid_res = self_uid.clone();
-        let self_gid_res = self_global_id.clone();
-        let resolver_handle = tokio::spawn(async move {
-            let mut g2pc_map = g2pc;
-            let mut unresolved: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            while let Some((thread_id, is_group, msgs)) = raw_rx.recv().await {
-                if is_group {
-                    let mut need: Vec<String> = Vec::new();
-                    let mut seen: std::collections::HashSet<&str> =
-                        std::collections::HashSet::new();
-                    for msg in &msgs {
-                        let s = msg.sender_id.trim();
-                        if s.is_empty()
-                            || s == "0"
-                            || s == self_uid_res
-                            || (!self_gid_res.is_empty() && s == self_gid_res)
-                            || g2pc_map.contains_key(s)
-                            || unresolved.contains(s)
-                            || !seen.insert(s)
-                        {
-                            continue;
-                        }
-                        need.push(s.to_owned());
-                    }
-                    if !need.is_empty() {
-                        for chunk in need.chunks(50) {
-                            if let Ok(val) = api_resolve.get_uids_from_global_noise_ids(chunk).await
-                            {
-                                for (k, v) in crate::noise_id::parse_gid_map(&val) {
-                                    g2pc_map.insert(k, v);
-                                }
-                            }
-                            for s in chunk {
-                                if !g2pc_map.contains_key(s) {
-                                    unresolved.insert(s.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-                let items = build_synced_message_records(
-                    &thread_id,
-                    is_group,
-                    &self_uid_res,
-                    &self_gid_res,
-                    &g2pc_map,
-                    &msgs,
-                );
-                if !items.is_empty() {
-                    let _ = db_tx.send(items);
-                }
-            }
-        });
-
-        let ui_prog = ui_tx.clone();
-        let on_messages = Arc::new(move |range: &MissingMessageRange, msgs: Vec<SyncMessage>| {
-            if !msgs.is_empty() {
-                let _ = raw_tx.send((range.conv_id.clone(), range.is_group, msgs));
-            }
-        });
-
-        let on_progress = Arc::new(
-            move |_completed: usize, _total: usize, percent: Option<u8>, _msgs: usize| {
-                let _ = ui_prog.unbounded_send(SyncUiEvent::Progress { percent });
-            },
+        // On post-login `AutoSync`, only fetch conversations with messages newer than what is
+        // already persisted in `store.db` (incremental delta), avoiding a full 100 MB+ re-sync
+        // on every QR scan.
+        let ranges = build_sync_ranges(&all_convs, &g2pc, &latest_by_thread, source);
+        eprintln!(
+            "zalo-gpui sync2: source={source:?} local_threads={} delta_ranges={}",
+            latest_by_thread.len(),
+            ranges.len()
         );
 
-        let msg_res = sync_other_messages_macro(
-            Arc::clone(&msg_db),
-            Arc::clone(&transport),
-            Arc::clone(&wasm),
-            &cfg,
-            ranges,
-            Arc::clone(&cancel_flag),
-            on_messages.clone(),
-            on_progress,
-        )
-        .await;
-
-        // Drop `on_messages` (closing `raw_tx`), wait for the sender resolver to drain (closing
-        // `db_tx`), then join the SQLite writer thread cleanly.
-        drop(on_messages);
-        let _ = resolver_handle.await;
-        let saved = if let Some(handle) = writer_handle {
-            tokio::task::spawn_blocking(move || handle.join().unwrap_or(0))
-                .await
-                .unwrap_or(0)
+        let (saved, msg_res) = if ranges.is_empty() {
+            (0usize, Ok(()))
         } else {
-            0
+            // Dedicated serialized SQLite writer thread: opens `LocalStore` ONCE, commits each
+            // batch in a single transaction, and throttles `DataUpdated` refreshes to <= 1 per 8s.
+            let (db_tx, db_rx) = std::sync::mpsc::channel::<Vec<(MessageRecord, Option<String>)>>();
+            let store_path_writer = store_path.clone();
+            let ui_data = ui_tx.clone();
+            let writer_handle = std::thread::Builder::new()
+                .name("zalo-sync-db-writer".into())
+                .spawn(move || -> usize {
+                    let mut store = match LocalStore::open(&store_path_writer) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            eprintln!("zalo-gpui sync2: open store for messages failed: {err}");
+                            return 0;
+                        }
+                    };
+                    let mut total_inserted = 0usize;
+                    let mut pending_notify = false;
+                    let mut last_notify = std::time::Instant::now();
+                    while let Ok(batch) = db_rx.recv() {
+                        match store.insert_messages_batch(&batch) {
+                            Ok(n) => {
+                                if n > 0 {
+                                    total_inserted += n;
+                                    pending_notify = true;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("zalo-gpui sync2: insert_messages_batch failed: {err}");
+                            }
+                        }
+                        if pending_notify
+                            && last_notify.elapsed() >= std::time::Duration::from_secs(8)
+                        {
+                            let _ = ui_data.unbounded_send(SyncUiEvent::DataUpdated);
+                            pending_notify = false;
+                            last_notify = std::time::Instant::now();
+                        }
+                    }
+                    total_inserted
+                })
+                .ok();
+
+            // Async sender-ID resolver stage between `on_messages` and the SQLite writer thread:
+            // resolves unknown group-member global noise IDs via `/api/gid/decrypt` (cached across
+            // batches) so synced group messages keep real PC sender UIDs instead of raw global IDs.
+            let (raw_tx, mut raw_rx) =
+                tokio_mpsc::unbounded_channel::<(String, bool, Vec<SyncMessage>)>();
+            let api_resolve = Arc::clone(&api);
+            let self_uid_res = self_uid.clone();
+            let self_gid_res = self_global_id.clone();
+            let resolver_handle = tokio::spawn(async move {
+                let mut g2pc_map = g2pc;
+                let mut unresolved: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                while let Some((thread_id, is_group, msgs)) = raw_rx.recv().await {
+                    if is_group {
+                        let mut need: Vec<String> = Vec::new();
+                        let mut seen: std::collections::HashSet<&str> =
+                            std::collections::HashSet::new();
+                        for msg in &msgs {
+                            let s = msg.sender_id.trim();
+                            if s.is_empty()
+                                || s == "0"
+                                || s == self_uid_res
+                                || (!self_gid_res.is_empty() && s == self_gid_res)
+                                || g2pc_map.contains_key(s)
+                                || unresolved.contains(s)
+                                || !seen.insert(s)
+                            {
+                                continue;
+                            }
+                            need.push(s.to_owned());
+                        }
+                        if !need.is_empty() {
+                            for chunk in need.chunks(50) {
+                                if let Ok(val) =
+                                    api_resolve.get_uids_from_global_noise_ids(chunk).await
+                                {
+                                    for (k, v) in crate::noise_id::parse_gid_map(&val) {
+                                        g2pc_map.insert(k, v);
+                                    }
+                                }
+                                for s in chunk {
+                                    if !g2pc_map.contains_key(s) {
+                                        unresolved.insert(s.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let items = build_synced_message_records(
+                        &thread_id,
+                        is_group,
+                        &self_uid_res,
+                        &self_gid_res,
+                        &g2pc_map,
+                        &msgs,
+                    );
+                    if !items.is_empty() {
+                        let _ = db_tx.send(items);
+                    }
+                }
+            });
+
+            let ui_prog = ui_tx.clone();
+            let on_messages =
+                Arc::new(move |range: &MissingMessageRange, msgs: Vec<SyncMessage>| {
+                    if !msgs.is_empty() {
+                        let _ = raw_tx.send((range.conv_id.clone(), range.is_group, msgs));
+                    }
+                });
+
+            let last_pct = Arc::new(std::sync::atomic::AtomicU8::new(u8::MAX));
+            let on_progress = Arc::new(
+                move |_completed: usize, _total: usize, percent: Option<u8>, _msgs: usize| {
+                    if let Some(p) = percent {
+                        let prev = last_pct.swap(p, Ordering::Relaxed);
+                        if prev != p {
+                            let _ = ui_prog.unbounded_send(SyncUiEvent::Progress {
+                                percent: Some(p),
+                            });
+                        }
+                    }
+                },
+            );
+
+            let res = sync_other_messages_macro(
+                Arc::clone(&msg_db),
+                Arc::clone(&transport),
+                Arc::clone(&wasm),
+                &cfg,
+                ranges,
+                Arc::clone(&cancel_flag),
+                on_messages.clone(),
+                on_progress,
+            )
+            .await;
+
+            // Drop `on_messages` (closing `raw_tx`), wait for the sender resolver to drain (closing
+            // `db_tx`), then join the SQLite writer thread cleanly.
+            drop(on_messages);
+            let _ = resolver_handle.await;
+            let n_saved = if let Some(handle) = writer_handle {
+                tokio::task::spawn_blocking(move || handle.join().unwrap_or(0))
+                    .await
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            (n_saved, res.map(|_| ()))
         };
 
-        // Also sync "My Documents" (`send2me_id`) from Zalo's cloud message server
-        // (`/api/cm/getrecentv2` + `/api/cm/getoldv2` with `isOA: 1`), since mobile Sync 2
-        // does not include My Documents.
+        // Also sync "My Documents" (`send2me_id`) from Zalo's cloud message server.
+        // On repeat `AutoSync` logins where local history already exists, fetch recent messages
+        // only instead of re-paginating the entire cloud history every login.
         let my_docs_saved = if !cancel_flag.load(Ordering::SeqCst) && !self_uid.is_empty() {
-            let docs =
-                crate::realtime::sync_my_documents_cloud(&api, &store_path, &self_uid, 50, true)
-                    .await;
-            let n = docs.len();
-            if n > 0 {
-                let _ = ui_tx.unbounded_send(SyncUiEvent::DataUpdated);
-            }
-            n
+            let full_docs =
+                source == SyncSource::Manual || !latest_by_thread.contains_key(&self_uid);
+            let docs = crate::realtime::sync_my_documents_cloud(
+                &api,
+                &store_path,
+                &self_uid,
+                50,
+                full_docs,
+            )
+            .await;
+            docs.len()
         } else {
             0
         };
@@ -767,7 +785,16 @@ async fn run_sync_job(
         } else {
             DisposeReason::SyncSuccess
         };
-        msg_db.close(transport.as_ref(), reason).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            msg_db.close(transport.as_ref(), reason),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conv_db.close(transport.as_ref(), reason),
+        )
+        .await;
 
         if let Err(fail) = msg_res {
             return Err(SyncSessionError::Remote {
@@ -813,6 +840,49 @@ async fn run_sync_job(
             can_retry: true,
         }),
     }
+}
+
+/// Builds Step 2 message ranges.
+///
+/// For `SyncSource::AutoSync` (post-QR login `transfer_after_login`), threads that already have
+/// messages persisted in `store.db` up to `conv.last_ts` are skipped, and threads with newer
+/// messages request only the delta since `max_local_ts - 60s` instead of re-syncing from `0`.
+/// For `SyncSource::Manual`, every resolved conversation requests full history.
+fn build_sync_ranges(
+    all_convs: &[SyncConversation],
+    g2pc: &HashMap<String, String>,
+    latest_by_thread: &HashMap<String, i64>,
+    source: SyncSource,
+) -> Vec<MissingMessageRange> {
+    const DELTA_OVERLAP_MS: u64 = 60_000;
+    all_convs
+        .iter()
+        .filter_map(|c| {
+            let pc_tid = g2pc.get(&c.conv_id)?.clone();
+            let is_group = c.conv_type == ConvType::Group;
+            let from_ts = if source == SyncSource::AutoSync {
+                match latest_by_thread.get(&pc_tid).copied().filter(|&ts| ts > 0) {
+                    Some(local_max) => {
+                        let local_u64 = local_max as u64;
+                        if c.last_ts <= local_u64 {
+                            return None;
+                        }
+                        local_u64.saturating_sub(DELTA_OVERLAP_MS)
+                    }
+                    None => 0,
+                }
+            } else {
+                0
+            };
+            Some(MissingMessageRange {
+                conv_id: pc_tid,
+                global_noised_id: c.conv_id.clone(),
+                is_group,
+                from_ts,
+                to_ts: JS_MAX_SAFE_INTEGER,
+            })
+        })
+        .collect()
 }
 
 /// Converts one range's decrypted [`SyncMessage`]s into `(MessageRecord, Option<attachment_json>)`
@@ -1046,7 +1116,7 @@ impl ShellView {
                                 };
                             }
                             SyncUiEvent::DataUpdated => {
-                                view.reload_from_store();
+                                view.reload_from_store_async(false, cx);
                             }
                             SyncUiEvent::Completed {
                                 conv_count,
@@ -1058,7 +1128,9 @@ impl ShellView {
                                     conv_count,
                                     msg_count,
                                 };
-                                view.reload_from_store();
+                                if msg_count > 0 || view.convs.is_empty() {
+                                    view.reload_from_store_async(true, cx);
+                                }
                             }
                             SyncUiEvent::Cancelled => {
                                 view.sync_ui.running = false;
@@ -1085,13 +1157,13 @@ impl ShellView {
     /// Sidebar Sync 2 status banner rendered below `list_tabs` and above `conv_rows`.
     pub(crate) fn sync_banner_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let dark = crate::color::is_dark();
-        let bg = if dark { 0x1e_29_3b } else { 0xe8_f2_ff };
+        let bg = if dark { 0x1e_1e_1e } else { 0xe8_f2_ff };
         let err_bg = if dark { 0x3b_1f_22 } else { 0xfd_ed_ed };
         let ok_bg = if dark { 0x17_33_26 } else { 0xe8_f7_ee };
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let blue = token_rgb("--B55", "#0068ff");
-        let border = if dark { 0x33_41_55 } else { 0xc7_dd_ff };
+        let border = if dark { 0x30_30_30 } else { 0xc7_dd_ff };
 
         match &self.sync_ui.banner {
             SyncBannerState::Hidden => None,
@@ -1134,7 +1206,7 @@ impl ShellView {
                                     .rounded(px(4.))
                                     .bg(rgb(blue))
                                     .text_size(px(12.))
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.sync_ui.wakeup();
@@ -1309,7 +1381,7 @@ impl ShellView {
                                             .rounded(px(4.))
                                             .bg(rgb(blue))
                                             .text_size(px(12.))
-                                            .text_color(rgb(0xff_ff_ff))
+                                            .text_color(rgb(crate::color::on_accent_fg()))
                                             .cursor_pointer()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.start_manual_sync(cx);
@@ -1427,5 +1499,47 @@ mod tests {
         );
         assert_eq!(grp[0].0.sender_id.as_deref(), Some("2002"));
         assert_eq!(grp[0].0.body, "test");
+    }
+
+    #[test]
+    fn auto_sync_builds_incremental_delta_ranges_only() {
+        let mut g2pc = HashMap::new();
+        g2pc.insert("gc1".into(), "u1".into());
+        g2pc.insert("gc2".into(), "u2".into());
+        g2pc.insert("gc3".into(), "g_3".into());
+        let convs = vec![
+            SyncConversation {
+                conv_id: "gc1".into(),
+                conv_type: ConvType::OneOne,
+                last_ts: 1_700_000_000_000,
+                ..SyncConversation::default()
+            },
+            SyncConversation {
+                conv_id: "gc2".into(),
+                conv_type: ConvType::OneOne,
+                last_ts: 1_700_000_500_000,
+                ..SyncConversation::default()
+            },
+            SyncConversation {
+                conv_id: "gc3".into(),
+                conv_type: ConvType::Group,
+                last_ts: 1_700_000_900_000,
+                ..SyncConversation::default()
+            },
+        ];
+        let mut latest = HashMap::new();
+        latest.insert("u1".into(), 1_700_000_000_000); // already up to date -> skip
+        latest.insert("u2".into(), 1_700_000_100_000); // has newer msgs -> delta
+
+        let auto = build_sync_ranges(&convs, &g2pc, &latest, SyncSource::AutoSync);
+        assert_eq!(auto.len(), 2);
+        assert_eq!(auto[0].conv_id, "u2");
+        assert_eq!(auto[0].from_ts, 1_700_000_040_000);
+        assert_eq!(auto[1].conv_id, "g_3");
+        assert_eq!(auto[1].from_ts, 0);
+
+        let manual = build_sync_ranges(&convs, &g2pc, &latest, SyncSource::Manual);
+        assert_eq!(manual.len(), 3);
+        assert!(manual.iter().all(|r| r.from_ts == 0));
     }
 }

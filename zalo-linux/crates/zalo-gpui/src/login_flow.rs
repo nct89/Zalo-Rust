@@ -233,6 +233,8 @@ pub fn is_session_error(err: &str) -> bool {
         || err.contains("returned 600")
         || err.contains("returned -69")
         || err.contains("zpw_sek")
+        || (err.contains("session I/O failed")
+            && (err.contains("No such file") || err.contains("os error 2")))
 }
 
 #[cfg(test)]
@@ -248,6 +250,9 @@ mod tests {
             "friends: Zalo returned 600: phiên đã kết thúc"
         ));
         assert!(is_session_error("poll: Zalo returned -69: logout"));
+        assert!(is_session_error(
+            "session I/O failed: No such file or directory (os error 2)"
+        ));
         assert!(!is_session_error("timeout"));
         assert!(!is_session_error("close 3003"));
     }

@@ -11,8 +11,8 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, hsla, img, prelude::*, px, rgb, ClickEvent, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    div, img, prelude::*, px, rgb, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
+    ParentElement, StatefulInteractiveElement, Styled,
 };
 use serde_json::Value;
 
@@ -58,6 +58,8 @@ pub enum Dialog {
     GroupCall(GroupCallPicker),
     /// Info panel "Group Management".
     GroupManage(crate::account::GroupManageDlg),
+    /// Conversation auto-delete TTL picker (`/api/conv/autodelete/updateConvers`).
+    AutoDelete(crate::account::AutoDeleteDlg),
     /// Account menu "Your Profile".
     Profile(crate::account::ProfileDlg),
     /// Clicking a `@mention` or peer opens their Zalo account info card.
@@ -86,6 +88,8 @@ pub enum Dialog {
     HiddenGuide(String),
     /// "About / Version info" dialog (from Settings › Help › Version info or titlebar badge).
     About,
+    /// In-app auto-update notification & one-click installer popup.
+    UpdateAvailable,
     /// "Contact / Support" dialog (from Settings › Help › Contact).
     Contact,
 }
@@ -629,6 +633,7 @@ impl ShellView {
             Some(Dialog::GroupManage(_)) | Some(Dialog::Board(_)) => {
                 return div().into_any_element();
             }
+            Some(Dialog::AutoDelete(a)) => self.auto_delete_el(a, cx).into_any_element(),
             Some(Dialog::Profile(p)) => self.profile_el(p, cx).into_any_element(),
             Some(Dialog::UserInfo(u)) => self.user_info_el(u, cx).into_any_element(),
             Some(Dialog::BackupDecrypt(b)) => self.backup_decrypt_el(b, cx).into_any_element(),
@@ -642,6 +647,7 @@ impl ShellView {
             Some(Dialog::TwoFactorOtp(t)) => self.two_factor_el(t, cx).into_any_element(),
             Some(Dialog::HiddenGuide(name)) => self.hidden_guide_el(name, cx).into_any_element(),
             Some(Dialog::About) => self.about_el(cx).into_any_element(),
+            Some(Dialog::UpdateAvailable) => self.update_available_el(cx).into_any_element(),
             Some(Dialog::Contact) => self.contact_el(cx).into_any_element(),
             None => return div().into_any_element(),
         };
@@ -657,6 +663,11 @@ impl ShellView {
                     .occlude()
                     .bg(crate::color::modal_scrim())
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if matches!(this.dialog, Some(Dialog::UpdateAvailable))
+                            && this.update_install.is_busy()
+                        {
+                            return;
+                        }
                         this.dialog = None;
                         cx.notify();
                     })),
@@ -1064,7 +1075,7 @@ impl ShellView {
                         .child(
                             div()
                                 .text_color(if member {
-                                    hsla(0.6, 0.9, 0.5, 0.35)
+                                    crate::color::accent_disabled_bg()
                                 } else if on {
                                     rgb(blue).into()
                                 } else {
@@ -1289,7 +1300,11 @@ impl ShellView {
                                     .text_size(px(13.))
                                     .font_family(FAMILY_SEMIBOLD)
                                     .bg(rgb(if label_filter.is_none() { blue } else { field }))
-                                    .text_color(rgb(if label_filter.is_none() { 0xffffff } else { ink }))
+                                    .text_color(rgb(if label_filter.is_none() {
+                                        crate::color::on_accent_fg()
+                                    } else {
+                                        ink
+                                    }))
                                     .when(label_filter.is_some(), |el| {
                                         el.hover(move |st| st.bg(rgb(hover)))
                                     })
@@ -1318,7 +1333,11 @@ impl ShellView {
                                     .cursor_pointer()
                                     .text_size(px(13.))
                                     .bg(rgb(if on { blue } else { field }))
-                                    .text_color(rgb(if on { 0xffffff } else { ink }))
+                                    .text_color(rgb(if on {
+                                        crate::color::on_accent_fg()
+                                    } else {
+                                        ink
+                                    }))
                                     .when(!on, |el| el.hover(move |st| st.bg(rgb(hover))))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Some(Dialog::Group(g)) = this.dialog.as_mut() {
@@ -1335,7 +1354,11 @@ impl ShellView {
                                             div()
                                                 .size(px(8.))
                                                 .rounded(px(4.))
-                                                .bg(rgb(if on { 0xffffff } else { c })),
+                                                .bg(rgb(if on {
+                                                    crate::color::on_accent_fg()
+                                                } else {
+                                                    c
+                                                })),
                                         )
                                     })
                                     .child(label.text.clone())
@@ -1819,14 +1842,107 @@ impl ShellView {
             return;
         };
         let note = s.note.read(cx).text();
+        let note_trimmed = note.trim().to_owned();
         let msgs = s.msgs;
         let back = self.selected;
-        let mut sent = 0;
-        for id in s.picked {
-            let Some(dest) = self.conv(id).cloned() else {
-                continue;
-            };
-            self.select_conv(id);
+        let dests: Vec<crate::data::ChatConv> = s
+            .picked
+            .iter()
+            .filter_map(|id| self.conv(*id).cloned())
+            .collect();
+        if dests.is_empty() {
+            return;
+        }
+        let sent = dests.len();
+        if dests.len() >= 2 {
+            // Batch text forwards via `/api/message/mforward` & `/api/group/mforward`.
+            let now = crate::data::now_ms();
+            let mut cli_cursor = (now.max(1) as u64).saturating_mul(10);
+            let live_targets: Vec<(String, bool)> = dests
+                .iter()
+                .filter(|d| d.live)
+                .map(|d| (d.thread_id.clone(), d.is_group))
+                .collect();
+            let you = crate::color::str_vi("STR_YOU", "Bạn").to_owned();
+            let me_uid = self.self_uid().unwrap_or_default().to_owned();
+            for msg in &msgs {
+                let local = msg.media_path.clone().filter(|p| p.is_file());
+                match (msg.kind, local) {
+                    (
+                        crate::media::MsgKind::Photo
+                        | crate::media::MsgKind::Gif
+                        | crate::media::MsgKind::Doodle,
+                        Some(path),
+                    ) => {
+                        for dest in &dests {
+                            self.select_conv(dest.id);
+                            self.send_photo_now(path.clone(), "");
+                        }
+                    }
+                    (crate::media::MsgKind::File, Some(path)) => {
+                        for dest in &dests {
+                            self.select_conv(dest.id);
+                            self.send_file_now(path.clone());
+                        }
+                    }
+                    _ => {
+                        let base_cid = cli_cursor;
+                        for (i, dest) in dests.iter().enumerate() {
+                            let cid = base_cid.saturating_add(i as u64);
+                            self.push_message(crate::data::ChatMsg::text_msg(
+                                0,
+                                dest.id,
+                                dest.thread_id.clone(),
+                                true,
+                                you.clone(),
+                                me_uid.clone(),
+                                msg.text.clone(),
+                                crate::data::vn_hm(now),
+                                now,
+                                Some(cid as i64),
+                                None,
+                            ));
+                        }
+                        cli_cursor = base_cid.saturating_add(dests.len() as u64 + 1);
+                        if !live_targets.is_empty() {
+                            self.maybe_live(crate::bridge::LiveAction::ForwardMulti {
+                                targets: live_targets.clone(),
+                                text: msg.text.clone(),
+                                base_client_id: base_cid,
+                            });
+                        }
+                    }
+                }
+            }
+            if !note_trimmed.is_empty() {
+                let base_cid = cli_cursor;
+                for (i, dest) in dests.iter().enumerate() {
+                    let cid = base_cid.saturating_add(i as u64);
+                    self.push_message(crate::data::ChatMsg::text_msg(
+                        0,
+                        dest.id,
+                        dest.thread_id.clone(),
+                        true,
+                        you.clone(),
+                        me_uid.clone(),
+                        note_trimmed.clone(),
+                        crate::data::vn_hm(now),
+                        now,
+                        Some(cid as i64),
+                        None,
+                    ));
+                }
+                if !live_targets.is_empty() {
+                    self.maybe_live(crate::bridge::LiveAction::ForwardMulti {
+                        targets: live_targets,
+                        text: note_trimmed,
+                        base_client_id: base_cid,
+                    });
+                }
+            }
+        } else {
+            let dest = &dests[0];
+            self.select_conv(dest.id);
             for msg in &msgs {
                 let local = msg.media_path.clone().filter(|p| p.is_file());
                 match (msg.kind, local) {
@@ -1837,16 +1953,15 @@ impl ShellView {
                         Some(path),
                     ) => self.send_photo_now(path, ""),
                     (crate::media::MsgKind::File, Some(path)) => self.send_file_now(path),
-                    _ => self.forward_to(&dest, msg),
+                    _ => self.forward_to(dest, msg),
                 }
             }
-            if let (false, Some(first)) = (note.trim().is_empty(), msgs.first()) {
+            if let (false, Some(first)) = (note_trimmed.is_empty(), msgs.first()) {
                 let mut extra = first.clone();
                 extra.kind = crate::media::MsgKind::Text;
-                extra.text = note.trim().to_owned();
-                self.forward_to(&dest, &extra);
+                extra.text = note_trimmed;
+                self.forward_to(dest, &extra);
             }
-            sent += 1;
         }
         if let Some(id) = back {
             self.select_conv(id);
@@ -2226,7 +2341,6 @@ impl ShellView {
                                             .min_w(px(0.))
                                             .text_color(rgb(link_fg))
                                             .cursor_pointer()
-                                            .hover(|s| s.underline())
                                             .on_click(move |_, _, cx| {
                                                 cx.open_url(repo_url);
                                             })
@@ -2235,9 +2349,9 @@ impl ShellView {
                             ),
                     )
                     .when_some(self.update_info.clone(), |el, info| {
-                        let dl_url = info.download_url.clone();
                         let tag = info.tag.clone();
                         let summary = info.summary.clone();
+                        let pkg_badge = info.package_badge();
                         el.child(
                             div()
                                 .w_full()
@@ -2258,6 +2372,7 @@ impl ShellView {
                                         .flex_col()
                                         .gap(px(2.))
                                         .min_w(px(0.))
+                                        .flex_1()
                                         .child(
                                             div()
                                                 .text_size(px(13.))
@@ -2268,19 +2383,21 @@ impl ShellView {
                                                     crate::i18n::t("Có phiên bản mới:")
                                                 )),
                                         )
-                                        .when(!summary.is_empty(), |d| {
-                                            d.child(
-                                                div()
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(muted))
-                                                    .truncate()
-                                                    .child(summary),
-                                            )
-                                        }),
+                                        .child(
+                                            div()
+                                                .text_size(px(12.))
+                                                .text_color(rgb(muted))
+                                                .truncate()
+                                                .child(if summary.is_empty() {
+                                                    pkg_badge
+                                                } else {
+                                                    summary
+                                                }),
+                                        ),
                                 )
                                 .child(
                                     div()
-                                        .id("about-download-update-btn")
+                                        .id("about-install-update-btn")
                                         .flex_none()
                                         .px(px(12.))
                                         .h(px(30.))
@@ -2294,10 +2411,11 @@ impl ShellView {
                                         .font_family(FAMILY_SEMIBOLD)
                                         .text_color(rgb(primary_fg))
                                         .cursor_pointer()
-                                        .on_click(move |_, _, cx| {
-                                            cx.open_url(&dl_url);
-                                        })
-                                        .child(crate::i18n::t("Tải cập nhật")),
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.dialog = Some(Dialog::UpdateAvailable);
+                                            cx.notify();
+                                        }))
+                                        .child(crate::i18n::t("Cập nhật ngay")),
                                 ),
                         )
                     })
@@ -2326,7 +2444,6 @@ impl ShellView {
                                             .text_color(rgb(link_fg))
                                             .font_family(FAMILY_SEMIBOLD)
                                             .cursor_pointer()
-                                            .hover(|s| s.underline())
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.trigger_update_check(true, cx);
                                             }))
@@ -2367,6 +2484,466 @@ impl ShellView {
                                 cx.notify();
                             }))
                             .child(crate::color::str_vi("STR_CLOSE", "Đóng")),
+                    ),
+            )
+    }
+
+    fn update_available_el(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let link_fg = token_rgb("--text-information", "#005ae0");
+        let panel_bg = token_rgb("--layer-background-subtle", "#ebecf0");
+        let badge_bg = token_rgb("--accent-blue-bg-subtle", "#f0f7ff");
+        let primary_bg = crate::color::accent_bg();
+        let primary_hover = token_rgb("--button-primary-hover", "#005ae0");
+        let primary_fg = crate::color::on_accent_fg();
+        let sec_bg = token_rgb("--button-secondary-neutral-normal", "#e5e7eb");
+        let sec_hover = token_rgb("--button-secondary-neutral-hover", "#d6dbe1");
+        let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
+        let err_fg = token_rgb("--text-errors", "#d91b1b");
+        let track_bg = if crate::color::is_dark() {
+            0x2c_2c_2c
+        } else {
+            0xe4_e6_eb
+        };
+
+        let Some(info) = self.update_info.clone() else {
+            return div().w(px(1.));
+        };
+
+        let install_state = self.update_install.clone();
+        let busy = install_state.is_busy();
+        let supports_in_app = info.package_kind.supports_in_app_install();
+        let pkg_badge = info.package_badge();
+        let release_url = info.release_url.clone();
+        let manual_url = info.download_url.clone();
+        let tag = info.tag.clone();
+
+        let notes_text = if !info.notes.trim().is_empty() {
+            info.notes.clone()
+        } else if !info.summary.trim().is_empty() {
+            info.summary.clone()
+        } else {
+            crate::i18n::t("Phiên bản mới đã sẵn sàng để tải và cài đặt tự động.").to_owned()
+        };
+        let wrapped_notes: Vec<String> = notes_text
+            .lines()
+            .flat_map(|line| {
+                crate::media::wrap_text_at(line.trim(), 384., 12.5, false)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .take(12)
+            .collect();
+
+        let (progress_label, progress_detail, is_error) = match &install_state {
+            crate::updater::UpdateInstallState::Idle => (String::new(), String::new(), false),
+            crate::updater::UpdateInstallState::Downloading { downloaded, total } => {
+                let detail = match total {
+                    Some(t) if *t > 0 => {
+                        let pct = ((*downloaded as f64 / *t as f64) * 100.0).round() as u64;
+                        format!(
+                            "{} / {} ({}%)",
+                            crate::updater::format_bytes(*downloaded),
+                            crate::updater::format_bytes(*t),
+                            pct.min(100)
+                        )
+                    }
+                    _ => crate::updater::format_bytes(*downloaded),
+                };
+                (
+                    crate::i18n::t("Đang tải bản cập nhật...").to_owned(),
+                    detail,
+                    false,
+                )
+            }
+            crate::updater::UpdateInstallState::Verifying => (
+                crate::i18n::t("Đang xác minh toàn vẹn SHA-256...").to_owned(),
+                "84%".to_owned(),
+                false,
+            ),
+            crate::updater::UpdateInstallState::Installing { message } => {
+                (message.clone(), "92%".to_owned(), false)
+            }
+            crate::updater::UpdateInstallState::Restarting { message } => {
+                (message.clone(), "100%".to_owned(), false)
+            }
+            crate::updater::UpdateInstallState::Failed(err) => (err.clone(), String::new(), true),
+        };
+        let progress_frac = install_state.progress_fraction();
+        let show_progress = !matches!(install_state, crate::updater::UpdateInstallState::Idle);
+
+        let cta_label = match &install_state {
+            crate::updater::UpdateInstallState::Idle => {
+                if supports_in_app {
+                    crate::i18n::t("Cập nhật & khởi động lại").to_owned()
+                } else {
+                    crate::i18n::t("Mở trang tải về").to_owned()
+                }
+            }
+            crate::updater::UpdateInstallState::Downloading { downloaded, total } => match total {
+                Some(t) if *t > 0 => {
+                    let pct = ((*downloaded as f64 / *t as f64) * 100.0).round() as u64;
+                    format!("{}%", pct.min(100))
+                }
+                _ => "...".to_owned(),
+            },
+            crate::updater::UpdateInstallState::Verifying => "SHA-256...".to_owned(),
+            crate::updater::UpdateInstallState::Installing { .. } => {
+                crate::i18n::t("Đang cài đặt...").to_owned()
+            }
+            crate::updater::UpdateInstallState::Restarting { .. } => {
+                crate::i18n::t("Đang khởi động lại...").to_owned()
+            }
+            crate::updater::UpdateInstallState::Failed(_) => crate::i18n::t("Thử lại").to_owned(),
+        };
+
+        div()
+            .w(px(464.))
+            .max_w(px(520.))
+            .rounded(px(10.))
+            .overflow_hidden()
+            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
+            .border_1()
+            .border_color(crate::color::border_subtle())
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .text_color(rgb(ink))
+            // Header
+            .child(
+                div()
+                    .w_full()
+                    .h(px(52.))
+                    .px(px(16.))
+                    .border_b_1()
+                    .border_color(crate::color::border_subtle())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .when_some(crate::titlebar::zalo_title_icon(), |el, icon| {
+                                el.child(
+                                    img(icon)
+                                        .size(px(24.))
+                                        .rounded(px(6.))
+                                        .object_fit(gpui::ObjectFit::Contain),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(15.5))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .child(crate::i18n::t("Có bản cập nhật mới")),
+                            ),
+                    )
+                    .when(!busy, |el| {
+                        el.child(
+                            div()
+                                .id("update-popup-close")
+                                .size(px(28.))
+                                .rounded(px(6.))
+                                .hover(move |s| s.bg(rgb(hover_bg)))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .text_size(px(16.))
+                                .text_color(rgb(muted))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dialog = None;
+                                    cx.notify();
+                                }))
+                                .child("×"),
+                        )
+                    }),
+            )
+            // Body
+            .child(
+                div()
+                    .w_full()
+                    .px(px(18.))
+                    .py(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    // Version comparison & package badge
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(8.))
+                            .bg(rgb(panel_bg))
+                            .border_1()
+                            .border_color(crate::color::border_subtle())
+                            .px(px(14.))
+                            .py(px(12.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .px(px(8.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(badge_bg))
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(muted))
+                                            .child(crate::APP_VERSION_TAG),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(rgb(muted))
+                                            .child("→"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(9.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .bg(rgb(primary_bg))
+                                            .text_size(px(12.5))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(primary_fg))
+                                            .child(tag),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(muted))
+                                    .child(pkg_badge),
+                            ),
+                    )
+                    // Release notes
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.5))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(muted))
+                                            .child(crate::i18n::t("Có gì mới")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("update-open-github")
+                                            .text_size(px(12.))
+                                            .text_color(rgb(link_fg))
+                                            .cursor_pointer()
+                                            .on_click(move |_, _, cx| {
+                                                cx.open_url(&release_url);
+                                            })
+                                            .child(crate::i18n::t("Xem trên GitHub")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .rounded(px(8.))
+                                    .bg(rgb(panel_bg))
+                                    .border_1()
+                                    .border_color(crate::color::border_subtle())
+                                    .px(px(12.))
+                                    .py(px(10.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .children(wrapped_notes.into_iter().map(|line| {
+                                        div()
+                                            .text_size(px(12.5))
+                                            .line_height(px(18.))
+                                            .text_color(rgb(ink))
+                                            .child(line)
+                                    })),
+                            ),
+                    )
+                    // Progress / Error box
+                    .when(show_progress, |el| {
+                        let fallback_url = manual_url.clone();
+                        el.child(
+                            div()
+                                .w_full()
+                                .rounded(px(8.))
+                                .bg(rgb(panel_bg))
+                                .border_1()
+                                .border_color(crate::color::border_subtle())
+                                .px(px(12.))
+                                .py(px(10.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(8.))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .text_size(px(12.5))
+                                                .text_color(rgb(if is_error { err_fg } else { ink }))
+                                                .child(progress_label),
+                                        )
+                                        .when(!progress_detail.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_size(px(12.))
+                                                    .font_family(FAMILY_SEMIBOLD)
+                                                    .text_color(rgb(muted))
+                                                    .child(progress_detail),
+                                            )
+                                        }),
+                                )
+                                .when(!is_error, |d| {
+                                    d.child(
+                                        div()
+                                            .w_full()
+                                            .h(px(6.))
+                                            .rounded(px(3.))
+                                            .bg(rgb(track_bg))
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .w(gpui::relative(progress_frac))
+                                                    .rounded(px(3.))
+                                                    .bg(rgb(primary_bg)),
+                                            ),
+                                    )
+                                })
+                                .when(is_error, |d| {
+                                    d.child(
+                                        div()
+                                            .id("update-manual-fallback")
+                                            .text_size(px(12.))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(link_fg))
+                                            .cursor_pointer()
+                                            .on_click(move |_, _, cx| {
+                                                cx.open_url(&fallback_url);
+                                            })
+                                            .child(crate::i18n::t("Mở trang tải thủ công")),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+            // Footer
+            .child(
+                div()
+                    .w_full()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(crate::color::border_subtle())
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .when(!busy, |d| {
+                                d.child(
+                                    div()
+                                        .id("update-skip-version")
+                                        .text_size(px(12.))
+                                        .text_color(rgb(muted))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.dismiss_update_version(cx);
+                                        }))
+                                        .child(crate::i18n::t("Bỏ qua phiên bản này")),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .when(!busy, |d| {
+                                d.child(
+                                    div()
+                                        .id("update-later-btn")
+                                        .px(px(14.))
+                                        .h(px(34.))
+                                        .rounded(px(6.))
+                                        .bg(rgb(sec_bg))
+                                        .hover(move |s| s.bg(rgb(sec_hover)))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(13.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(ink))
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.dialog = None;
+                                            cx.notify();
+                                        }))
+                                        .child(crate::i18n::t("Để sau")),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("update-install-now-btn")
+                                    .px(px(16.))
+                                    .h(px(34.))
+                                    .rounded(px(6.))
+                                    .bg(rgb(if busy { sec_bg } else { primary_bg }))
+                                    .when(!busy, |d| {
+                                        d.hover(move |s| s.bg(rgb(primary_hover)))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.start_update_install(cx);
+                                            }))
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(13.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(if busy { muted } else { primary_fg }))
+                                    .child(cta_label),
+                            ),
                     ),
             )
     }
@@ -2445,7 +3022,6 @@ impl ShellView {
                                                 .min_w(px(0.))
                                                 .text_color(rgb(link_fg))
                                                 .cursor_pointer()
-                                                .hover(|s| s.underline())
                                                 .on_click(move |_, _, cx| {
                                                     cx.open_url(url);
                                                 })
@@ -3121,9 +3697,13 @@ fn footer(
                 .bg(if enabled {
                     rgb(blue).into()
                 } else {
-                    hsla(0.6, 0.9, 0.5, 0.35)
+                    crate::color::accent_disabled_bg()
                 })
-                .text_color(rgb(0xffffff))
+                .text_color(rgb(if enabled {
+                    crate::color::on_accent_fg()
+                } else {
+                    crate::color::accent_disabled_fg()
+                }))
                 .text_size(px(16.))
                 .font_family(FAMILY_SEMIBOLD)
                 .when(enabled, |el| el.cursor_pointer().on_click(on_ok))
@@ -3154,7 +3734,11 @@ fn chip_toggle(id: (&'static str, usize), label: &str, active: bool) -> gpui::St
         .py(px(6.))
         .rounded(px(16.))
         .bg(rgb(if active { blue } else { subtle }))
-        .text_color(rgb(if active { 0xff_ff_ff } else { ink }))
+        .text_color(rgb(if active {
+            crate::color::on_accent_fg()
+        } else {
+            ink
+        }))
         .text_size(px(13.))
         .cursor_pointer()
         .child(label.to_owned())
@@ -3697,7 +4281,7 @@ impl ShellView {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .text_size(px(11.))
                                     .child(if on { "✓" } else { "" }),
                             )
@@ -3892,7 +4476,7 @@ impl ShellView {
     fn two_factor_el(&self, t: &TwoFactorOtpDlg, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let blue = token_rgb("--blue", "#0068ff");
+        let blue = token_rgb("--B55", "#0068ff");
         let danger = token_rgb("--R60", "#c31818");
         let ok = !t.busy && !t.otp_text.trim().is_empty();
         let otp_submit = t.otp_text.trim().to_owned();

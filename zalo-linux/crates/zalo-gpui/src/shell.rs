@@ -91,6 +91,38 @@ fn profile_avatar(profiles: &crate::profiles::Profiles, key: &str) -> Option<Str
         .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
 }
 
+/// Zalo PC responsive shell modes (`verifyCompactMode` in `compact-app-pc.*.js`):
+/// - `Normal` (`width > 1224`): Rail (64) + Sidebar (344) + Chat + Docked Info (344).
+/// - `SemiCompact` (`880 < width <= 1224`): Rail (64) + Sidebar (344) + Chat; Info floats.
+/// - `Compact` (`width <= 880`): Rail (64) + single active pane (either full-width Sidebar
+///   OR full-width Chat with `<` back button in header, matching `#sidebarNav.compact-mode` /
+///   `#sidebarNav.compact-mode.show-chat` and `main.compact-mode { display: none }`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompactLevel {
+    #[default]
+    Normal,
+    SemiCompact,
+    Compact,
+}
+
+impl CompactLevel {
+    /// Exact Zalo PC breakpoint below which the shell hides the list when viewing chat.
+    pub const COMPACT_MAX_W: f32 = 880.0;
+    /// Exact Zalo PC breakpoint above which the shell is in full desktop mode.
+    pub const SEMI_COMPACT_MAX_W: f32 = 1224.0;
+
+    #[must_use]
+    pub fn for_width(width: f32, solo: bool) -> Self {
+        if solo || width > Self::SEMI_COMPACT_MAX_W {
+            Self::Normal
+        } else if width > Self::COMPACT_MAX_W {
+            Self::SemiCompact
+        } else {
+            Self::Compact
+        }
+    }
+}
+
 /// Root view of the main shell.
 pub struct ShellView {
     pub(crate) rail: Rail,
@@ -105,6 +137,8 @@ pub struct ShellView {
     pub(crate) conv_labels: HashMap<u64, i64>,
     /// "Star Message".
     pub(crate) starred: HashSet<u64>,
+    /// Left sidebar is showing the "Starred Messages" view (like Zalo PC).
+    pub(crate) starred_open: bool,
     /// "Pin Message" (local).
     pub(crate) pinned_msgs: HashSet<u64>,
     pub(crate) selected: Option<u64>,
@@ -220,6 +254,18 @@ pub struct ShellView {
     pub(crate) info_pref: bool,
     /// Last width class, so shrinking closes the overlay and widening restores it.
     pub(crate) info_wide: Option<bool>,
+    /// Current responsive breakpoint (`Normal` / `SemiCompact` / `Compact`), matching
+    /// Zalo PC `verifyCompactMode`.
+    pub(crate) compact_level: CompactLevel,
+    /// In `Compact` mode (`width <= 880`), `true` hides the conversation list column
+    /// (`#sidebarNav.compact-mode.show-chat { width: 64px }`) and gives the active chat
+    /// or contacts page the entire `width - 64px` canvas; `false` shows the full-width
+    /// conversation list (`main.compact-mode { display: none }`).
+    pub(crate) compact_show_chat: bool,
+    /// Live logical width of the conversation column (`#messageViewContainer`),
+    /// updated each frame from the window viewport minus rail, sidebar, and any
+    /// docked right panel so bubbles/albums/floating actions scale without clipping.
+    pub(crate) chat_pane_w: f32,
     /// Narrow window: the column floats and a click outside closes it.
     pub(crate) info_overlay: bool,
     /// Group invite link already fetched, keyed by conversation id.
@@ -268,6 +314,10 @@ pub struct ShellView {
     pub(crate) update_checking: bool,
     /// Human-readable status note from the last manual update check.
     pub(crate) update_checked_note: Option<String>,
+    /// Live download / verify / install state for in-app auto-update.
+    pub(crate) update_install: crate::updater::UpdateInstallState,
+    /// Tag for which the automatic update popup was already shown this session.
+    pub(crate) update_popup_shown_tag: Option<String>,
     /// Bare group ids from `/api/group/getlg/e2ee`. `None` until a live fetch.
     pub(crate) e2ee_groups: Option<Vec<String>>,
     pub(crate) e2ee_busy: bool,
@@ -404,6 +454,16 @@ pub struct ShellView {
     pub(crate) presence: crate::presence::Presence,
     /// Info-column media store preview for the open thread.
     pub(crate) media_shelf: crate::media_store::Shelf,
+    /// Per-thread auto-delete TTL in milliseconds from `/api/conv/autodelete/getConvers`.
+    pub(crate) auto_delete_ttl: HashMap<String, i64>,
+    /// True while a background `load_snapshot_from_dir` reload is running.
+    reload_store_inflight: bool,
+    /// Queued follow-up reload (`Some(full_refresh)`) coalesced while `reload_store_inflight`.
+    reload_store_pending: Option<bool>,
+    /// Group threads currently fetching older history via `/api/cm/rgetv2`.
+    pub(crate) cloud_history_busy: HashSet<String>,
+    /// Group threads with no older cloud history left on the server.
+    pub(crate) cloud_history_exhausted: HashSet<String>,
 }
 
 /// Newest messages built per open conversation (see `msg_window`).
@@ -653,6 +713,7 @@ impl ShellView {
             labels_pending: false,
             conv_labels: HashMap::new(),
             starred: HashSet::new(),
+            starred_open: false,
             pinned_msgs: HashSet::new(),
             selected: initial_thread(&snap.convs),
             contact_tab: ContactTab::Friends,
@@ -731,6 +792,9 @@ impl ShellView {
             info_open: false,
             info_pref: true,
             info_wide: None,
+            compact_level: CompactLevel::Normal,
+            compact_show_chat: true,
+            chat_pane_w: (1200.0 - zalo_design::SIDEBAR_W).max(320.0),
             info_overlay: false,
             info_join: HashMap::new(),
             info_join_busy: HashSet::new(),
@@ -760,6 +824,8 @@ impl ShellView {
             update_info: None,
             update_checking: false,
             update_checked_note: None,
+            update_install: crate::updater::UpdateInstallState::Idle,
+            update_popup_shown_tag: None,
             e2ee_groups: None,
             e2ee_busy: false,
             e2ee_failed: false,
@@ -832,6 +898,11 @@ impl ShellView {
             last_warm_key: None,
             presence: crate::presence::Presence::default(),
             media_shelf: crate::media_store::Shelf::default(),
+            auto_delete_ttl: HashMap::new(),
+            reload_store_inflight: false,
+            reload_store_pending: None,
+            cloud_history_busy: HashSet::new(),
+            cloud_history_exhausted: HashSet::new(),
         };
         if let Some(saved) = this.prefs.json("receipts") {
             this.read_sync.load_cursors(&saved);
@@ -865,6 +936,8 @@ impl ShellView {
             window.focus(&handle);
         }
         this.load_hidden(cx);
+        this.load_auto_delete(cx);
+        this.load_server_conv_states(cx);
         if let Ok(mode) = std::env::var("ZALO_GPUI_CALL") {
             this.demo_call(&mode, cx);
         }
@@ -941,7 +1014,10 @@ impl ShellView {
         this.rail_popup = match std::env::var("ZALO_GPUI_POPUP").as_deref() {
             Ok("zcloud") => Some(crate::rail::RailPopup::ZCloud),
             Ok("tools") => Some(crate::rail::RailPopup::Tools),
-            Ok("starred") => Some(crate::rail::RailPopup::Starred),
+            Ok("starred") => {
+                this.starred_open = true;
+                None
+            }
             Ok("catalog") => Some(crate::rail::RailPopup::Catalog),
             _ => None,
         };
@@ -957,6 +1033,7 @@ impl ShellView {
             Ok("friend") => this.open_add_friend(cx),
             Ok("group") => this.open_group_picker(None, cx),
             Ok("profile") => this.open_profile_dialog(cx),
+            Ok("quick") => this.open_quick_messages(cx),
             Ok("board") => {
                 if let Some(id) = this.selected {
                     this.open_board_dialog(id, crate::board::BoardTab::All, cx);
@@ -966,6 +1043,14 @@ impl ShellView {
                 if let Some(id) = this.selected {
                     this.open_group_manage(id, cx);
                 }
+            }
+            Ok("autodelete") => {
+                if let Some(id) = this.selected {
+                    this.open_auto_delete(id, cx);
+                }
+            }
+            Ok("resetpin") => {
+                this.open_pin(crate::privacy::PinMode::ResetHidden, cx);
             }
             Ok("viewer") => {
                 let photo = this.selected.and_then(|id| {
@@ -1057,8 +1142,24 @@ impl ShellView {
                             );
                             crate::updater::notify_update_available(&info);
                         }
+                        let tag = info.tag.clone();
+                        let dismissed =
+                            view.prefs.str("dismissedUpdateVersion", "") == tag;
+                        let already_popped =
+                            view.update_popup_shown_tag.as_deref() == Some(tag.as_str());
                         view.update_info = Some(info);
                         view.update_checked_note = None;
+                        if manual {
+                            view.update_popup_shown_tag = Some(tag);
+                            view.dialog = Some(crate::dialogs::Dialog::UpdateAvailable);
+                        } else if view.solo.is_none()
+                            && view.dialog.is_none()
+                            && !dismissed
+                            && !already_popped
+                        {
+                            view.update_popup_shown_tag = Some(tag);
+                            view.dialog = Some(crate::dialogs::Dialog::UpdateAvailable);
+                        }
                     }
                     crate::updater::UpdateCheckResult::UpToDate => {
                         view.update_info = None;
@@ -1084,6 +1185,99 @@ impl ShellView {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    /// Dismisses automatic popup prompts for the currently advertised release tag.
+    pub(crate) fn dismiss_update_version(&mut self, cx: &mut Context<Self>) {
+        if self.update_install.is_busy() {
+            return;
+        }
+        if let Some(tag) = self.update_info.as_ref().map(|u| u.tag.clone()) {
+            self.prefs.set(
+                "dismissedUpdateVersion",
+                serde_json::Value::String(tag.clone()),
+            );
+            self.update_popup_shown_tag = Some(tag);
+        }
+        if matches!(self.dialog, Some(crate::dialogs::Dialog::UpdateAvailable)) {
+            self.dialog = None;
+        }
+        cx.notify();
+    }
+
+    /// Downloads, verifies SHA-256, installs, and restarts into the detected release.
+    pub(crate) fn start_update_install(&mut self, cx: &mut Context<Self>) {
+        if self.update_install.is_busy() {
+            return;
+        }
+        let Some(info) = self.update_info.clone() else {
+            return;
+        };
+        if !info.package_kind.supports_in_app_install() {
+            cx.open_url(&info.release_url);
+            self.set_note(crate::i18n::t("Đã mở trang tải bản cập nhật trên trình duyệt"));
+            cx.notify();
+            return;
+        }
+
+        self.dialog = Some(crate::dialogs::Dialog::UpdateAvailable);
+        self.update_install = crate::updater::UpdateInstallState::Downloading {
+            downloaded: 0,
+            total: info.asset_size,
+        };
+        cx.notify();
+
+        let release_url = info.release_url.clone();
+        let (progress_tx, mut progress_rx) =
+            futures::channel::mpsc::unbounded::<crate::updater::UpdateInstallState>();
+        let (done_tx, done_rx) =
+            futures::channel::oneshot::channel::<Result<crate::updater::ApplyOutcome, String>>();
+
+        crate::ws_rpc::async_rt().spawn(async move {
+            let outcome = crate::updater::download_and_apply_update(info, move |st| {
+                let _ = progress_tx.unbounded_send(st);
+            })
+            .await;
+            let _ = done_tx.send(outcome);
+        });
+
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(st) = progress_rx.next().await {
+                if this
+                    .update(cx, |view, cx| {
+                        view.update_install = st;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let Ok(outcome) = done_rx.await else {
+                return;
+            };
+            match outcome {
+                Ok(crate::updater::ApplyOutcome::QuitToRestart) => {
+                    gpui::Timer::after(std::time::Duration::from_millis(450)).await;
+                    let _ = cx.update(|cx| cx.quit());
+                }
+                Ok(crate::updater::ApplyOutcome::OpenReleasePage) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.update_install = crate::updater::UpdateInstallState::Idle;
+                        cx.open_url(&release_url);
+                        cx.notify();
+                    });
+                }
+                Err(err) => {
+                    let _ = this.update(cx, |view, cx| {
+                        view.update_install = crate::updater::UpdateInstallState::Failed(err);
+                        cx.notify();
+                    });
+                }
+            }
         })
         .detach();
     }
@@ -1307,10 +1501,34 @@ impl ShellView {
     }
 
     /// Composer `.chat-input-link-preview`: the first complete URL in the draft.
+    ///
+    /// Requires a host with at least a 2-letter alphabetic TLD (e.g. `.vn`, `.com`,
+    /// `.lol`) or a path/port so typing partial domains like `https://lza.l` does
+    /// not fire invalid `parselink` requests (`error 114`).
     fn sync_composer_link(&mut self, text: &str) {
         let url = crate::media::first_link(text).filter(|u| {
             let host = crate::media::host_of(u);
-            host.contains('.') && host.len() > 3 && !host.ends_with('.')
+            let bare = host.split(':').next().unwrap_or(host);
+            let Some((_, tld)) = bare.rsplit_once('.') else {
+                return false;
+            };
+            let tld_ok = tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic());
+            // Only preview once the URL is followed by whitespace/path/query or
+            // has a TLD of >= 3 chars (or common 2-char ccTLDs like `.vn`/`.io`),
+            // avoiding transient partial-TLD fetches while typing `.lo` -> `.lol`.
+            let after_url = text
+                .find(u.as_str())
+                .map(|i| i + u.len() < text.len())
+                .unwrap_or(false);
+            let has_path = u
+                .strip_prefix("https://")
+                .or_else(|| u.strip_prefix("http://"))
+                .is_some_and(|rest| rest.contains('/'));
+            let common_2 = matches!(
+                tld.to_ascii_lowercase().as_str(),
+                "vn" | "io" | "ai" | "me" | "co" | "tv" | "us" | "uk" | "jp" | "kr" | "de" | "fr"
+            );
+            bare.len() > 3 && tld_ok && (after_url || has_path || tld.len() >= 3 || common_2)
         });
         if self.composer_link_hide.is_some() && self.composer_link_hide != url {
             self.composer_link_hide = None;
@@ -1917,6 +2135,7 @@ impl ShellView {
         }
         self.rail = rail;
         self.rail_popup = None;
+        self.starred_open = false;
         self.note = None;
         self.sticker_open = false;
         self.menu = None;
@@ -1924,14 +2143,19 @@ impl ShellView {
         self.settings_open = false;
         if rail == Rail::Chats {
             self.list_filter = ListFilter::All;
-        }
-        if rail == Rail::Docs {
+            self.compact_show_chat = false;
+        } else if rail == Rail::Contacts {
+            self.compact_show_chat = false;
+        } else if rail == Rail::Docs {
             self.ensure_my_documents_conv();
             if let Some(id) = self.cloud_id() {
                 self.selected = Some(id);
                 self.warm_media(id);
                 self.scroll_msgs_to_bottom();
             }
+            self.compact_show_chat = true;
+        } else {
+            self.compact_show_chat = true;
         }
     }
 
@@ -2230,57 +2454,7 @@ impl ShellView {
                 if row.cli_msg_id.unwrap_or(0) <= 0 && m.cli_msg_id.unwrap_or(0) > 0 {
                     row.cli_msg_id = m.cli_msg_id;
                 }
-                if m.kind != crate::media::MsgKind::Text && row.kind == crate::media::MsgKind::Text
-                {
-                    row.kind = m.kind;
-                    row.text = m.text.clone();
-                    if !m.file_name.is_empty() {
-                        row.file_name = m.file_name.clone();
-                    }
-                    if !m.media_url.is_empty() {
-                        row.media_url = m.media_url.clone();
-                        row.media_path = crate::media::cache_path_for(&row.media_url)
-                            .filter(|p| p.is_file());
-                        upgraded_media = true;
-                    }
-                    if !m.href.is_empty() {
-                        row.href = m.href.clone();
-                    }
-                    if m.width > 0 {
-                        row.media_w = m.width;
-                    }
-                    if m.height > 0 {
-                        row.media_h = m.height;
-                    }
-                } else if row.kind == crate::media::MsgKind::Photo
-                    && m.kind == crate::media::MsgKind::Photo
-                    && !m.media_url.is_empty()
-                    && row.media_url != m.media_url
-                    && !crate::media::is_thumb_photo_url(&m.media_url)
-                {
-                    row.media_url = m.media_url.clone();
-                    row.media_path =
-                        crate::media::cache_path_for(&row.media_url).filter(|p| p.is_file());
-                    if m.width > 0 {
-                        row.media_w = m.width;
-                    }
-                    if m.height > 0 {
-                        row.media_h = m.height;
-                    }
-                    if crate::media::is_local_media_uri(&row.text) {
-                        row.text = m.text.clone();
-                    }
-                    upgraded_media = true;
-                } else if row.kind == crate::media::MsgKind::Text
-                    && (m.text == "Tin nhắn đã bị xóa"
-                        || m.text == "[Tin nhắn đã tự xóa]"
-                        || m.text.starts_with("[Việc cần làm]"))
-                    && row.text != m.text
-                {
-                    row.text = m.text.clone();
-                } else if row.href.is_empty() && !m.href.is_empty() {
-                    row.href = m.href.clone();
-                }
+                upgraded_media = merge_incoming_into_row(row, &m);
                 if row.quote_text.is_empty() && !m.quote_text.is_empty() {
                     row.quote_sender = m.quote_sender.clone();
                     row.quote_text = m.quote_text.clone();
@@ -2308,6 +2482,29 @@ impl ShellView {
                 Some(row.id)
             });
             if let Some(id) = id {
+                if m.kind == crate::media::MsgKind::Link {
+                    let link_key = if !m.href.is_empty() {
+                        m.href.clone()
+                    } else {
+                        crate::media::first_link(&m.text).unwrap_or_default()
+                    };
+                    if !link_key.is_empty()
+                        && (!m.link_title.is_empty() || !m.media_url.is_empty())
+                    {
+                        self.link_previews.insert(
+                            link_key.clone(),
+                            crate::links::LinkPreview {
+                                title: m.link_title.clone(),
+                                desc: m.link_desc.clone(),
+                                thumb: m.media_url.clone(),
+                                src: crate::media::host_of(&link_key).to_owned(),
+                            },
+                        );
+                        if let Some(path) = crate::links::cache_path() {
+                            crate::links::save(&path, &self.link_previews);
+                        }
+                    }
+                }
                 if upgraded_media {
                     self.media_bitmaps.remove(&id);
                     self.media_pending.remove(&id);
@@ -2441,15 +2638,20 @@ impl ShellView {
             msg.quote_cli_id = m.quote_cli_id;
         }
         if m.kind == crate::media::MsgKind::Link {
-            msg.href = m.text.clone();
-            if !m.link_title.is_empty() || !m.media_url.is_empty() {
+            let link_href = if !m.href.is_empty() {
+                m.href.clone()
+            } else {
+                crate::media::first_link(&m.text).unwrap_or_else(|| m.text.clone())
+            };
+            msg.href = link_href.clone();
+            if !link_href.is_empty() && (!m.link_title.is_empty() || !m.media_url.is_empty()) {
                 self.link_previews.insert(
-                    m.text.clone(),
+                    link_href.clone(),
                     crate::links::LinkPreview {
                         title: m.link_title.clone(),
                         desc: m.link_desc.clone(),
                         thumb: m.media_url.clone(),
-                        src: crate::media::host_of(&m.text).to_owned(),
+                        src: crate::media::host_of(&link_href).to_owned(),
                     },
                 );
                 msg.media_url = String::new();
@@ -2879,6 +3081,159 @@ impl ShellView {
         self.save_conv_flags();
     }
 
+    /// Syncs server-side muted conversations (`/api/social/profile/getmute`),
+    /// cross-device unread marks (`/api/conv/getUnreadMark`), and last-seen cursors
+    /// (`/api/preloadconvers/get-last-seen`) once per session in the background.
+    pub(crate) fn load_server_conv_states(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.has_session {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let mut group_ids: Vec<String> = Vec::new();
+        let mut direct_ids: Vec<String> = Vec::new();
+        for c in self.convs.iter().take(60) {
+            if !c.live || c.thread_id.is_empty() {
+                continue;
+            }
+            if c.is_group {
+                group_ids.push(c.thread_id.clone());
+            } else {
+                direct_ids.push(c.thread_id.clone());
+            }
+        }
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        let muted_val = api.get_mute_conversations().await.ok();
+                        let unread_val = api.get_unread_marks().await.ok();
+                        let last_seen_val = if !group_ids.is_empty() || !direct_ids.is_empty() {
+                            api.get_last_seen(&group_ids, &direct_ids).await.ok()
+                        } else {
+                            None
+                        };
+                        Ok((muted_val, unread_val, last_seen_val))
+                    })
+                })
+                .await;
+            if let Ok((muted_val, unread_val, last_seen_val)) = res {
+                let _ = this.update(cx, |view, cx| {
+                    let mut changed = false;
+                    if let Some(val) = muted_val.as_ref() {
+                        let muted_threads = muted_threads_from(val);
+                        if !muted_threads.is_empty() {
+                            Self::sync_live_set(&view.convs, &mut view.muted, &muted_threads);
+                            view.save_conv_flags();
+                            changed = true;
+                        }
+                    }
+                    if let Some(val) = unread_val.as_ref() {
+                        let unread_threads = unread_mark_threads_from(val);
+                        let active_tid = view.selected_conv().map(|c| c.thread_id);
+                        for conv in &mut view.convs {
+                            if conv.live
+                                && unread_threads.contains(&conv.thread_id)
+                                && active_tid.as_deref() != Some(conv.thread_id.as_str())
+                                && conv.unread == 0
+                            {
+                                conv.unread = 1;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if let Some(val) = last_seen_val.as_ref() {
+                        for (tid, msg_id) in last_seen_from(val) {
+                            if msg_id > 0 {
+                                view.read_sync.mark_seen_sent(&tid, msg_id.to_string());
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Loads older messages for a group thread from Zalo's `group_cloud_message` service
+    /// (`/api/cm/rgetv2`, falling back to `/api/cm/mget` when no local message exists yet).
+    pub(crate) fn load_older_group_cloud(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.has_session {
+            return;
+        }
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| c.is_group && c.live) else {
+            return;
+        };
+        let tid = conv.thread_id.clone();
+        if self.cloud_history_busy.contains(&tid) || self.cloud_history_exhausted.contains(&tid) {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let oldest_gmi = self
+            .messages_of(conv_id)
+            .iter()
+            .filter_map(|m| m.global_msg_id.filter(|&id| id > 0))
+            .min()
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let self_uid = self.self_uid().unwrap_or_default().to_owned();
+        self.cloud_history_busy.insert(tid.clone());
+        let tid_req = tid.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        let val = if oldest_gmi.is_empty() {
+                            api.group_cloud_mget(std::slice::from_ref(&tid_req))
+                                .await
+                                .map_err(|e| e.to_string())?
+                        } else {
+                            api.group_cloud_jump(&tid_req, &oldest_gmi, 50, false)
+                                .await
+                                .map_err(|e| e.to_string())?
+                        };
+                        Ok(cloud_group_items_from(&val, &tid_req, &self_uid))
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.cloud_history_busy.remove(&tid);
+                match res {
+                    Ok(items) => {
+                        let before = view.messages_of(conv_id).len();
+                        for m in items {
+                            view.apply_incoming(m, false, false);
+                        }
+                        let after = view.messages_of(conv_id).len();
+                        let added = after.saturating_sub(before);
+                        if added > 0 {
+                            view.msg_window += added;
+                            view.warm_media(conv_id);
+                            view.set_note(format!("Đã tải thêm {added} tin nhắn cũ từ máy chủ"));
+                        } else {
+                            view.cloud_history_exhausted.insert(tid);
+                            view.set_note("Đã hiển thị toàn bộ lịch sử tin nhắn trên máy chủ");
+                        }
+                    }
+                    Err(err) => {
+                        view.set_note(format!("Không tải được lịch sử cũ: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn sync_live_set(convs: &[ChatConv], set: &mut HashSet<u64>, raw_ids: &[String]) {
         let threads: HashSet<String> = raw_ids
             .iter()
@@ -3107,7 +3462,41 @@ impl ShellView {
 
     /// Reloads conversations and messages from `LocalStore` (called after Sync 2 persists batches),
     /// preserving the currently selected conversation thread.
-    pub(crate) fn reload_from_store(&mut self) {
+    /// Reloads `store.db` on a background thread so large stores (100 MB+) never block UI input.
+    ///
+    /// Overlapping calls while a reload is already running are coalesced into one follow-up pass.
+    pub(crate) fn reload_from_store_async(&mut self, full_refresh: bool, cx: &mut Context<Self>) {
+        if self.reload_store_inflight {
+            self.reload_store_pending = Some(
+                self.reload_store_pending
+                    .map_or(full_refresh, |prev| prev || full_refresh),
+            );
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        self.reload_store_inflight = true;
+        cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { data::load_snapshot_from_dir(&dir) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.reload_store_inflight = false;
+                if let Some(snap) = loaded {
+                    view.apply_reloaded_snapshot(snap, full_refresh);
+                }
+                if let Some(next_full) = view.reload_store_pending.take() {
+                    view.reload_from_store_async(next_full, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_reloaded_snapshot(&mut self, snap: data::Snapshot, full_refresh: bool) {
         let prev_thread = self
             .selected
             .and_then(|id| self.convs.iter().find(|c| c.id == id))
@@ -3117,11 +3506,6 @@ impl ShellView {
             .map(|id| self.messages_of(id).len())
             .unwrap_or(0);
         let was_at_bottom = self.is_msgs_at_bottom();
-        let snap = self
-            .session_dir
-            .as_deref()
-            .and_then(data::load_snapshot_from_dir)
-            .unwrap_or_else(data::load_snapshot);
         if snap.send2me_id.as_deref().is_some_and(|s| !s.is_empty()) {
             self.send2me_id = snap.send2me_id;
         }
@@ -3142,22 +3526,24 @@ impl ShellView {
         }
         self.apply_profile_aliases();
         self.msg_list_state.set((None, 0, 0));
-        self.avatar_miss.clear();
-        self.group_gaps_tried.clear();
-        self.profile_uids_tried.clear();
-        self.media_shelf = crate::media_store::Shelf::default();
-        self.profile_gaps_started = false;
-        self.avatars_queued = true;
+        if full_refresh {
+            self.avatar_miss.clear();
+            self.group_gaps_tried.clear();
+            self.profile_uids_tried.clear();
+            self.media_shelf = crate::media_store::Shelf::default();
+            self.profile_gaps_started = false;
+            self.avatars_queued = true;
+        }
         if let Some(id) = self.selected {
             self.warm_media(id);
-            if self.info_open {
+            if full_refresh && self.info_open {
                 self.warm_info_media(id);
             }
             if prev_msg_count == 0 || was_at_bottom {
                 self.scroll_msgs_to_bottom();
             }
         }
-        if self.has_session && self.profiles.stale(data::now_ms()) {
+        if full_refresh && self.has_session && self.profiles.stale(data::now_ms()) {
             self.profiles_refresh = true;
         }
     }
@@ -4223,10 +4609,15 @@ impl ShellView {
     /// Esc: close the topmost overlay (menu → viewer → dialog → popup →
     /// settings → reply bar). Returns false when nothing was open.
     pub(crate) fn escape_overlay(&mut self) -> bool {
-        if self.menu.take().is_some()
-            || self.viewer.take().is_some()
-            || self.dialog.take().is_some()
-        {
+        if self.menu.take().is_some() || self.viewer.take().is_some() {
+            return true;
+        }
+        if let Some(crate::dialogs::Dialog::UpdateAvailable) = self.dialog {
+            if self.update_install.is_busy() {
+                return true;
+            }
+        }
+        if self.dialog.take().is_some() {
             return true;
         }
         if self.react_picker.is_some() {
@@ -4307,6 +4698,8 @@ impl ShellView {
             self.msg_search_presets_open = false;
         }
         self.selected = Some(id);
+        self.starred_open = false;
+        self.compact_show_chat = true;
         self.avatars_queued = true;
         self.profile_gaps_started = false;
         self.rail = Rail::Chats;
@@ -4475,12 +4868,21 @@ impl ShellView {
         self.sticker_open = false;
         if conv.live && self.has_session {
             if let Some(dir) = self.session_dir.clone() {
+                let mentions = if conv.is_group && text.contains('@') {
+                    let members = self.group_member_uid_names(&conv);
+                    build_group_mentions(text, &members)
+                } else {
+                    Vec::new()
+                };
+                let language = if self.english { "en" } else { "vi" }.to_owned();
                 bridge::spawn_live(
                     LiveAction::Send {
                         thread_id: conv.thread_id.clone(),
                         is_group: conv.is_group,
                         text: text.to_owned(),
                         quote,
+                        mentions,
+                        language,
                         urgency,
                         client_id: cli as u64,
                     },
@@ -4496,6 +4898,106 @@ impl ShellView {
                 stored_quote.as_ref(),
             );
         }
+    }
+
+    /// Collects `(uid, display_name)` pairs for members of a group so `@mention` metadata
+    /// carries real Zalo UIDs.
+    pub(crate) fn group_member_uid_names(&self, conv: &ChatConv) -> Vec<(String, String)> {
+        let mut seen = HashSet::<String>::new();
+        let mut out = Vec::new();
+        if let Some(prof) = self.profile_ref(&conv.thread_id) {
+            for uid in &prof.member_ids {
+                if uid.is_empty() || !seen.insert(uid.clone()) {
+                    continue;
+                }
+                if let Some(name) = self
+                    .profile_ref(uid)
+                    .map(|p| p.name.trim().to_owned())
+                    .filter(|n| !n.is_empty())
+                {
+                    out.push((uid.clone(), name));
+                }
+            }
+        }
+        if let Some(msgs) = self.messages.get(&conv.id) {
+            for msg in msgs {
+                if msg.sender_uid.is_empty()
+                    || msg.sender_uid == "0"
+                    || msg.sender.trim().is_empty()
+                    || !seen.insert(msg.sender_uid.clone())
+                {
+                    continue;
+                }
+                out.push((msg.sender_uid.clone(), msg.sender.trim().to_owned()));
+            }
+        }
+        if let Some(view) = self.members_view.as_ref().filter(|v| v.conv == conv.id) {
+            for (uid, name) in &view.list {
+                if !uid.is_empty() && !name.trim().is_empty() && seen.insert(uid.clone()) {
+                    out.push((uid.clone(), name.trim().to_owned()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Recalls one or several sent messages in a conversation using `/api/message/multi_undo`
+    /// or `/api/group/multi_undomsg` when more than one message is selected.
+    pub(crate) fn recall_selected_msgs(&mut self, msgs: &[ChatMsg]) {
+        let recallable: Vec<&ChatMsg> = msgs
+            .iter()
+            .filter(|m| m.from_me && !m.recalled)
+            .collect();
+        if recallable.is_empty() {
+            self.set_note("Chỉ có thể thu hồi tin nhắn do bạn gửi");
+            return;
+        }
+        let conv_id = recallable[0].conv;
+        let Some(conv) = self.conv(conv_id).cloned() else {
+            return;
+        };
+        let recall_ids: HashSet<u64> = recallable.iter().map(|m| m.id).collect();
+        if let Some(list) = self.messages.get_mut(&conv_id) {
+            for m in list.iter_mut() {
+                if recall_ids.contains(&m.id) {
+                    m.recalled = true;
+                }
+            }
+        }
+        if let Some(c) = self.convs.iter_mut().find(|c| c.id == conv_id) {
+            c.preview = str_vi("STR_UNDO_MESSAGE", "Tin nhắn đã thu hồi").to_owned();
+        }
+        if conv.live {
+            let base = (data::now_ms().max(1) as u64).saturating_mul(10);
+            let items: Vec<zalo_client::MultiUndoItem> = recallable
+                .iter()
+                .enumerate()
+                .filter_map(|(i, m)| {
+                    Some(zalo_client::MultiUndoItem {
+                        cli_msg_id: base.saturating_add(i as u64),
+                        cli_msg_id_undo: m.cli_msg_id?,
+                        global_msg_id: m.global_msg_id?,
+                    })
+                })
+                .collect();
+            if items.len() == 1 {
+                let it = &items[0];
+                self.maybe_live(LiveAction::Undo {
+                    thread_id: conv.thread_id.clone(),
+                    is_group: conv.is_group,
+                    msg_id: it.global_msg_id,
+                    client_id: it.cli_msg_id,
+                    cli_msg_id_undo: it.cli_msg_id_undo,
+                });
+            } else if items.len() > 1 {
+                self.maybe_live(LiveAction::UndoMulti {
+                    thread_id: conv.thread_id.clone(),
+                    is_group: conv.is_group,
+                    items,
+                });
+            }
+        }
+        self.set_note(format!("Đã thu hồi {} tin nhắn", recallable.len()));
     }
 
     fn quote_target(&self, _conv: &ChatConv) -> Option<zalo_client::QuoteTarget> {
@@ -4539,6 +5041,7 @@ impl ShellView {
             | LiveAction::Mute { thread_id, .. }
             | LiveAction::Archive { thread_id, .. }
             | LiveAction::Undo { thread_id, .. }
+            | LiveAction::UndoMulti { thread_id, .. }
             | LiveAction::Delete { thread_id, .. }
             | LiveAction::React { thread_id, .. }
             | LiveAction::Forward {
@@ -4558,6 +5061,9 @@ impl ShellView {
             | LiveAction::UnpinBoard { thread_id, .. } => data::live_allowed(thread_id),
             LiveAction::MarkUnread { item } | LiveAction::DeleteConv { item, .. } => {
                 data::live_allowed(&item.thread_id)
+            }
+            LiveAction::ForwardMulti { targets, .. } => {
+                !targets.is_empty() && targets.iter().all(|(tid, _)| data::live_allowed(tid))
             }
             LiveAction::RemoveFriend { uid }
             | LiveAction::UpdateAlias { uid, .. }
@@ -5005,8 +5511,22 @@ impl ShellView {
 }
 
 impl ShellView {
+    /// True when the right-hand chat / contacts page should be visible.
+    /// In `Compact` mode (`<= 880 px`), only one of Sidebar or Chat is shown at once.
+    pub(crate) fn compact_shows_chat(&self) -> bool {
+        self.compact_level != CompactLevel::Compact
+            || (self.compact_show_chat && !self.starred_open)
+    }
+
+    /// True when the conversation list / contacts nav sidebar should be visible.
+    pub(crate) fn compact_shows_sidebar(&self) -> bool {
+        self.compact_level != CompactLevel::Compact || !self.compact_shows_chat()
+    }
+
     /// Dock the info column when it fits. Otherwise it floats and a click
     /// outside closes it. Widening restores the saved preference.
+    /// Also updates Zalo PC's 3-level responsive mode (`Normal` / `SemiCompact` / `Compact`)
+    /// and the exact live `chat_pane_w` budget for message layout.
     fn sync_info_layout(&mut self, window: &Window) {
         let csd = if crate::window_frame::CsdCorners::from_window(window).any_pad() {
             zalo_design::WINDOW_SHADOW * 2.0
@@ -5014,6 +5534,11 @@ impl ShellView {
             0.0
         };
         let width = (f32::from(window.viewport_size().width) - csd).max(0.0);
+        let next_level = CompactLevel::for_width(width, self.solo.is_some());
+        if self.compact_level != CompactLevel::Compact && next_level == CompactLevel::Compact {
+            self.compact_show_chat = self.selected.is_some() && !self.starred_open;
+        }
+        self.compact_level = next_level;
         let wide = crate::info::info_docks(width, self.solo.is_some());
         let became_narrow = self.info_wide == Some(true) && !wide;
         self.info_wide = Some(wide);
@@ -5026,6 +5551,26 @@ impl ShellView {
             }
             self.info_overlay = self.info_open;
         }
+        let left_w = if self.solo.is_some() {
+            0.0
+        } else if next_level == CompactLevel::Compact {
+            // In Compact mode the 344 px conversation list hides when chat is shown,
+            // leaving only the 64 px left rail (`#sidebarNav.compact-mode.show-chat`).
+            zalo_design::MAIN_TAB_W
+        } else {
+            zalo_design::SIDEBAR_W
+        };
+        let search_docks = self.msg_search_open
+            && self.selected.is_some()
+            && next_level == CompactLevel::Normal;
+        let right_docked_w = if search_docks {
+            crate::info::INFO_PANEL_W
+        } else if self.info_open && !self.info_overlay && self.rail != Rail::Contacts {
+            crate::info::INFO_PANEL_W
+        } else {
+            0.0
+        };
+        self.chat_pane_w = (width - left_w - right_docked_w).max(200.0);
     }
 
     /// Title-bar pill: Light / Dark / System, same values as Settings › Appearance.
@@ -5264,7 +5809,11 @@ impl Render for ShellView {
                         }),
                         cx.listener(ShellView::open_theme_menu),
                         cx.listener(|this, _, _, cx| {
-                            this.dialog = Some(crate::dialogs::Dialog::About);
+                            if this.update_info.is_some() {
+                                this.dialog = Some(crate::dialogs::Dialog::UpdateAvailable);
+                            } else {
+                                this.dialog = Some(crate::dialogs::Dialog::About);
+                            }
                             cx.notify();
                         }),
                     ))
@@ -5373,7 +5922,11 @@ impl Render for ShellView {
                                 cx.notify();
                             }),
                             cx.listener(|this, _, _, cx| {
-                                this.dialog = Some(crate::dialogs::Dialog::About);
+                                if this.update_info.is_some() {
+                                    this.dialog = Some(crate::dialogs::Dialog::UpdateAvailable);
+                                } else {
+                                    this.dialog = Some(crate::dialogs::Dialog::About);
+                                }
                                 cx.notify();
                             }),
                         ))
@@ -5386,13 +5939,34 @@ impl Render for ShellView {
                                 .w_full()
                                 .min_h(px(0.))
                                 .relative()
-                                .child(self.sidebar_column(cx))
-                                .child(self.chat_column(corners, cx))
+                                .when(self.compact_shows_sidebar(), |el| {
+                                    el.child(self.sidebar_column(cx))
+                                })
+                                .when(self.compact_shows_chat(), |el| {
+                                    el.child(self.chat_column(corners, cx))
+                                })
                                 .when(self.info_overlay && !self.msg_search_open, |el| {
                                     el.child(self.info_dismiss(cx))
                                 })
                                 .when(self.msg_search_open && selected.is_some(), |el| {
-                                    el.child(self.msg_search_panel(selected.as_ref(), corners, cx))
+                                    let panel = self.msg_search_panel(selected.as_ref(), corners, cx);
+                                    if self.compact_level == CompactLevel::Normal {
+                                        el.child(panel)
+                                    } else {
+                                        el.child(
+                                            div()
+                                                .id("msg-search-overlay")
+                                                .absolute()
+                                                .top_0()
+                                                .right_0()
+                                                .bottom_0()
+                                                .w(px(crate::info::INFO_PANEL_W
+                                                    .min(self.chat_pane_w)))
+                                                .occlude()
+                                                .shadow_lg()
+                                                .child(panel),
+                                        )
+                                    }
                                 })
                                 .when(
                                     info && self.rail != Rail::Contacts && !self.msg_search_open,
@@ -5517,7 +6091,7 @@ impl ShellView {
                     .px(px(10.))
                     .rounded(px(4.))
                     .bg(rgb(blue))
-                    .text_color(rgb(0xffffff))
+                    .text_color(rgb(crate::color::on_accent_fg()))
                     .text_size(px(12.))
                     .font_family(crate::fonts::FAMILY_SEMIBOLD)
                     .flex()
@@ -5726,6 +6300,355 @@ fn starred_ids_json(set: &HashSet<u64>) -> serde_json::Value {
     let mut ids: Vec<u64> = set.iter().copied().collect();
     ids.sort_unstable();
     serde_json::json!(ids)
+}
+
+/// Matches `@All` / `@Tất cả` and `@<member_name>` spans inside a group message
+/// and builds Zalo's UTF-16 `MentionItem` descriptors for `/api/group/mention`.
+pub(crate) fn build_group_mentions(
+    text: &str,
+    members: &[(String, String)],
+) -> Vec<zalo_client::MentionItem> {
+    if !text.contains('@') {
+        return Vec::new();
+    }
+    let mut candidates: Vec<(&str, &str, i64)> = Vec::with_capacity(members.len() + 2);
+    candidates.push(("-1", "All", 1));
+    candidates.push(("-1", "Tất cả", 1));
+    for (uid, name) in members {
+        let trimmed = name.trim();
+        if !uid.is_empty() && !trimmed.is_empty() {
+            candidates.push((uid.as_str(), trimmed, 0));
+        }
+    }
+    // Longest name first so `@Trường Nguyễn` wins over `@Trường`.
+    candidates.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+    let mut out = Vec::new();
+    let mut byte_idx = 0usize;
+    let bytes = text.as_bytes();
+    while byte_idx < bytes.len() {
+        let Some(rel) = text[byte_idx..].find('@') else {
+            break;
+        };
+        let at_pos = byte_idx + rel;
+        let prev_ok = at_pos == 0
+            || text[..at_pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_alphanumeric() && c != '_');
+        if !prev_ok {
+            byte_idx = at_pos + 1;
+            continue;
+        }
+        let after = &text[at_pos + 1..];
+        let matched = candidates.iter().find_map(|&(uid, name, kind)| {
+            let rest = after.strip_prefix(name)?;
+            let next_ok = rest.is_empty()
+                || rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| !c.is_alphanumeric() && c != '_');
+            next_ok.then_some((uid, name, kind))
+        });
+        if let Some((uid, name, kind)) = matched {
+            let span_end = at_pos + 1 + name.len();
+            let pos = text[..at_pos].encode_utf16().count();
+            let len = text[at_pos..span_end].encode_utf16().count();
+            out.push(zalo_client::MentionItem {
+                pos,
+                uid: uid.to_owned(),
+                len,
+                kind,
+            });
+            byte_idx = span_end;
+        } else {
+            byte_idx = at_pos + 1;
+        }
+    }
+    out
+}
+
+/// Parses `/api/social/profile/getmute` into normalized thread ids (`uid` / `g_<grid>`).
+pub(crate) fn muted_threads_from(value: &serde_json::Value) -> Vec<String> {
+    let root = value.get("data").unwrap_or(value);
+    let now_s = data::now_ms() / 1000;
+    let mut out = Vec::new();
+    let mut collect = |key: &str, group: bool| {
+        let Some(entries) = root.get(key) else {
+            return;
+        };
+        let list: Vec<&serde_json::Value> = if let Some(arr) = entries.as_array() {
+            arr.iter().collect()
+        } else if let Some(obj) = entries.as_object() {
+            obj.values().collect()
+        } else {
+            Vec::new()
+        };
+        for item in list {
+            let Some(id) = item
+                .get("id")
+                .or_else(|| item.get("chatId"))
+                .or_else(|| item.get("uid"))
+                .and_then(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                })
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            // Skip expired mute timers (`muteDuration > 0 && endTime < now`).
+            let expired = item
+                .get("endTime")
+                .or_else(|| item.get("muteUntil"))
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|t| t > 0 && t < now_s);
+            if expired {
+                continue;
+            }
+            if group && !id.starts_with("g_") {
+                out.push(format!("g_{}", id.trim_start_matches('g')));
+            } else {
+                out.push(id);
+            }
+        }
+    };
+    collect("chatEntries", false);
+    collect("groupChatEntries", true);
+    out
+}
+
+/// Parses `/api/conv/getUnreadMark` into normalized thread ids (`uid` / `g_<grid>`).
+pub(crate) fn unread_mark_threads_from(value: &serde_json::Value) -> HashSet<String> {
+    let root = value.get("data").unwrap_or(value);
+    let mut out = HashSet::new();
+    let mut collect = |key: &str, group: bool| {
+        let Some(arr) = root.get(key).and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for item in arr {
+            let raw = item
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| {
+                    item.get("id").and_then(|v| {
+                        v.as_str()
+                            .map(str::to_owned)
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
+                })
+                .unwrap_or_default();
+            if raw.is_empty() {
+                continue;
+            }
+            if group {
+                out.insert(format!(
+                    "g_{}",
+                    raw.trim_start_matches("g_").trim_start_matches('g')
+                ));
+            } else {
+                out.insert(raw);
+            }
+        }
+    };
+    collect("convsUser", false);
+    collect("convsGroup", true);
+    out
+}
+
+/// Parses `/api/preloadconvers/get-last-seen` into `(normalized_thread_id, global_msg_id)` pairs.
+pub(crate) fn last_seen_from(value: &serde_json::Value) -> Vec<(String, i64)> {
+    let root = value.get("data").unwrap_or(value);
+    let mut out = Vec::new();
+    let mut collect = |key: &str, group: bool| {
+        let Some(node) = root.get(key) else {
+            return;
+        };
+        if let Some(arr) = node.as_array() {
+            for item in arr {
+                let raw_id = item
+                    .get("id")
+                    .or_else(|| item.get("groupId"))
+                    .or_else(|| item.get("uid"))
+                    .and_then(|v| {
+                        v.as_str()
+                            .map(str::to_owned)
+                            .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    })
+                    .unwrap_or_default();
+                let msg_id = item
+                    .get("mId")
+                    .or_else(|| item.get("globalMsgId"))
+                    .or_else(|| item.get("lastSeenMsgId"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    })
+                    .unwrap_or(0);
+                if !raw_id.is_empty() && msg_id > 0 {
+                    let tid = if group && !raw_id.starts_with("g_") {
+                        format!("g_{}", raw_id.trim_start_matches('g'))
+                    } else {
+                        raw_id
+                    };
+                    out.push((tid, msg_id));
+                }
+            }
+        } else if let Some(map) = node.as_object() {
+            for (k, v) in map {
+                let msg_id = v
+                    .as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    .or_else(|| {
+                        v.get("mId")
+                            .or_else(|| v.get("globalMsgId"))
+                            .and_then(|x| {
+                                x.as_i64()
+                                    .or_else(|| x.as_str().and_then(|s| s.parse::<i64>().ok()))
+                            })
+                    })
+                    .unwrap_or(0);
+                if msg_id > 0 {
+                    let tid = if group && !k.starts_with("g_") {
+                        format!("g_{}", k.trim_start_matches('g'))
+                    } else {
+                        k.clone()
+                    };
+                    out.push((tid, msg_id));
+                }
+            }
+        }
+    };
+    collect("oneone", false);
+    collect("group", true);
+    out
+}
+
+/// Extracts group cloud messages from `/api/cm/rgetv2` or `/api/cm/mget` responses.
+fn cloud_group_items_from(
+    value: &serde_json::Value,
+    thread_id: &str,
+    self_uid: &str,
+) -> Vec<crate::realtime::Incoming> {
+    let root = value.get("data").unwrap_or(value);
+    let mut raw_msgs: Vec<&serde_json::Value> = Vec::new();
+    if let Some(arr) = root.as_array() {
+        raw_msgs.extend(arr.iter());
+    } else if let Some(arr) = root.get("msgs").and_then(serde_json::Value::as_array) {
+        raw_msgs.extend(arr.iter());
+    } else if let Some(arr) = root.get("messages").and_then(serde_json::Value::as_array) {
+        raw_msgs.extend(arr.iter());
+    } else if let Some(obj) = root.as_object() {
+        for v in obj.values() {
+            if let Some(arr) = v.as_array() {
+                raw_msgs.extend(arr.iter());
+            } else if let Some(arr) = v.get("msgs").and_then(serde_json::Value::as_array) {
+                raw_msgs.extend(arr.iter());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for item in raw_msgs {
+        if let Some(mut inc) = crate::realtime::parse_item(item, true, self_uid) {
+            if inc.thread_id.is_empty() || inc.thread_id == "g_" {
+                inc.thread_id = thread_id.to_owned();
+            }
+            out.push(inc);
+        }
+    }
+    out
+}
+
+/// Merges a server echo / sync [`crate::realtime::Incoming`] into an existing
+/// local [`ChatMsg`] row without ever leaving `MsgKind::Link` with an empty
+/// `href` or clobbering richer local text (`@All https://...`).
+///
+/// Returns `true` when media URLs changed and cached bitmaps should be refreshed.
+fn merge_incoming_into_row(row: &mut ChatMsg, m: &crate::realtime::Incoming) -> bool {
+    let mut upgraded_media = false;
+    if m.kind != crate::media::MsgKind::Text && row.kind == crate::media::MsgKind::Text {
+        row.kind = m.kind;
+        let resolved_href = if !m.href.is_empty() {
+            m.href.clone()
+        } else if m.kind == crate::media::MsgKind::Link {
+            crate::media::first_link(&m.text)
+                .or_else(|| crate::media::first_link(&row.text))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        // Preserve richer local text (e.g. "@All https://lza.lol") when
+        // the server link echo only carries the bare URL.
+        let keep_local_text = m.kind == crate::media::MsgKind::Link
+            && !row.text.trim().is_empty()
+            && !resolved_href.is_empty()
+            && m.text.trim() == resolved_href.trim()
+            && row.text.contains(&resolved_href)
+            && row.text.trim() != resolved_href.trim();
+        if !keep_local_text && !m.text.trim().is_empty() {
+            row.text = m.text.clone();
+        }
+        if !m.file_name.is_empty() {
+            row.file_name = m.file_name.clone();
+        }
+        if m.kind == crate::media::MsgKind::Link {
+            if !resolved_href.is_empty() {
+                row.href = resolved_href;
+            }
+        } else {
+            if !m.media_url.is_empty() {
+                row.media_url = m.media_url.clone();
+                row.media_path =
+                    crate::media::cache_path_for(&row.media_url).filter(|p| p.is_file());
+                upgraded_media = true;
+            }
+            if !resolved_href.is_empty() {
+                row.href = resolved_href;
+            }
+        }
+        if m.width > 0 {
+            row.media_w = m.width;
+        }
+        if m.height > 0 {
+            row.media_h = m.height;
+        }
+    } else if row.kind == crate::media::MsgKind::Photo
+        && m.kind == crate::media::MsgKind::Photo
+        && !m.media_url.is_empty()
+        && row.media_url != m.media_url
+        && !crate::media::is_thumb_photo_url(&m.media_url)
+    {
+        row.media_url = m.media_url.clone();
+        row.media_path = crate::media::cache_path_for(&row.media_url).filter(|p| p.is_file());
+        if m.width > 0 {
+            row.media_w = m.width;
+        }
+        if m.height > 0 {
+            row.media_h = m.height;
+        }
+        if crate::media::is_local_media_uri(&row.text) {
+            row.text = m.text.clone();
+        }
+        upgraded_media = true;
+    } else if row.kind == crate::media::MsgKind::Text
+        && (m.text == "Tin nhắn đã bị xóa"
+            || m.text == "[Tin nhắn đã tự xóa]"
+            || m.text.starts_with("[Việc cần làm]"))
+        && row.text != m.text
+    {
+        row.text = m.text.clone();
+    } else if row.href.is_empty() && !m.href.is_empty() {
+        row.href = m.href.clone();
+    }
+    if row.kind == crate::media::MsgKind::Link && row.href.is_empty() {
+        if let Some(url) = crate::media::first_link(&m.text)
+            .or_else(|| crate::media::first_link(&row.text))
+        {
+            row.href = url;
+        }
+    }
+    upgraded_media
 }
 
 #[cfg(test)]
@@ -6133,5 +7056,142 @@ mod tests {
             2,
             None
         ));
+    }
+
+    #[test]
+    fn p0_group_mentions_and_server_state_parsers() {
+        let members = vec![
+            ("101".to_owned(), "Trường".to_owned()),
+            ("102".to_owned(), "Trường Nguyễn".to_owned()),
+        ];
+        let mentions = build_group_mentions("Chào @Trường Nguyễn và @All nhé", &members);
+        assert_eq!(mentions.len(), 2);
+        assert_eq!(mentions[0].uid, "102");
+        assert_eq!(mentions[0].kind, 0);
+        assert_eq!(mentions[0].pos, "Chào ".encode_utf16().count());
+        assert_eq!(mentions[0].len, "@Trường Nguyễn".encode_utf16().count());
+        assert_eq!(mentions[1].uid, "-1");
+        assert_eq!(mentions[1].kind, 1);
+
+        let muted = muted_threads_from(&serde_json::json!({
+            "data": {
+                "chatEntries": [{"id": "555", "endTime": -1}],
+                "groupChatEntries": [{"id": "888", "endTime": -1}]
+            }
+        }));
+        assert!(muted.contains(&"555".to_owned()));
+        assert!(muted.contains(&"g_888".to_owned()));
+
+        let unread = unread_mark_threads_from(&serde_json::json!({
+            "data": {
+                "convsUser": [{"id": "111"}],
+                "convsGroup": [{"id": "222"}]
+            }
+        }));
+        assert!(unread.contains("111"));
+        assert!(unread.contains("g_222"));
+
+        let seen = last_seen_from(&serde_json::json!({
+            "data": {
+                "oneone": [{"id": "111", "mId": "9001"}],
+                "group": {"222": {"mId": 9002}}
+            }
+        }));
+        assert!(seen.contains(&("111".to_owned(), 9001)));
+        assert!(seen.contains(&("g_222".to_owned(), 9002)));
+    }
+
+    #[test]
+    fn link_echo_merge_preserves_text_and_never_leaves_empty_href() {
+        // Case 1: Full Zalo PC `recommened.link` echo matching local optimistic message
+        let mut local = ChatMsg::text_msg(
+            1,
+            10,
+            "g_4263295552360969008".into(),
+            true,
+            "Bạn".into(),
+            "1488852095078916019".into(),
+            "@All https://lza.lol".into(),
+            "18:05".into(),
+            1_795_604_752_138,
+            Some(1_795_604_752_138),
+            None,
+        );
+        let echo_json = serde_json::json!({
+            "uidFrom": "0",
+            "idTo": "4263295552360969008",
+            "cliMsgId": "1795604752138",
+            "msgId": "8528321999999",
+            "msgType": "chat.recommended",
+            "content": {
+                "action": "recommened.link",
+                "href": "https://lza.lol",
+                "title": "@All https://lza.lol",
+                "description": "",
+                "thumb": ""
+            }
+        });
+        let incoming =
+            crate::realtime::parse_item(&echo_json, true, "1488852095078916019").unwrap();
+        merge_incoming_into_row(&mut local, &incoming);
+        assert_eq!(local.kind, crate::media::MsgKind::Link);
+        assert_eq!(local.href, "https://lza.lol");
+        assert_eq!(local.text, "@All https://lza.lol");
+
+        // Case 2: Server echo carries ONLY bare URL while local optimistic row has "@All https://lza.lol"
+        let mut local2 = ChatMsg::text_msg(
+            2,
+            10,
+            "g_4263295552360969008".into(),
+            true,
+            "Bạn".into(),
+            "1488852095078916019".into(),
+            "@All https://lza.lol".into(),
+            "18:05".into(),
+            1_795_604_752_138,
+            Some(1_795_604_752_138),
+            None,
+        );
+        let bare_echo = crate::realtime::Incoming {
+            kind: crate::media::MsgKind::Link,
+            text: "https://lza.lol".into(),
+            href: String::new(), // worst-case empty href
+            from_me: true,
+            ..crate::realtime::Incoming::default()
+        };
+        merge_incoming_into_row(&mut local2, &bare_echo);
+        assert_eq!(local2.kind, crate::media::MsgKind::Link);
+        assert_eq!(local2.href, "https://lza.lol");
+        assert_eq!(local2.text, "@All https://lza.lol");
+    }
+
+    #[test]
+    fn compact_level_breakpoints_match_zalo_pc() {
+        assert_eq!(CompactLevel::for_width(1440.0, false), CompactLevel::Normal);
+        assert_eq!(CompactLevel::for_width(1225.0, false), CompactLevel::Normal);
+        assert_eq!(
+            CompactLevel::for_width(1224.0, false),
+            CompactLevel::SemiCompact
+        );
+        assert_eq!(
+            CompactLevel::for_width(960.0, false),
+            CompactLevel::SemiCompact
+        );
+        assert_eq!(
+            CompactLevel::for_width(881.0, false),
+            CompactLevel::SemiCompact
+        );
+        assert_eq!(CompactLevel::for_width(880.0, false), CompactLevel::Compact);
+        assert_eq!(CompactLevel::for_width(580.0, false), CompactLevel::Compact);
+        assert_eq!(CompactLevel::for_width(580.0, true), CompactLevel::Normal);
+
+        // At minimum window width 580 px in Compact mode, hiding the 344 px sidebar
+        // leaves 580 - 64 = 516 px for the chat pane — plenty of room for full bubbles
+        // + 4 floating actions beside the card with zero clipping.
+        let compact_580 =
+            crate::chat::ChatLayoutMetrics::for_chat_width(580.0 - zalo_design::MAIN_TAB_W, false);
+        assert!(!compact_580.actions_above);
+        assert_eq!(compact_580.chat_pane_w, 516.0);
+        assert!(compact_580.content_max_w >= 318.0);
     }
 }

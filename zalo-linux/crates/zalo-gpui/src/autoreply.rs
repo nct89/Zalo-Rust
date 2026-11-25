@@ -346,7 +346,7 @@ impl ShellView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .text_color(rgb(0xffffff))
+                                .text_color(rgb(crate::color::on_accent_fg()))
                                 .text_size(px(12.))
                                 .child(if on { "✓" } else { "" }),
                         )

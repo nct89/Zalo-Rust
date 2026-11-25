@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui::{
-    div, hsla, img, prelude::*, px, rgb, Context, InteractiveElement, IntoElement, ObjectFit,
+    div, img, prelude::*, px, rgb, Context, InteractiveElement, IntoElement, ObjectFit,
     ParentElement, Render, RenderImage, StatefulInteractiveElement, Styled, Timer, WeakEntity,
     Window,
 };
@@ -180,8 +180,8 @@ impl LoginView {
     }
 
     fn hamburger(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ink = 0x08_1b_3a;
-        let hover = 0xf1_f2_f4;
+        let ink = crate::color::token_rgb("--text-primary", "#081b3a");
+        let hover = crate::color::token_rgb("--layer-background-hover", "#f1f2f4");
         let open = self.menu_open;
         div()
             .id("login-hamburger")
@@ -216,11 +216,11 @@ impl LoginView {
     }
 
     fn login_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let paper = 0xff_ff_ff;
-        let ink = 0x08_1b_3a;
-        let muted = 0x5a_69_81;
-        let hover = 0xf1_f2_f4;
-        let line = hsla(0., 0., 0., 0.08);
+        let paper = crate::color::token_rgb("--layer-background", "#ffffff");
+        let ink = crate::color::token_rgb("--text-primary", "#081b3a");
+        let muted = crate::color::token_rgb("--text-secondary", "#5a6981");
+        let hover = crate::color::token_rgb("--layer-background-hover", "#f1f2f4");
+        let line = crate::color::border_vanish();
         let lang = if self.english {
             "English"
         } else {
@@ -343,12 +343,12 @@ fn encode_qr_prompt(prompt: &crate::login_flow::QrPrompt) -> Option<Arc<RenderIm
 
 impl Render for LoginView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Electron login window is always crisp white regardless of app Dark mode.
-        let ink = 0x08_1b_3a;
-        let muted = 0x5a_69_81;
-        let blue = 0x00_68_ff;
-        let field = 0xf1_f2_f4;
-        let error = 0xc3_18_18;
+        let paper = crate::color::token_rgb("--layer-background", "#ffffff");
+        let ink = crate::color::token_rgb("--text-primary", "#081b3a");
+        let muted = crate::color::token_rgb("--text-secondary", "#5a6981");
+        let blue = crate::color::token_rgb("--B55", "#0068ff");
+        let field = crate::color::token_rgb("--input-field-bg-filled", "#f1f2f4");
+        let error = crate::color::token_rgb("--R60", "#c31818");
         let expired = self.expired;
         let qr = self.qr.clone();
 
@@ -363,7 +363,7 @@ impl Render for LoginView {
                         .flex_col()
                         .size_full()
                         .overflow_hidden()
-                        .bg(rgb(0xff_ff_ff)),
+                        .bg(rgb(paper)),
                     true,
                     true,
                     true,

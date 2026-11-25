@@ -1338,7 +1338,7 @@ impl ShellView {
                                     .h(px(34.))
                                     .rounded(px(4.))
                                     .bg(rgb(blue))
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .text_size(px(13.5))
                                     .flex()
                                     .items_center()

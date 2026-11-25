@@ -31,7 +31,8 @@ pub use listener::{
 };
 pub use ops::{
     avatar_url_from, conv_id, voice_href_is_amr, voice_play_href, DeleteItem, LastOnline,
-    MediaItem, MediaPage, MediaPreview, QuoteTarget, Reaction, ARCHIVE_ADD, ARCHIVE_REMOVE,
+    LinkSendInfo, MediaItem, MediaPage, MediaPreview, MentionItem, MultiUndoItem, QuoteTarget,
+    Reaction, ARCHIVE_ADD, ARCHIVE_REMOVE,
     AVATAR_ERR_NO_PERMISSION, AVATAR_ERR_OVERSIZE, AVATAR_MAX_BYTES, AVATAR_MIN_BYTES,
     AVATAR_MIN_EDGE, AVATAR_SIZE, CONV_TYPE_GROUP, CONV_TYPE_OA, CONV_TYPE_USER, MEDIA_ERR_GONE,
     MEDIA_PREVIEW_LIMIT, MEDIA_STORE_FALLBACK, MEDIA_STORE_SEND2ME_FALLBACK, MEDIA_TYPE_FILE,

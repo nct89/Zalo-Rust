@@ -6,9 +6,9 @@
 use std::path::PathBuf;
 
 use zalo_client::{
-    conv_id, DeleteItem, Device, GifRef, QuoteTarget, Reaction, StickerRef, StoredSession, ZaloApi,
-    ARCHIVE_ADD, ARCHIVE_REMOVE, MSG_FILE, MSG_TEXT, MSG_VOICE, PIN_ADD, PIN_REMOVE, SET_MUTE,
-    UNSET_MUTE,
+    conv_id, DeleteItem, Device, GifRef, LinkSendInfo, MentionItem, MultiUndoItem, QuoteTarget,
+    Reaction, StickerRef, StoredSession, ZaloApi, ARCHIVE_ADD, ARCHIVE_REMOVE, MSG_FILE, MSG_TEXT,
+    MSG_VOICE, PIN_ADD, PIN_REMOVE, SET_MUTE, UNSET_MUTE,
 };
 
 use crate::data::live_allowed;
@@ -26,6 +26,10 @@ pub enum LiveAction {
         text: String,
         /// Quote target when the composer reply bar is set and ids exist.
         quote: Option<QuoteTarget>,
+        /// Structured group `@mention` spans (UTF-16 offsets).
+        mentions: Vec<MentionItem>,
+        /// Client language (`"vi"` / `"en"`).
+        language: String,
         /// Priority tag (`0` normal, `1` important, `2` urgent).
         urgency: u8,
         /// `clientId` / `cliMsgId`.
@@ -80,6 +84,15 @@ pub enum LiveAction {
         /// `cliMsgId` of the recalled bubble.
         cli_msg_id_undo: i64,
     },
+    /// Recall multiple messages in one call (`/api/message/multi_undo` or `/api/group/multi_undomsg`).
+    UndoMulti {
+        /// Parent thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Recalled message descriptors.
+        items: Vec<MultiUndoItem>,
+    },
     /// Delete for me.
     Delete {
         /// Parent thread.
@@ -118,6 +131,15 @@ pub enum LiveAction {
         text: String,
         /// `clientId`.
         client_id: u64,
+    },
+    /// Forward text to multiple conversations in one batch (`/api/message/mforward` & `/api/group/mforward`).
+    ForwardMulti {
+        /// `(thread_id, is_group)` destinations.
+        targets: Vec<(String, bool)>,
+        /// Body.
+        text: String,
+        /// Starting `clientId`.
+        base_client_id: u64,
     },
     /// Block messages and calls (`/api/friend/block`).
     Block {
@@ -309,6 +331,7 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
     | LiveAction::Mute { thread_id, .. }
     | LiveAction::Archive { thread_id, .. }
     | LiveAction::Undo { thread_id, .. }
+    | LiveAction::UndoMulti { thread_id, .. }
     | LiveAction::Delete { thread_id, .. }
     | LiveAction::React { thread_id, .. }
     | LiveAction::Forward {
@@ -359,7 +382,8 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
         LiveAction::SendVideo { .. } => Some("Gửi video"),
         LiveAction::SendContact { .. } => Some("Gửi danh thiếp"),
         LiveAction::Send { .. } => Some("Gửi tin"),
-        LiveAction::Forward { .. } => Some("Chia sẻ"),
+        LiveAction::Forward { .. } | LiveAction::ForwardMulti { .. } => Some("Chia sẻ"),
+        LiveAction::UndoMulti { .. } => Some("Thu hồi"),
         _ => None,
     };
     let silent = matches!(
@@ -374,6 +398,7 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
             quote,
             urgency,
             client_id,
+            ..
         } => Some((
             thread_id.clone(),
             *is_group,
@@ -531,6 +556,8 @@ pub fn flush_outbox(session_dir: PathBuf) {
                     is_group: item.is_group,
                     text: item.body.clone(),
                     quote,
+                    mentions: Vec::new(),
+                    language: "vi".into(),
                     urgency: item.urgency,
                     client_id: item.client_id,
                 };
@@ -725,12 +752,76 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             is_group,
             text,
             quote,
+            mentions,
+            language,
             urgency,
             client_id,
         } => {
             if let Some(quote) = quote {
                 api.send_quote(&thread_id, is_group, &text, client_id, &quote)
                     .await
+            } else if urgency == 0 && crate::media::first_link(&text).is_some() {
+                let href = crate::media::first_link(&text).unwrap_or_default();
+                let parsed = api.parse_link(&href).await.ok();
+                // Match Zalo PC: only upgrade to `sendLinkMessage` when
+                // `/api/message/parselink` actually returned rich preview
+                // metadata (title/desc/thumb). Otherwise send as a normal
+                // mention or text message so unparseable URLs never turn into
+                // empty `recommened.link` cards.
+                if has_rich_link_metadata(parsed.as_ref(), &href) {
+                    let info = build_link_send_info(&text, &href, parsed.as_ref());
+                    match api
+                        .send_link_message(
+                            &thread_id, is_group, &info, &mentions, client_id, &language,
+                        )
+                        .await
+                    {
+                        Ok(v) => Ok(v),
+                        Err(err) => {
+                            eprintln!("zalo-gpui send_link_message fallback to text: {err}");
+                            if is_group && !mentions.is_empty() {
+                                api.send_group_mention(
+                                    &thread_id, &text, &mentions, client_id, &language,
+                                )
+                                .await
+                            } else {
+                                api.send_text_with_urgency(
+                                    &thread_id, is_group, &text, client_id, urgency,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                } else if is_group && !mentions.is_empty() {
+                    match api
+                        .send_group_mention(&thread_id, &text, &mentions, client_id, &language)
+                        .await
+                    {
+                        Ok(v) => Ok(v),
+                        Err(err) => {
+                            eprintln!("zalo-gpui send_group_mention fallback to text: {err}");
+                            api.send_text_with_urgency(
+                                &thread_id, is_group, &text, client_id, urgency,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    api.send_text_with_urgency(&thread_id, is_group, &text, client_id, urgency)
+                        .await
+                }
+            } else if is_group && !mentions.is_empty() && urgency == 0 {
+                match api
+                    .send_group_mention(&thread_id, &text, &mentions, client_id, &language)
+                    .await
+                {
+                    Ok(v) => Ok(v),
+                    Err(err) => {
+                        eprintln!("zalo-gpui send_group_mention fallback to text: {err}");
+                        api.send_text_with_urgency(&thread_id, is_group, &text, client_id, urgency)
+                            .await
+                    }
+                }
             } else {
                 api.send_text_with_urgency(&thread_id, is_group, &text, client_id, urgency)
                     .await
@@ -779,6 +870,11 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             api.undo_message(&thread_id, is_group, msg_id, client_id, cli_msg_id_undo)
                 .await
         }
+        LiveAction::UndoMulti {
+            thread_id,
+            is_group,
+            items,
+        } => api.undo_multi_messages(&thread_id, is_group, &items).await,
         LiveAction::Delete {
             thread_id,
             is_group,
@@ -808,6 +904,14 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             text,
             client_id,
         } => api.forward_text(&dest_id, is_group, &text, client_id).await,
+        LiveAction::ForwardMulti {
+            targets,
+            text,
+            base_client_id,
+        } => api
+            .forward_multi_text(&targets, &text, base_client_id)
+            .await
+            .map(|_| serde_json::Value::Null),
         LiveAction::Block { uid } => api.set_block(&uid, true).await,
         LiveAction::SendPhoto {
             client_id: cid,
@@ -1101,6 +1205,92 @@ pub fn client_id() -> u64 {
     crate::data::now_ms().max(1) as u64
 }
 
+/// True when `/api/message/parselink` returned real preview metadata (a title
+/// distinct from the raw URL, a description, or a thumbnail), matching Zalo PC's
+/// `if (s) { n.type = MSG_LINK_CLIENT; ... }` gate.
+fn has_rich_link_metadata(parsed: Option<&serde_json::Value>, href: &str) -> bool {
+    let Some(v) = parsed else {
+        return false;
+    };
+    let preview = crate::links::from_parselink(v);
+    let url_trim = href.trim();
+    let has_real_title = !preview.title.trim().is_empty()
+        && preview.title.trim() != url_trim
+        && !preview.title.trim().starts_with("http://")
+        && !preview.title.trim().starts_with("https://");
+    let has_real_desc = !preview.desc.trim().is_empty()
+        && preview.desc.trim() != url_trim
+        && !preview.desc.trim().starts_with("http://")
+        && !preview.desc.trim().starts_with("https://");
+    let has_thumb = !preview.thumb.trim().is_empty()
+        && !preview.thumb.contains("default")
+        && !preview.thumb.contains("placeholder");
+    has_real_title || has_real_desc || has_thumb
+}
+
+fn build_link_send_info(
+    msg: &str,
+    href: &str,
+    parsed: Option<&serde_json::Value>,
+) -> LinkSendInfo {
+    let root = parsed
+        .and_then(|v| v.get("data").filter(|d| d.is_object()).or(Some(v)))
+        .filter(|v| v.is_object());
+    let pick = |keys: &[&str]| -> String {
+        root.and_then(|r| {
+            keys.iter().find_map(|k| {
+                r.get(*k)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_default()
+    };
+    let host = href
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| href.trim().strip_prefix("http://"))
+        .and_then(|s| s.split('/').next())
+        .unwrap_or("")
+        .to_owned();
+    let title = pick(&["title", "mediaTitle"]);
+    let desc = pick(&["desc", "description"]);
+    let thumb = pick(&["thumb", "thumbUrl", "ogImage"]);
+    let src = {
+        let s = pick(&["src", "domain"]);
+        if s.is_empty() { host } else { s }
+    };
+    let media = root
+        .and_then(|r| r.get("media"))
+        .map(|m| {
+            if let Some(s) = m.as_str() {
+                s.to_owned()
+            } else {
+                m.to_string()
+            }
+        })
+        .unwrap_or_else(|| "{}".to_owned());
+    let link_type = root
+        .and_then(|r| r.get("type").and_then(serde_json::Value::as_i64))
+        .unwrap_or(0);
+    LinkSendInfo {
+        msg: msg.to_owned(),
+        href: href.to_owned(),
+        src,
+        title: if title.is_empty() {
+            href.to_owned()
+        } else {
+            title
+        },
+        desc,
+        thumb,
+        media,
+        link_type,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,6 +1316,8 @@ mod tests {
                 is_group: false,
                 text: "no".into(),
                 quote: None,
+                mentions: Vec::new(),
+                language: "vi".into(),
                 urgency: 0,
                 client_id: 1,
             },
@@ -1135,5 +1327,30 @@ mod tests {
             LiveAction::Block { uid: "1".into() },
             PathBuf::from("/tmp/zalo-gpui-no-session"),
         );
+    }
+
+    #[test]
+    fn rich_link_metadata_gate_matches_zalo_pc() {
+        assert!(!has_rich_link_metadata(None, "https://lza.lol"));
+        assert!(!has_rich_link_metadata(
+            Some(&serde_json::json!({})),
+            "https://lza.lol"
+        ));
+        assert!(!has_rich_link_metadata(
+            Some(&serde_json::json!({"data": {"title": "https://lza.lol", "desc": "", "thumb": ""}})),
+            "https://lza.lol"
+        ));
+        assert!(has_rich_link_metadata(
+            Some(&serde_json::json!({"data": {"title": "Example Domain", "desc": "", "thumb": ""}})),
+            "https://example.com"
+        ));
+        assert!(has_rich_link_metadata(
+            Some(&serde_json::json!({"data": {"title": "", "desc": "Useful page", "thumb": ""}})),
+            "https://example.com"
+        ));
+        assert!(has_rich_link_metadata(
+            Some(&serde_json::json!({"data": {"title": "", "desc": "", "thumb": "https://cdn.example/og.jpg"}})),
+            "https://example.com"
+        ));
     }
 }

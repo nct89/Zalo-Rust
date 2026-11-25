@@ -1004,7 +1004,7 @@ impl ShellView {
                                                             .py(px(1.5))
                                                             .rounded(px(9.))
                                                             .bg(rgb(if dark {
-                                                                0x12_15_1a
+                                                                0x14_14_14
                                                             } else {
                                                                 0x1c_24_30
                                                             }))

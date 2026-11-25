@@ -1,6 +1,6 @@
 //! Account profile, group management, and `.zdb4` backup decryption dialogs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -220,6 +220,102 @@ fn biz_from(root: &serde_json::Value) -> BizCard {
         website: pick(&["website", "url"]),
         email: pick(&["email"]),
     }
+}
+
+/// Parses `/api/social/friend/get-bizacc` response into [`BizCard`], merging onto `base`.
+#[must_use]
+pub(crate) fn merge_biz_card(mut base: BizCard, value: &serde_json::Value) -> BizCard {
+    let root = value.get("data").filter(|v| v.is_object()).unwrap_or(value);
+    let biz = root
+        .get("biz")
+        .and_then(object_value)
+        .unwrap_or_else(|| root.clone());
+    if base.pkg_id == 0 {
+        if let Some(id) = root
+            .get("pkgId")
+            .or_else(|| biz.get("pkgId"))
+            .and_then(json_i64)
+        {
+            base.pkg_id = id;
+        }
+    }
+    let pick = |keys: &[&str]| json_text(&biz, keys);
+    if base.desc.is_empty() {
+        base.desc = pick(&["desc", "description"]);
+    }
+    if base.addr.is_empty() {
+        base.addr = pick(&["addr", "address"]);
+    }
+    if base.website.is_empty() {
+        base.website = pick(&["website", "url"]);
+    }
+    if base.email.is_empty() {
+        base.email = pick(&["email"]);
+    }
+    base
+}
+
+/// Parses `/api/conv/autodelete/getConvers` into a `bare_id -> ttl_ms` map.
+#[must_use]
+pub(crate) fn autodelete_map_from(value: &Value) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    let root = value.get("data").filter(|v| !v.is_null()).unwrap_or(value);
+    let Some(convers) = root.get("convers").and_then(Value::as_array) else {
+        return out;
+    };
+    for item in convers {
+        let dest = json_text(item, &["destId", "threadId"]);
+        if dest.is_empty() {
+            continue;
+        }
+        let Some(ttl) = item.get("ttl").and_then(json_i64) else {
+            continue;
+        };
+        let bare = dest
+            .strip_prefix("g_")
+            .or_else(|| dest.strip_prefix('g'))
+            .unwrap_or(&dest)
+            .to_owned();
+        out.insert(dest, ttl);
+        if !bare.is_empty() {
+            out.insert(bare, ttl);
+        }
+    }
+    out
+}
+
+/// Formats `/api/group/quota/community` reply into a short Vietnamese quota line.
+#[must_use]
+pub(crate) fn community_quota_summary(value: &Value) -> Option<String> {
+    let root = value.get("data").filter(|v| v.is_object()).unwrap_or(value);
+    let used = root
+        .get("used")
+        .or_else(|| root.get("current"))
+        .or_else(|| root.get("totalUsed"))
+        .or_else(|| root.get("count"))
+        .and_then(json_i64);
+    let max = root
+        .get("max")
+        .or_else(|| root.get("limit"))
+        .or_else(|| root.get("quota"))
+        .or_else(|| root.get("maxQuota"))
+        .or_else(|| root.get("total"))
+        .and_then(json_i64);
+    let remain = root
+        .get("remain")
+        .or_else(|| root.get("remaining"))
+        .and_then(json_i64);
+    if let (Some(u), Some(m)) = (used, max) {
+        return Some(format!("Hạn mức cộng đồng: {u}/{m} nhóm đã nâng cấp"));
+    }
+    if let Some(r) = remain {
+        return Some(format!("Hạn mức cộng đồng: còn {r} lượt nâng cấp"));
+    }
+    if let Some(m) = max {
+        return Some(format!("Hạn mức cộng đồng tối đa: {m} nhóm"));
+    }
+    let msg = json_text(root, &["message", "desc", "title"]);
+    (!msg.is_empty()).then_some(msg)
 }
 
 /// Zalo's placeholder cover ends with `default` and is not a photo.
@@ -644,6 +740,8 @@ pub struct GroupManageDlg {
     pub(crate) total_member: Option<i64>,
     /// Second click calls `/api/group/upgrade/community`. Owner only. Never fired from tests.
     pub(crate) community_armed: bool,
+    /// Quota line from `/api/group/quota/community`.
+    pub(crate) community_quota: Option<String>,
     /// TTL from `getConvers` when this thread is in the server list.
     pub(crate) ttl_ms: Option<i64>,
     pub(crate) tab: GroupManageTab,
@@ -658,6 +756,16 @@ pub struct GroupManageDlg {
     pub(crate) error: Option<String>,
 }
 
+/// Auto-delete TTL picker modal state (`/api/conv/autodelete/updateConvers`).
+pub struct AutoDeleteDlg {
+    pub(crate) thread_id: String,
+    pub(crate) name: String,
+    pub(crate) is_group: bool,
+    pub(crate) selected_ttl: i64,
+    pub(crate) busy: bool,
+    pub(crate) error: Option<String>,
+}
+
 /// Account info modal opened when clicking a `@mention` or peer name.
 pub struct UserInfoDlg {
     pub(crate) uid: String,
@@ -667,6 +775,7 @@ pub struct UserInfoDlg {
     pub(crate) birthday: String,
     pub(crate) phone: String,
     pub(crate) status: String,
+    pub(crate) biz: BizCard,
     pub(crate) cover_img: Option<Arc<RenderImage>>,
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
@@ -736,7 +845,15 @@ impl ShellView {
             group_type: None,
             total_member: None,
             community_armed: false,
-            ttl_ms: None,
+            community_quota: None,
+            ttl_ms: self
+                .auto_delete_ttl
+                .get(&tid)
+                .or_else(|| {
+                    let bare = tid.strip_prefix("g_").unwrap_or(&tid);
+                    self.auto_delete_ttl.get(bare)
+                })
+                .copied(),
             tab,
             settings: GroupSettingsState::default(),
             settings_busy: false,
@@ -753,6 +870,7 @@ impl ShellView {
         let Some(dir) = self.session_dir.clone() else {
             return;
         };
+        let lang = if self.english { "en" } else { "vi" };
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
@@ -763,18 +881,24 @@ impl ShellView {
                             .await
                             .map_err(|e| e.to_string())?;
                         let ttl = api.get_auto_delete_conversations().await.ok();
-                        Ok((info, ttl))
+                        let quota = api.get_community_quota(Some(&tid), lang).await.ok();
+                        Ok((info, ttl, quota))
                     })
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 let mine = view.self_member_ids();
                 let mut admin = false;
+                if let Ok((_, Some(ref ttl_val), _)) = res {
+                    for (k, v) in autodelete_map_from(ttl_val) {
+                        view.auto_delete_ttl.insert(k, v);
+                    }
+                }
                 if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
                     if d.conv_id == conv_id {
                         d.loading = false;
                         match res {
-                            Ok((val, ttl)) => {
+                            Ok((val, ttl, quota)) => {
                                 let (list, creator, admins) = crate::info::members_from(&val);
                                 d.creator = creator;
                                 d.admins = admins;
@@ -782,6 +906,8 @@ impl ShellView {
                                 let (kind, total) = group_kind_from(&val);
                                 d.group_type = kind;
                                 d.total_member = total;
+                                d.community_quota =
+                                    quota.as_ref().and_then(community_quota_summary);
                                 if let Some(value) = ttl.as_ref() {
                                     d.ttl_ms = zalo_client::features::autodelete_ttl_ms(
                                         value,
@@ -972,12 +1098,9 @@ impl ShellView {
                             })
                             .when_some(d.ttl_ms, |card, ms| {
                                 let text = if ms <= 0 {
-                                    "Máy chủ báo tin tự xóa đang tắt. Máy này không gửi lệnh đổi.".to_owned()
+                                    "Tin nhắn tự xóa: Không bao giờ".to_owned()
                                 } else {
-                                    format!(
-                                        "Tin tự xóa sau {}. Máy này không gửi lệnh đổi thời hạn.",
-                                        ttl_caption(ms)
-                                    )
+                                    format!("Tin nhắn tự xóa: sau {}", ttl_caption(ms))
                                 };
                                 card.child(
                                     div()
@@ -1017,6 +1140,12 @@ impl ShellView {
                                     cx.notify();
                                 },
                             )))
+                            .child(action_btn("gm-autodelete", "Tin nhắn tự xóa", false).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.open_auto_delete(conv_id, cx);
+                                    cx.notify();
+                                }),
+                            ))
                             .child(action_btn("gm-leave", leave_label, true).on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     let armed = matches!(
@@ -1077,8 +1206,16 @@ impl ShellView {
                                     )
                                 })
                                 .when(!community, |col| {
-                                    let confirm = "Nâng cấp không hoàn tác từ máy này. Bấm lần nữa để gửi /api/group/upgrade/community.";
-                                    col.child(
+                                    let confirm = "Sau khi nâng cấp thành cộng đồng sẽ không thể hoàn tác. Bấm lần nữa để xác nhận.";
+                                    col.when_some(d.community_quota.clone(), |col, q| {
+                                        col.child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .text_color(rgb(muted))
+                                                .child(q),
+                                        )
+                                    })
+                                    .child(
                                         action_btn("gm-community", community_label, false).on_click(cx.listener(
                                             move |this, _, _, cx| {
                                                 let armed = matches!(
@@ -1223,6 +1360,264 @@ impl ShellView {
             });
         })
         .detach();
+    }
+
+    /// Loads per-conversation auto-delete TTLs once per session.
+    pub(crate) fn load_auto_delete(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.has_session {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.get_auto_delete_conversations()
+                            .await
+                            .map(|v| autodelete_map_from(&v))
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            if let Ok(map) = res {
+                let _ = this.update(cx, |view, cx| {
+                    view.auto_delete_ttl = map;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Current auto-delete TTL in milliseconds for `thread_id` (`0` = off).
+    #[must_use]
+    pub(crate) fn thread_ttl_ms(&self, thread_id: &str) -> i64 {
+        let bare = thread_id
+            .strip_prefix("g_")
+            .or_else(|| thread_id.strip_prefix('g'))
+            .unwrap_or(thread_id);
+        self.auto_delete_ttl
+            .get(thread_id)
+            .or_else(|| self.auto_delete_ttl.get(bare))
+            .copied()
+            .unwrap_or(0)
+            .max(0)
+    }
+
+    /// Short Vietnamese label for `thread_id`'s auto-delete TTL.
+    #[must_use]
+    pub(crate) fn thread_ttl_label(&self, thread_id: &str) -> String {
+        let ms = self.thread_ttl_ms(thread_id);
+        if ms <= 0 {
+            str_vi("STR_NEVER", "Không bao giờ").trim().to_owned()
+        } else {
+            ttl_caption(ms)
+        }
+    }
+
+    /// Opens the "Tin nhắn tự xóa" picker dialog for a 1-1 or group conversation.
+    pub(crate) fn open_auto_delete(&mut self, conv_id: u64, _cx: &mut Context<Self>) {
+        let Some(conv) = self.conv(conv_id).cloned() else {
+            return;
+        };
+        let current = self.thread_ttl_ms(&conv.thread_id);
+        self.dialog = Some(Dialog::AutoDelete(AutoDeleteDlg {
+            thread_id: conv.thread_id,
+            name: conv.name,
+            is_group: conv.is_group,
+            selected_ttl: current,
+            busy: false,
+            error: None,
+        }));
+    }
+
+    /// Saves the selected TTL via `/api/conv/autodelete/updateConvers`.
+    pub(crate) fn save_auto_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::AutoDelete(d)) = self.dialog.as_ref() else {
+            return;
+        };
+        if d.busy {
+            return;
+        }
+        let thread_id = d.thread_id.clone();
+        let is_group = d.is_group;
+        let ttl_ms = d.selected_ttl;
+        let bare = thread_id
+            .strip_prefix("g_")
+            .or_else(|| thread_id.strip_prefix('g'))
+            .unwrap_or(&thread_id)
+            .to_owned();
+        if !self.has_session || cfg!(test) || !crate::data::live_allowed(&thread_id) {
+            self.auto_delete_ttl.insert(thread_id, ttl_ms);
+            self.auto_delete_ttl.insert(bare, ttl_ms);
+            self.dialog = None;
+            self.set_note(if ttl_ms <= 0 {
+                "Đã tắt tin nhắn tự xóa (xem trước)"
+            } else {
+                "Đã cập nhật thời gian tin nhắn tự xóa (xem trước)"
+            });
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let lang = if self.english { "en" } else { "vi" };
+        if let Some(Dialog::AutoDelete(dlg)) = self.dialog.as_mut() {
+            dlg.busy = true;
+            dlg.error = None;
+        }
+        let tid_req = thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.update_auto_delete_conversation(&tid_req, is_group, ttl_ms, lang)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(()) => {
+                        view.auto_delete_ttl.insert(thread_id, ttl_ms);
+                        view.auto_delete_ttl.insert(bare, ttl_ms);
+                        view.dialog = None;
+                        view.set_note(if ttl_ms <= 0 {
+                            "Đã tắt tin nhắn tự xóa".to_owned()
+                        } else {
+                            format!("Đã bật tin nhắn tự xóa sau {}", ttl_caption(ttl_ms))
+                        });
+                    }
+                    Err(err) => {
+                        if let Some(Dialog::AutoDelete(dlg)) = view.dialog.as_mut() {
+                            dlg.busy = false;
+                            dlg.error = Some(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn auto_delete_el(
+        &self,
+        d: &AutoDeleteDlg,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        const OPTIONS: &[(i64, &str)] = &[
+            (0, "Không bao giờ"),
+            (86_400_000, "1 ngày"),
+            (604_800_000, "7 ngày"),
+            (2_592_000_000, "30 ngày"),
+        ];
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let danger = token_rgb("--R60", "#c31818");
+        let accent = crate::color::accent_bg();
+        let title = str_vi("STR_VANISH_MSGS", "Tin nhắn tự xóa");
+
+        div()
+            .w(px(380.))
+            .rounded(px(8.))
+            .bg(rgb(paper))
+            .text_color(rgb(ink))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .child(self.dialog_title_bar(title, cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(14.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(rgb(muted))
+                            .child(format!(
+                                "Chọn thời gian tự xóa tin nhắn mới trong «{}».",
+                                d.name
+                            )),
+                    )
+                    .children(OPTIONS.iter().enumerate().map(|(i, &(ms, label))| {
+                        let on = d.selected_ttl == ms;
+                        div()
+                            .id(("autodel-opt", i as u64))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(10.))
+                            .h(px(40.))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(hover)))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(Dialog::AutoDelete(dlg)) = this.dialog.as_mut() {
+                                    dlg.selected_ttl = ms;
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .size(px(18.))
+                                    .rounded(px(9.))
+                                    .border_2()
+                                    .border_color(if on {
+                                        rgb(accent).into()
+                                    } else {
+                                        crate::color::border_subtle()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(on, |dot| {
+                                        dot.child(
+                                            div()
+                                                .size(px(8.))
+                                                .rounded(px(4.))
+                                                .bg(rgb(accent)),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(ink))
+                                    .child(label),
+                            )
+                    }))
+                    .when_some(d.error.clone(), |el, err| {
+                        el.child(div().text_size(px(12.5)).text_color(rgb(danger)).child(err))
+                    }),
+            )
+            .child(dialog_footer(
+                "Hủy",
+                if d.busy { "Đang lưu…" } else { "Lưu" },
+                !d.busy,
+                cx.listener(|this, _, _, cx| {
+                    this.dialog = None;
+                    cx.notify();
+                }),
+                cx.listener(|this, _, _, cx| {
+                    this.save_auto_delete(cx);
+                    cx.notify();
+                }),
+            ))
     }
 
     /// Opens "Your Profile", fetching `/api/social/profile/me` when signed in.
@@ -1559,8 +1954,8 @@ impl ShellView {
                             .w_full()
                             .h(px(170.))
                             .overflow_hidden()
-                            .bg(rgb(0x6b83e8))
-                            .child(div().absolute().top_0().left_0().right_0().h(px(85.)).bg(rgb(0x8f8cf2)))
+                            .bg(rgb(if crate::color::is_dark() { 0x1e_1e_1e } else { 0x6b83e8 }))
+                            .child(div().absolute().top_0().left_0().right_0().h(px(85.)).bg(rgb(if crate::color::is_dark() { 0x28_28_28 } else { 0x8f8cf2 })))
                             .when_some(d.cover_img.clone(), |el, image| {
                                 el.child(
                                     img(image)
@@ -1692,7 +2087,7 @@ impl ShellView {
                                                     .flex_1()
                                                     .min_w(px(0.))
                                                     .text_size(px(14.5))
-                                                    .text_color(rgb(blue))
+                                                    .text_color(rgb(crate::color::link_fg()))
                                                     .truncate()
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(move |_, _, _, _| {
@@ -1926,6 +2321,7 @@ impl ShellView {
             birthday: String::new(),
             phone: String::new(),
             status: String::new(),
+            biz: BizCard::default(),
             cover_img: None,
             loading: can_fetch,
             error: None,
@@ -1960,7 +2356,13 @@ impl ShellView {
                             })
                             .cloned()
                             .unwrap_or(val);
-                        Ok::<AccountMe, String>(me_from_value(&entry))
+                        let mut info = me_from_value(&entry);
+                        if info.biz.pkg_id != 0 {
+                            if let Ok(biz_val) = api.get_biz_card(&fetch_uid).await {
+                                info.biz = merge_biz_card(info.biz, &biz_val);
+                            }
+                        }
+                        Ok::<AccountMe, String>(info)
                     })
                 })
                 .await;
@@ -1979,6 +2381,7 @@ impl ShellView {
                                 d.birthday = info.birthday;
                                 d.phone = info.phone;
                                 d.status = info.status;
+                                d.biz = info.biz;
                                 if !info.cover.is_empty() {
                                     cover_url = Some(info.cover);
                                 }
@@ -2090,7 +2493,7 @@ impl ShellView {
                             .w_full()
                             .h(px(148.))
                             .overflow_hidden()
-                            .bg(rgb(0x6b83e8))
+                            .bg(rgb(if crate::color::is_dark() { 0x1e_1e_1e } else { 0x6b83e8 }))
                             .child(
                                 div()
                                     .absolute()
@@ -2098,7 +2501,7 @@ impl ShellView {
                                     .left_0()
                                     .right_0()
                                     .h(px(74.))
-                                    .bg(rgb(0x8f8cf2)),
+                                    .bg(rgb(if crate::color::is_dark() { 0x28_28_28 } else { 0x8f8cf2 })),
                             )
                             .when_some(d.cover_img.clone(), |el, image| {
                                 el.child(
@@ -2202,7 +2605,13 @@ impl ShellView {
                                         .h(px(36.))
                                         .rounded(px(4.))
                                         .bg(rgb(blue_soft))
-                                        .hover(|st| st.bg(rgb(0xd4_e6_ff)))
+                                        .hover(|st| {
+                                            st.bg(rgb(if crate::color::is_dark() {
+                                                0x32_32_32
+                                            } else {
+                                                0xd4_e6_ff
+                                            }))
+                                        })
                                         .cursor_pointer()
                                         .flex()
                                         .flex_row()
@@ -2263,6 +2672,66 @@ impl ShellView {
                                 ink,
                                 muted,
                             ))
+                            .when(
+                                d.biz.pkg_id != 0
+                                    || !d.biz.desc.is_empty()
+                                    || !d.biz.addr.is_empty()
+                                    || !d.biz.website.is_empty()
+                                    || !d.biz.email.is_empty(),
+                                |el| {
+                                    let website = d.biz.website.clone();
+                                    let email = d.biz.email.clone();
+                                    el.child(div().h(px(1.)).my(px(8.)).w_full().bg(rgb(subtle)))
+                                        .child(
+                                            div()
+                                                .pb(px(4.))
+                                                .text_size(px(15.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .child(str_vi(
+                                                    "STR_BUSINESS_INFO_TITLE",
+                                                    "Thông tin kinh doanh",
+                                                )),
+                                        )
+                                        .when(!d.biz.desc.is_empty(), |col| {
+                                            col.child(profile_kv(
+                                                str_vi("STR_BUSINESS_INFO_DESC", "Mô tả"),
+                                                &d.biz.desc,
+                                                ink,
+                                                muted,
+                                            ))
+                                        })
+                                        .when(!d.biz.addr.is_empty(), |col| {
+                                            col.child(profile_kv(
+                                                str_vi("STR_BUSINESS_INFO_ADDR", "Địa chỉ"),
+                                                &d.biz.addr,
+                                                ink,
+                                                muted,
+                                            ))
+                                        })
+                                        .when(!website.is_empty(), |col| {
+                                            let url = website.clone();
+                                            col.child(
+                                                div()
+                                                    .id("ui-biz-web")
+                                                    .cursor_pointer()
+                                                    .on_click(move |_, _, cx| {
+                                                        if url.starts_with("http") {
+                                                            cx.open_url(&url);
+                                                        }
+                                                    })
+                                                    .child(profile_kv(
+                                                        "Website",
+                                                        &website,
+                                                        crate::color::link_fg(),
+                                                        muted,
+                                                    )),
+                                            )
+                                        })
+                                        .when(!email.is_empty(), |col| {
+                                            col.child(profile_kv("Email", &email, ink, muted))
+                                        })
+                                },
+                            )
                             .when(d.loading, |el| {
                                 el.child(
                                     div()
@@ -2359,7 +2828,7 @@ impl ShellView {
                         .px(px(12.))
                         .rounded(px(4.))
                         .bg(rgb(blue))
-                        .text_color(rgb(0xffffff))
+                        .text_color(rgb(crate::color::on_accent_fg()))
                         .text_size(px(13.5))
                         .font_family(FAMILY_SEMIBOLD)
                         .flex()
@@ -2398,7 +2867,11 @@ impl ShellView {
                     .cursor_pointer()
                     .text_size(px(13.5))
                     .bg(if active { rgb(blue) } else { rgb(subtle) })
-                    .text_color(rgb(if active { 0xffffff } else { ink }))
+                    .text_color(rgb(if active {
+                        crate::color::on_accent_fg()
+                    } else {
+                        ink
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(Dialog::Profile(dlg)) = this.dialog.as_mut() {
                             dlg.gender = code;
@@ -2903,10 +3376,10 @@ impl ShellView {
     ) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let blue = token_rgb("--blue", "#0068ff");
+        let blue = token_rgb("--B55", "#0068ff");
         let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
         let card = token_rgb("--layer-background", "#ffffff");
-        let danger = token_rgb("--danger", "#e53935");
+        let danger = token_rgb("--R60", "#c31818");
         let mine = self.self_member_ids();
         let can_manage = group_role_label(&mine, &d.creator, &d.admins) != "Thành viên";
         let conv_id = d.conv_id;
@@ -2949,7 +3422,11 @@ impl ShellView {
                             .bg(rgb(if active { blue } else { subtle }))
                             .text_size(px(12.))
                             .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(if active { 0xff_ffff } else { ink }))
+                            .text_color(rgb(if active {
+                                crate::color::on_accent_fg()
+                            } else {
+                                ink
+                            }))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
                                     dlg.tab = tab;
@@ -3091,7 +3568,7 @@ impl ShellView {
                                                                 .rounded(px(4.))
                                                                 .bg(rgb(blue))
                                                                 .text_size(px(11.5))
-                                                                .text_color(rgb(0xff_ffff))
+                                                                .text_color(rgb(crate::color::on_accent_fg()))
                                                                 .cursor_pointer()
                                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                                     this.review_group_pending(conv_id, uid_ok.clone(), true, cx);
@@ -3175,7 +3652,7 @@ impl ShellView {
                                                     .rounded(px(4.))
                                                     .bg(rgb(blue))
                                                     .text_size(px(12.))
-                                                    .text_color(rgb(0xff_ffff))
+                                                    .text_color(rgb(crate::color::on_accent_fg()))
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         this.mutate_group_link(conv_id, true, cx);
@@ -3761,5 +4238,57 @@ mod tests {
         }));
         assert!(link.enabled);
         assert_eq!(link.url, "https://zalo.me/g/abc");
+    }
+
+    #[test]
+    fn parses_autodelete_map_biz_card_and_community_quota() {
+        let map = autodelete_map_from(&serde_json::json!({
+            "data": {
+                "convers": [
+                    { "destId": "g_55", "ttl": 604_800_000 },
+                    { "destId": "88", "ttl": 86_400_000 }
+                ]
+            }
+        }));
+        assert_eq!(map.get("g_55"), Some(&604_800_000));
+        assert_eq!(map.get("55"), Some(&604_800_000));
+        assert_eq!(map.get("88"), Some(&86_400_000));
+
+        let merged = merge_biz_card(
+            BizCard {
+                pkg_id: 2,
+                ..BizCard::default()
+            },
+            &serde_json::json!({
+                "data": {
+                    "biz": {
+                        "desc": "Cửa hàng chính hãng",
+                        "addr": "Quận 1, TP.HCM",
+                        "website": "https://zalo.me",
+                        "email": "shop@example.com"
+                    }
+                }
+            }),
+        );
+        assert_eq!(merged.pkg_id, 2);
+        assert_eq!(merged.desc, "Cửa hàng chính hãng");
+        assert_eq!(merged.addr, "Quận 1, TP.HCM");
+        assert_eq!(merged.website, "https://zalo.me");
+        assert_eq!(merged.email, "shop@example.com");
+
+        let q1 = community_quota_summary(&serde_json::json!({
+            "data": { "used": 1, "max": 3 }
+        }));
+        assert_eq!(
+            q1.as_deref(),
+            Some("Hạn mức cộng đồng: 1/3 nhóm đã nâng cấp")
+        );
+        let q2 = community_quota_summary(&serde_json::json!({
+            "data": { "remain": 2 }
+        }));
+        assert_eq!(
+            q2.as_deref(),
+            Some("Hạn mức cộng đồng: còn 2 lượt nâng cấp")
+        );
     }
 }

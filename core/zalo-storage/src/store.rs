@@ -436,6 +436,26 @@ impl LocalStore {
         Ok(out)
     }
 
+    /// Latest stored `sent_at` (ms) per `thread_id` for incremental post-login sync.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the query fails.
+    pub fn latest_sent_at_by_thread(
+        &self,
+    ) -> Result<std::collections::HashMap<String, i64>, StorageError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT thread_id, MAX(sent_at) FROM messages GROUP BY thread_id",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (tid, ts) = row?;
+            out.insert(tid, ts);
+        }
+        Ok(out)
+    }
+
     /// Newest server message id stored for direct threads and for groups,
     /// as `(direct, group)`. The realtime socket resumes after these.
     ///

@@ -192,7 +192,7 @@ fn lang_switch(
     on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl gpui::IntoElement {
     let dark = crate::color::is_dark();
-    let track = if dark { 0x38_3c_42 } else { 0xd9_dd_e3 };
+    let track = if dark { 0x2c_2c_2c } else { 0xd9_dd_e3 };
     let tip_text = if english {
         "Language: English"
     } else {
@@ -237,7 +237,7 @@ fn theme_switch(
     on_toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl gpui::IntoElement {
     let dark = crate::color::is_dark();
-    let track = if dark { 0x38_3c_42 } else { 0xd9_dd_e3 };
+    let track = if dark { 0x2c_2c_2c } else { 0xd9_dd_e3 };
     let knob = 0xff_ff_ff;
     let tip_text = "Giao diện";
     div()
@@ -273,7 +273,7 @@ fn theme_mark(dark: bool) -> gpui::AnyElement {
     let loaded = crate::fonts::awesome_loaded();
     let (glyph, color) = if dark {
         let mark = if loaded { crate::fonts::FA_MOON } else { '☾' };
-        (mark, rgb(0x28_2d_33))
+        (mark, rgb(0x1e_1e_1e))
     } else {
         let mark = if loaded { crate::fonts::FA_SUN } else { '☀' };
         (mark, rgb(0x6b_72_80))
@@ -588,7 +588,7 @@ fn render_distro_caption_btn(
         let hover_bg = if is_close {
             rgb(0xc4_2b_1c)
         } else if dark {
-            rgb(0x3a_3e_46)
+            rgb(0x30_30_30)
         } else {
             rgb(0xd4_d8_df)
         };
@@ -636,7 +636,7 @@ fn render_distro_caption_btn(
         hsla(0., 0., 0., 0.13)
     };
     let icon_color = if is_close && style == CaptionStyle::LinuxRound {
-        if dark { 0xee_f2_f6 } else { ink }
+        if dark { 0xf0_f0_f0 } else { ink }
     } else {
         ink
     };

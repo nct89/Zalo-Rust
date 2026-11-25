@@ -157,10 +157,12 @@ struct RenderKey {
     video_layout: VideoLayout,
     pinned: Option<PinTarget>,
     fullscreen: bool,
+    on_hold: bool,
 }
 /// Peer shown in the call windows.
 #[derive(Clone)]
 struct Peer {
+    uid: String,
     name: String,
     avatar: Option<Arc<RenderImage>>,
     /// Tiny decode stretched over the window: a cheap blur.
@@ -176,6 +178,7 @@ pub struct CallView {
     action_tx: Sender<UiAction>,
     focus: FocusHandle,
     muted: bool,
+    on_hold: bool,
     speaker_off: bool,
     hint: Option<(String, Instant)>,
     sound: Sound,
@@ -650,6 +653,7 @@ impl ShellView {
             .unwrap_or_default();
         let path = crate::media::cache_path_for(&url).filter(|p| p.is_file());
         Peer {
+            uid: uid.to_owned(),
             name,
             avatar: path
                 .as_ref()
@@ -1004,6 +1008,7 @@ fn new_view(
         action_tx,
         focus: cx.focus_handle(),
         muted: false,
+        on_hold: false,
         speaker_off: false,
         hint: None,
         sound: Sound::default(),
@@ -1056,6 +1061,7 @@ fn new_view(
             video_layout,
             pinned: None,
             fullscreen: false,
+            on_hold: false,
         },
         mic_drag: false,
         device_status_open: false,
@@ -1290,6 +1296,7 @@ impl CallView {
             video_layout: self.video_layout,
             pinned: self.pinned,
             fullscreen,
+            on_hold: self.on_hold,
         };
         let ui_changed = next_key != self.last_render_key;
         self.last_render_key = next_key;
@@ -1638,6 +1645,58 @@ impl CallView {
         self.hint = Some((text.to_owned(), Instant::now()));
     }
 
+    /// Toggles 1-1 call hold state and notifies the peer via `/api/voicecall/holdreq` or `unholdreq`.
+    fn toggle_hold(&mut self, cx: &mut Context<Self>) {
+        if self.group {
+            return;
+        }
+        let next = !self.on_hold;
+        self.on_hold = next;
+        // Mute mic while held; restore the user's mic preference when unholding.
+        self.send(UiAction::Mute {
+            on: next || self.muted,
+        });
+        self.say(if next {
+            "Đã tạm giữ cuộc gọi"
+        } else {
+            "Đã tiếp tục cuộc gọi"
+        });
+        let Some(dir) = self.audio.dir.clone().filter(|_| !cfg!(test)) else {
+            return;
+        };
+        let to_id = self.peer.uid.clone();
+        if to_id.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if next {
+                            api.send_hold_request(&to_id)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        } else {
+                            api.send_unhold_request(&to_id)
+                                .await
+                                .map(|_| ())
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                })
+                .await;
+            if let Err(err) = res {
+                let _ = this.update(cx, |view, cx| {
+                    view.say(&format!("Không gửi được lệnh giữ máy: {err}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Notice › answer: open the call window on the same call, close this one.
     fn accept(&mut self, cam_off: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.send(UiAction::Accept {
@@ -1802,7 +1861,7 @@ impl CallView {
             .rounded(px(4.))
             .bg(rgb(0x23_23_23))
             .when(tile.speaking, |d| {
-                d.border(px(1.5)).border_color(rgb(0x00_68_ff))
+                d.border(px(1.5)).border_color(rgb(0xf0_f0_f0))
             })
             .when(!tile.speaking, |d| {
                 d.border_1().border_color(hsla(0., 0., 1., 0.1))
@@ -2135,7 +2194,11 @@ impl CallView {
             .relative()
             .rounded(px(zalo_design::WINDOW_RADIUS))
             .overflow_hidden()
-            .bg(rgb(0x39_89_ff))
+            .bg(rgb(if crate::color::is_dark() {
+                0x1a_1a_1a
+            } else {
+                0x39_89_ff
+            }))
             .text_color(rgb(0xffffff))
             .font_family(crate::fonts::FAMILY_UI)
             .flex()
@@ -2229,8 +2292,18 @@ impl CallView {
                         .bottom(px(20.))
                         .h(px(40.))
                         .rounded(px(4.))
-                        .bg(rgb(0x2c_7f_e9))
-                        .hover(|s| s.bg(rgb(0x27_74_d8)))
+                        .bg(rgb(if crate::color::is_dark() {
+                            0x2c_2c_2c
+                        } else {
+                            0x2c_7f_e9
+                        }))
+                        .hover(|s| {
+                            s.bg(rgb(if crate::color::is_dark() {
+                                0x38_38_38
+                            } else {
+                                0x27_74_d8
+                            }))
+                        })
                         .cursor_pointer()
                         .flex()
                         .items_center()
@@ -2342,6 +2415,9 @@ impl CallView {
         };
         let mut peer_chips: Vec<&'static str> = Vec::new();
         if !self.group && up && !ended {
+            if self.on_hold {
+                peer_chips.push("Đang giữ cuộc gọi");
+            }
             if self.peer_muted {
                 peer_chips.push("Đã tắt micro");
             }
@@ -2758,6 +2834,46 @@ impl CallView {
                                 },
                             ))),
                     )
+                    .when(!self.group && up && !ended, |el| {
+                        let held = self.on_hold;
+                        el.child(
+                            div()
+                                .id("zcall-hold")
+                                .h(px(40.))
+                                .px(px(14.))
+                                .rounded(px(20.))
+                                .bg(rgb(if held { 0xf0_f0_f0 } else { 0x1d_1d_1d }))
+                                .border_1()
+                                .border_color(rgb(if held { 0xf0_f0_f0 } else { 0x3a_3a_3a }))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(5.))
+                                .cursor_pointer()
+                                .hover(move |s| {
+                                    s.bg(rgb(if held { 0xff_ff_ff } else { 0x2d_2d_2d }))
+                                })
+                                .text_size(px(12.5))
+                                .font_family(FAMILY_SEMIBOLD)
+                                .text_color(rgb(if held { 0x12_12_12 } else { 0xff_ff_ff }))
+                                .tooltip(move |_, cx| {
+                                    crate::widgets::tip(
+                                        if held {
+                                            "Tiếp tục cuộc gọi"
+                                        } else {
+                                            "Tạm giữ cuộc gọi"
+                                        },
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.toggle_hold(cx);
+                                    cx.notify();
+                                }))
+                                .child(if held { "Tiếp tục" } else { "Giữ máy" }),
+                        )
+                    })
                     .when(bar.show_full, |el| {
                         let right_x = if bar.show_layout { 95. } else { 50. };
                         el.child(

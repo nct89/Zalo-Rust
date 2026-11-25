@@ -1126,18 +1126,8 @@ impl Element for SelectableTextElement {
         if let Some(hitbox) = outer.as_ref() {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
         }
-        let underline_color: Hsla = gpui::rgb(crate::color::token_rgb("--B55", "#0068ff")).into();
-        for (hb, sub) in interactive_hitboxes.iter() {
+        for (hb, _sub) in interactive_hitboxes.iter() {
             window.set_cursor_style(CursorStyle::PointingHand, hb);
-            if hb.is_hovered(window) {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        point(sub.left(), sub.bottom() - px(2.0)),
-                        size(sub.size.width, px(1.0)),
-                    ),
-                    underline_color,
-                ));
-            }
         }
         let line_h = px(self.line_h);
         let highlight = selection_bg(crate::color::is_dark());
@@ -1222,7 +1212,7 @@ impl Element for SelectableTextElement {
 
 fn selection_bg(dark: bool) -> Hsla {
     if dark {
-        gpui::rgba(0x3b_82_f6_66).into()
+        gpui::hsla(0., 0., 1., 0.22)
     } else {
         gpui::rgba(0x00_68_ff_44).into()
     }

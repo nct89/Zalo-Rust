@@ -1039,14 +1039,14 @@ impl Render for PhotoView {
                 .rounded(px(6.))
                 .cursor_pointer()
                 .text_color(if active {
-                    rgb(0x4d_a3_ff)
+                    rgb(0xff_ff_ff)
                 } else {
-                    gpui::rgba(0xff_ff_ff_e0)
+                    gpui::rgba(0xff_ff_ff_c0)
                 })
                 .when(active, |el| {
-                    el.bg(hsla(0., 0., 1., 0.16))
+                    el.bg(hsla(0., 0., 1., 0.18))
                         .border_1()
-                        .border_color(gpui::rgba(0x4d_a3_ff_66))
+                        .border_color(hsla(0., 0., 1., 0.35))
                 })
                 .hover(|st| st.bg(hsla(0., 0., 1., 0.14)))
                 .tooltip(move |_, cx| crate::widgets::tip(label, cx))
@@ -1120,7 +1120,7 @@ impl Render for PhotoView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(rgb(0x16_18_1a))
+                                .bg(rgb(0x18_18_18))
                                 .border_2()
                                 .border_color(if selected {
                                     rgb(0xffffff).into()
@@ -1134,7 +1134,7 @@ impl Render for PhotoView {
                                         .h(px(74.))
                                         .object_fit(gpui::ObjectFit::Cover),
                                 ),
-                                None => cell.bg(rgb(0x3a_3d_40)).child(
+                                None => cell.bg(rgb(0x33_33_33)).child(
                                     div()
                                         .flex()
                                         .items_center()
@@ -1631,7 +1631,7 @@ impl Render for PhotoView {
                                                     .text_color(if has_prev {
                                                         rgb(0xffffff)
                                                     } else {
-                                                        rgb(0x6e_72_77)
+                                                        rgb(0x70_70_70)
                                                     })
                                                     .on_mouse_down(
                                                         gpui::MouseButton::Left,
@@ -1664,7 +1664,7 @@ impl Render for PhotoView {
                                                     .text_color(if has_next {
                                                         rgb(0xffffff)
                                                     } else {
-                                                        rgb(0x6e_72_77)
+                                                        rgb(0x70_70_70)
                                                     })
                                                     .on_mouse_down(
                                                         gpui::MouseButton::Left,
@@ -1723,10 +1723,12 @@ impl Render for PhotoView {
                                                     .px(px(14.))
                                                     .py(px(8.))
                                                     .rounded(px(8.))
-                                                    .bg(rgb(0x00_68_ff))
+                                                    .bg(rgb(0x28_28_28))
+                                                    .border_1()
+                                                    .border_color(hsla(0., 0., 1., 0.16))
                                                     .shadow_lg()
                                                     .text_size(px(13.))
-                                                    .text_color(rgb(0xff_ff_ff))
+                                                    .text_color(rgb(0xf0_f0_f0))
                                                     .on_mouse_down(
                                                         gpui::MouseButton::Left,
                                                         |_, _, cx| cx.stop_propagation(),
@@ -1909,11 +1911,11 @@ impl Render for PhotoView {
                                                                 .px(px(10.))
                                                                 .py(px(4.))
                                                                 .rounded(px(5.))
-                                                                .bg(rgb(0x00_68_ff))
-                                                                .hover(|s| s.bg(rgb(0x00_5a_e0)))
+                                                                .bg(rgb(0xf0_f0_f0))
+                                                                .hover(|s| s.bg(rgb(0xff_ff_ff)))
                                                                 .cursor_pointer()
                                                                 .font_family(FAMILY_SEMIBOLD)
-                                                                .text_color(rgb(0xff_ff_ff))
+                                                                .text_color(rgb(0x12_12_12))
                                                                 .on_click(cx.listener(
                                                                     |this, _, _, cx| {
                                                                         cx.stop_propagation();
@@ -2030,7 +2032,7 @@ impl Render for PhotoView {
                                         .size(px(36.))
                                         .flex_none()
                                         .rounded(px(18.))
-                                        .bg(rgb(0x0068ff))
+                                        .bg(rgb(0x36_36_36))
                                         .flex()
                                         .items_center()
                                         .justify_center()

@@ -1,9 +1,9 @@
 //! Chat column: header 68, empty `#ebecf0` body, composer tools 40 + input 52.
 
 use gpui::{
-    div, hsla, img, prelude::*, px, rgb, ClickEvent, Context, Focusable, Font, FontFallbacks,
-    FontFeatures, FontStyle, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled,
+    div, hsla, img, prelude::*, px, relative, rgb, ClickEvent, Context, Focusable, Font,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, InteractiveElement, IntoElement, ObjectFit,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled,
 };
 
 use crate::color::{str_vi, token_rgb};
@@ -79,6 +79,76 @@ pub const COMPOSER_INPUT_H: f32 = 51.0;
 /// `#chat-box-bar-id` 41 = border 1 + 40, buttons 32×32 at +5.
 pub const COMPOSER_BAR_H: f32 = 41.0;
 
+/// Single source of truth for every horizontal dimension in the conversation
+/// pane, derived directly from Zalo PC's CSS box model:
+/// - `.chat-item { padding: 0 16px }` (`ROW_PAD_X = 32`)
+/// - `.chat-content { margin-left: 10px; max-width: calc(100% - 50px) }` (`AVATAR_SLOT = 50`)
+/// - `.floating-menu-wrapper` + `.chat-message__actions` (`ACTION_RESERVE = 116`)
+/// - `.card--file { width: 376px; max-width: calc(100% - 137px) }`
+///
+/// Guarantees that at ANY window width (from `MIN_WIDTH_WINDOW_APP = 580 px` up
+/// to ultrawide), no message card, album, or floating quick-action bar can ever
+/// clip off the right edge or bleed into the conversation list on the left.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ChatLayoutMetrics {
+    pub chat_pane_w: f32,
+    pub row_inner_w: f32,
+    pub content_max_w: f32,
+    pub bubble_max_w: f32,
+    pub bubble_inner_w: f32,
+    pub album_max_w: f32,
+    pub photo_max_w: f32,
+    pub file_card_w: f32,
+    pub link_card_w: f32,
+    pub poll_card_w: f32,
+    pub compact_card_w: f32,
+    pub actions_above: bool,
+}
+
+impl ChatLayoutMetrics {
+    /// `.chat-item` left + right padding (`16 + 16`).
+    pub const ROW_PAD_X: f32 = 32.0;
+    /// Peer avatar (`40`) + gap (`10`) = Zalo PC `calc(100% - 50px)`.
+    pub const AVATAR_SLOT: f32 = 50.0;
+    /// Floating quick-action bar (`4 × 24 + 3 × 4 = 108`) + `8` px gap.
+    pub const ACTION_RESERVE: f32 = 116.0;
+    /// Multi-select checkbox gutter (`40` px on left).
+    pub const SELECT_GUTTER: f32 = 40.0;
+
+    #[must_use]
+    pub fn for_chat_width(chat_pane_w: f32, multi_select: bool) -> Self {
+        let pane_w = chat_pane_w.max(200.0);
+        let select_pad = if multi_select { Self::SELECT_GUTTER } else { 0.0 };
+        let row_inner_w = (pane_w - Self::ROW_PAD_X - select_pad).max(160.0);
+        let beside_budget = row_inner_w - Self::AVATAR_SLOT - Self::ACTION_RESERVE;
+        // On ultra-narrow panes where reserving 116 px beside the card leaves
+        // less than 180 px for content, dock the floating action bar above the
+        // card corner instead of clipping horizontally.
+        let actions_above = !multi_select && beside_budget < 180.0;
+        let content_max_w = if multi_select || actions_above {
+            (row_inner_w - Self::AVATAR_SLOT).max(120.0)
+        } else {
+            beside_budget
+        };
+        let bubble_max_w = media::BUBBLE_MAX.min(content_max_w);
+        let bubble_inner_w = (bubble_max_w - media::BUBBLE_PAD * 2.0).max(96.0);
+        Self {
+            chat_pane_w: pane_w,
+            row_inner_w,
+            content_max_w,
+            bubble_max_w,
+            bubble_inner_w,
+            album_max_w: 400.0_f32.min(content_max_w),
+            photo_max_w: media::PHOTO_MAX_W.min(content_max_w),
+            file_card_w: zalo_design::FILE_CARD_W.min(content_max_w),
+            link_card_w: 300.0_f32.min(content_max_w),
+            poll_card_w: 308.0_f32.min(content_max_w),
+            compact_card_w: 220.0_f32.min(content_max_w),
+            actions_above,
+        }
+    }
+}
+
 /// Outgoing receipt under the last bubble we sent.
 struct OutgoingStatus {
     /// "Sent", "Received", or "Seen".
@@ -139,6 +209,7 @@ impl ShellView {
         }
         let chat_bg = token_rgb("--layer-background-CSC", "#ebecf0");
         let round_br = (!self.info_open || self.info_overlay) && !self.msg_search_open;
+        let max_sticker_w = (self.chat_pane_w - 16.0).max(200.0);
         corners
             .apply(
                 div()
@@ -148,6 +219,7 @@ impl ShellView {
                     .flex_1()
                     .h_full()
                     .min_w(px(0.))
+                    .overflow_hidden()
                     .bg(rgb(chat_bg)),
                 false,
                 false,
@@ -170,6 +242,8 @@ impl ShellView {
                         .absolute()
                         .left(px(8.))
                         .bottom(px(COMPOSER_INPUT_H + COMPOSER_BAR_H + 8.0))
+                        .max_w(px(max_sticker_w))
+                        .overflow_hidden()
                         .child(self.sticker_panel(cx)),
                 )
             })
@@ -210,7 +284,7 @@ impl ShellView {
                     .items_center()
                     .rounded(px(3.))
                     .bg(rgb(token_rgb("--B55", "#0068ff")))
-                    .text_color(rgb(0xffffff))
+                    .text_color(rgb(crate::color::on_accent_fg()))
                     .font_family(FAMILY_SEMIBOLD)
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -360,7 +434,7 @@ impl ShellView {
             }))
             .child(
                 div()
-                    .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                    .text_color(rgb(crate::color::link_fg()))
                     .child(fonts::icon_el('\u{EC5B}', "💬", 20.)),
             )
             .child(
@@ -432,6 +506,9 @@ impl ShellView {
                 .find(|l| l.id == lid)
                 .map(|l| l.text.clone())
         });
+        let show_compact_back = self.solo.is_none()
+            && self.compact_level == crate::shell::CompactLevel::Compact;
+        let back_hover = token_rgb("--layer-background-hover", "#f1f2f4");
         div()
             .id("header")
             .flex()
@@ -444,6 +521,28 @@ impl ShellView {
             .bg(rgb(paper))
             .border_b_1()
             .border_color(line)
+            .when(show_compact_back, |el| {
+                el.child(
+                    div()
+                        .id("conv-back-btn")
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(px(32.))
+                        .mr(px(8.))
+                        .rounded(px(16.))
+                        .cursor_pointer()
+                        .text_color(rgb(ink))
+                        .hover(move |st| st.bg(rgb(back_hover)))
+                        .tooltip(|_, cx| tip("Quay lại danh sách hội thoại", cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.compact_show_chat = false;
+                            cx.notify();
+                        }))
+                        .child(fonts::icon_el(ic::CHEVRON_LEFT, "‹", 18.)),
+                )
+            })
             .child(self.header_identity(
                 conv,
                 members,
@@ -458,7 +557,6 @@ impl ShellView {
                 muted,
                 cx,
             ))
-            .child(div().flex_1().min_w(px(18.)))
             .child(self.header_actions(conv, cx))
     }
 
@@ -796,9 +894,11 @@ impl ShellView {
                     .flex_row()
                     .items_center()
                     .flex_none()
+                    .w_full()
+                    .overflow_hidden()
                     .h(px(COMPOSER_BAR_H))
                     .px(px(8.))
-                    .gap(px(12.))
+                    .gap(px(if self.chat_pane_w < 420.0 { 4. } else { 12. }))
                     .border_t_1()
                     .border_color(line)
                     .child(self.tool_btn(
@@ -1753,7 +1853,15 @@ impl ShellView {
                         .cursor_pointer()
                         .bg(rgb(if active { accent } else { hover }))
                         .text_size(px(12.))
-                        .text_color(rgb(if active { 0xff_ffff } else { ink }))
+                        .text_color(rgb(if active {
+                            if lvl == 0 {
+                                crate::color::on_accent_fg()
+                            } else {
+                                0xff_ffff
+                            }
+                        } else {
+                            ink
+                        }))
                         .child(label)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.urgency = lvl;
@@ -1911,7 +2019,7 @@ impl ShellView {
                 .absolute()
                 .left(px(12.))
                 .bottom(px(8.))
-                .w(px(300.))
+                .w(px(300.0_f32.min((self.chat_pane_w - 24.0).max(180.0))))
                 .rounded(px(8.))
                 .bg(rgb(paper))
                 .border_1()
@@ -1975,7 +2083,7 @@ impl ShellView {
                                         .justify_center()
                                         .text_size(px(15.))
                                         .font_family(FAMILY_SEMIBOLD)
-                                        .text_color(rgb(0xff_ffff))
+                                        .text_color(rgb(crate::color::on_accent_fg()))
                                         .child("@")
                                         .into_any_element()
                                 } else if let Some(p) = photo {
@@ -2094,6 +2202,7 @@ enum HeaderAction {
 #[derive(Clone)]
 enum MsgRowItem {
     LoadOlder(usize),
+    LoadOlderCloud,
     DateChip(String),
     Bubble {
         msg_idx: usize,
@@ -2114,6 +2223,12 @@ impl ShellView {
         let mut items: Vec<MsgRowItem> = Vec::with_capacity(msgs.len() + 8);
         if hidden > 0 {
             items.push(MsgRowItem::LoadOlder(hidden));
+        } else if row.is_group
+            && row.live
+            && self.has_session
+            && !self.cloud_history_exhausted.contains(&row.thread_id)
+        {
+            items.push(MsgRowItem::LoadOlderCloud);
         }
         let last_own_id = msgs
             .iter()
@@ -2220,7 +2335,9 @@ impl ShellView {
             .flex_col()
             .flex_1()
             .w_full()
+            .min_w(px(0.))
             .min_h(px(0.))
+            .overflow_hidden()
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
@@ -2380,7 +2497,7 @@ impl ShellView {
                                         .rounded(px(14.))
                                         .bg(rgb(token_rgb("--layer-background", "#ffffff")))
                                         .text_size(px(13.))
-                                        .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                                        .text_color(rgb(crate::color::link_fg()))
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.msg_window += crate::shell::MSG_WINDOW;
@@ -2392,6 +2509,46 @@ impl ShellView {
                                         .child(format!("Xem tin nhắn cũ hơn ({hidden_n})")),
                                 )
                                 .into_any_element(),
+                            MsgRowItem::LoadOlderCloud => {
+                                let busy = this.cloud_history_busy.contains(&row_owned.thread_id);
+                                div()
+                                    .id("load-older-cloud")
+                                    .flex()
+                                    .justify_center()
+                                    .w_full()
+                                    .pt(px(8.))
+                                    .pb(px(4.))
+                                    .child(
+                                        div()
+                                            .id("load-older-cloud-btn")
+                                            .px(px(12.))
+                                            .h(px(28.))
+                                            .flex()
+                                            .items_center()
+                                            .rounded(px(14.))
+                                            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
+                                            .text_size(px(13.))
+                                            .text_color(rgb(if busy {
+                                                token_rgb("--text-secondary", "#5a6981")
+                                            } else {
+                                                crate::color::link_fg()
+                                            }))
+                                            .when(!busy, |el| {
+                                                el.cursor_pointer().on_click(cx.listener(
+                                                    move |this, _, _, cx| {
+                                                        this.load_older_group_cloud(conv_id, cx);
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                            })
+                                            .child(if busy {
+                                                "Đang tải tin nhắn cũ…"
+                                            } else {
+                                                "Tải tin nhắn cũ hơn từ máy chủ"
+                                            }),
+                                    )
+                                    .into_any_element()
+                            }
                             MsgRowItem::DateChip(chip) => date_chip(chip).into_any_element(),
                             MsgRowItem::Bubble {
                                 msg_idx,
@@ -2661,7 +2818,10 @@ impl ShellView {
                     .children(faces.iter().map(|(uid, name)| self.receipt_face(uid, name)))
                     .when(extra > 0, |el| el.child(format!("+{extra}"))),
             )
-            .when(open && has_people, |el| el.child(receipt_panel(&pill)))
+            .when(open && has_people, |el| {
+                let m = ChatLayoutMetrics::for_chat_width(self.chat_pane_w, false);
+                el.child(receipt_panel(&pill, m.compact_card_w))
+            })
     }
 
     fn receipt_face(&self, uid: &str, name: &str) -> gpui::AnyElement {
@@ -2733,6 +2893,12 @@ impl ShellView {
         let starred = self.starred.contains(&msg.id);
         let pinned = self.pinned_msgs.contains(&msg.id);
         let click_msg = msg.clone();
+        let selecting = self
+            .select_msgs
+            .as_ref()
+            .filter(|(c, _)| *c == msg.conv)
+            .map(|(_, ids)| ids.contains(&row_id));
+        let metrics = ChatLayoutMetrics::for_chat_width(self.chat_pane_w, selecting.is_some());
         let media = matches!(
             msg.kind,
             MsgKind::Sticker | MsgKind::Gif | MsgKind::Photo | MsgKind::Doodle
@@ -2741,9 +2907,9 @@ impl ShellView {
         let quote_box = self.quote_card(&msg, media, cx);
         let has_quote = quote_box.is_some();
         let body = if album.len() > 1 {
-            self.album_body(album, msg.id, msg_idx, ink, cx)
+            self.album_body(album, msg.id, msg_idx, ink, metrics, cx)
         } else {
-            self.bubble_body(&msg, msg_idx, fill, ink, muted, cx)
+            self.bubble_body(&msg, msg_idx, fill, ink, muted, metrics, cx)
         };
         let show_sender = is_group && !msg.from_me && first;
         let urgency = self.urgency_msgs.get(&row_id).copied().unwrap_or(0);
@@ -2761,9 +2927,17 @@ impl ShellView {
         let border_c: gpui::Hsla = if phone.is_some() || search_focused {
             rgb(token_rgb("--B55", "#0068ff")).into()
         } else if search_active {
-            rgb(0x66a6ff).into()
+            if crate::color::is_dark() {
+                hsla(0., 0., 1., 0.35)
+            } else {
+                rgb(0x66a6ff).into()
+            }
         } else if media && msg.from_me {
-            rgb(0x66a6ff).into()
+            if crate::color::is_dark() {
+                hsla(0., 0., 1., 0.16)
+            } else {
+                rgb(0x66a6ff).into()
+            }
         } else {
             hsla(0., 0., 0., 0.)
         };
@@ -2780,11 +2954,19 @@ impl ShellView {
                 .bg(rgb(fill))
                 .border_1()
                 .border_color(border_c)
-                .max_w(px(media::BUBBLE_MAX + 40.0))
-                .when(phone.is_some(), |el| el.min_w(px(240.)))
+                .max_w(px(metrics.content_max_w))
+                .when(phone.is_some(), |el| {
+                    el.min_w(px(240.0_f32.min(metrics.content_max_w)))
+                })
                 .when(urgency > 0 && !media, |el| {
                     let (label, bg_c, fg_c) = if urgency >= 2 {
-                        ("Tin khẩn cấp", 0xfe_e2_e2, 0xb9_1c_1c)
+                        if crate::color::is_dark() {
+                            ("Tin khẩn cấp", 0x3b_18_18, 0xf8_71_71)
+                        } else {
+                            ("Tin khẩn cấp", 0xfe_e2_e2, 0xb9_1c_1c)
+                        }
+                    } else if crate::color::is_dark() {
+                        ("Tin quan trọng", 0x38_2b_14, 0xfb_bf_24)
                     } else {
                         ("Tin quan trọng", 0xfe_f3_c7, 0xb4_53_09)
                     };
@@ -2805,7 +2987,7 @@ impl ShellView {
                     let s_uid = msg.sender_uid.clone();
                     let s_name = msg.sender.clone();
                     let s_conv = msg.conv;
-                    let link_blue = token_rgb("--B55", "#0068ff");
+                    let link_blue = crate::color::link_fg();
                     el.child(
                         div()
                             .id(("bubble-sender", row_id))
@@ -2856,14 +3038,22 @@ impl ShellView {
                     )
                 })
         };
-        let actions = div()
-            .flex()
-            .flex_col()
-            .justify_end()
-            .flex_none()
-            .when(msg.from_me, |el| el.mr(px(8.)))
-            .when(!msg.from_me, |el| el.ml(px(8.)))
-            .child(self.hover_actions(&msg, &group, cx));
+        // Exact Zalo PC `.floating-menu-wrapper`: anchored absolutely to the
+        // message card (`left: 100% + 8px` for incoming, `right: 100% + 8px`
+        // for outgoing), or docked above the card corner on ultra-narrow panes.
+        let floating_actions = (selecting.is_none()).then(|| {
+            let wrap = div().absolute().flex().flex_row().flex_none();
+            let wrap = if metrics.actions_above {
+                wrap.top(px(-28.))
+                    .when(msg.from_me, |el| el.right_0())
+                    .when(!msg.from_me, |el| el.left_0())
+            } else if msg.from_me {
+                wrap.bottom(px(8.)).right(relative(1.0)).mr(px(8.))
+            } else {
+                wrap.bottom(px(8.)).left(relative(1.0)).ml(px(8.))
+            };
+            wrap.child(self.hover_actions(&msg, &group, cx))
+        });
         let react_summary = self
             .reactions
             .get(&row_id)
@@ -2994,20 +3184,17 @@ impl ShellView {
             .when_some(summary_pill, |el, pill| el.child(pill))
             .child(like_trigger);
         let menu_msg = msg.clone();
-        let selecting = self
-            .select_msgs
-            .as_ref()
-            .filter(|(c, _)| *c == msg.conv)
-            .map(|(_, ids)| ids.contains(&row_id));
         let content = div()
             .flex()
             .flex_col()
             .flex_none()
             .min_w(px(0.))
+            .max_w(px(metrics.content_max_w))
             .when(msg.from_me, |el| el.items_end())
             .when(!msg.from_me, |el| el.items_start())
             .child(
                 card.child(react)
+                    .when_some(floating_actions, |el, acts| el.child(acts))
                     .when(self.prefs.bool("peekGuard", false), |el| {
                         el.child(peek_cover(&group, fill))
                     }),
@@ -3071,7 +3258,7 @@ impl ShellView {
             .pt(px(if first { 12. } else { 4. }))
             .pb(px(if has_reacts { 14. } else { 12. }))
             .when(selecting.is_some(), |el| el.pl(px(40.)))
-            .when(msg.from_me, |el| el.justify_end().pl(px(88.)))
+            .when(msg.from_me, |el| el.justify_end())
             .when(!msg.from_me, |el| {
                 let fallback_user = str_vi("STR_ZALO_USER", "Người dùng Zalo");
                 let avatar_photo = self
@@ -3097,7 +3284,7 @@ impl ShellView {
                 let click_uid = avatar_uid.to_owned();
                 let click_name = avatar_name.to_owned();
                 let click_conv = msg.conv;
-                el.justify_start().pr(px(48.)).child(
+                el.justify_start().child(
                     div().flex_none().w(px(40.)).mr(px(10.)).when(first, |el| {
                         el.child(
                             div()
@@ -3146,13 +3333,7 @@ impl ShellView {
                     cx.notify();
                 }),
             )
-            .map(|el| {
-                if msg.from_me {
-                    el.child(actions).child(content)
-                } else {
-                    el.child(content).child(actions)
-                }
-            })
+            .child(content)
             // Multi-select: round tick on the left, and a transparent layer
             // that turns any click on the row into a toggle.
             .when_some(selecting, |el, on| {
@@ -3297,6 +3478,19 @@ impl ShellView {
                     },
                 )),
             )
+            .child({
+                let can_recall = picked(self).iter().any(|m| m.from_me && !m.recalled);
+                btn("sel-undo", '\u{ECF6}', "Thu hồi", red, can_recall).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let msgs = picked(this);
+                        if msgs.iter().any(|m| m.from_me && !m.recalled) {
+                            this.recall_selected_msgs(&msgs);
+                            this.select_msgs = None;
+                        }
+                        cx.notify();
+                    },
+                ))
+            })
             .child(
                 btn("sel-delete", '\u{EDCF}', "Xóa", red, any).on_click(cx.listener(
                     move |this, _, _, cx| {
@@ -3363,7 +3557,6 @@ impl ShellView {
             .flex_row()
             .flex_none()
             .gap(px(4.))
-            .mb(px(8.))
             .invisible()
             .group_hover(group.clone(), |st| st.visible())
             .child(mk("mqa-react", ic::TB_STICKER, "Thả cảm xúc").on_click(cx.listener(
@@ -3494,6 +3687,25 @@ impl ShellView {
             self.warm_media(msg.conv);
         }
         if let Some(conv) = self.conv(msg.conv).cloned() {
+            let (hidden, items) = self.build_msg_rows(&conv);
+            self.sync_msg_list(conv.id, items.len(), hidden);
+        }
+        self.msg_list.scroll_to_reveal_item(child_idx);
+    }
+
+    /// Select `conv_id` and scroll the chat list to `msg_id` (used by Starred Messages).
+    pub(crate) fn jump_to_msg_id(&mut self, conv_id: u64, msg_id: u64) {
+        self.select_conv(conv_id);
+        let Some((new_window, child_idx)) =
+            id_scroll_index(self.messages_of(conv_id), self.msg_window, msg_id)
+        else {
+            return;
+        };
+        if new_window > self.msg_window {
+            self.msg_window = new_window;
+            self.warm_media(conv_id);
+        }
+        if let Some(conv) = self.conv(conv_id).cloned() {
             let (hidden, items) = self.build_msg_rows(&conv);
             self.sync_msg_list(conv.id, items.len(), hidden);
         }
@@ -3671,16 +3883,8 @@ impl ShellView {
         let muted = token_rgb("--text-secondary", "#5a6981");
         let accent = token_rgb("--button-primary-normal", "#0068ff");
         let accent_hover = token_rgb("--button-primary-hover", "#005ae0");
-        let chip_active_bg = if crate::color::is_dark() {
-            0x17_31_57
-        } else {
-            0xe5_ef_ff
-        };
-        let chip_active_ink = if crate::color::is_dark() {
-            0x66_ad_ff
-        } else {
-            accent
-        };
+        let chip_active_bg = crate::color::accent_subtle_bg();
+        let chip_active_ink = crate::color::accent_fg();
 
         let has_q = !self.msg_search_q.trim().is_empty();
         let has_filter = self.msg_search_has_filter();
@@ -3819,7 +4023,11 @@ impl ShellView {
                                 .justify_center()
                                 .text_size(px(13.))
                                 .font_family(FAMILY_SEMIBOLD)
-                                .text_color(rgb(if m.from_me { 0xff_ff_ff } else { ink }))
+                                .text_color(rgb(if m.from_me {
+                                    crate::color::on_accent_fg()
+                                } else {
+                                    ink
+                                }))
                                 .child(initial)
                                 .into_any_element()
                         };
@@ -3917,7 +4125,7 @@ impl ShellView {
                     };
                     let clicked = cell.date;
                     let text_col = if is_edge {
-                        rgb(0xff_ff_ff)
+                        rgb(crate::color::on_accent_fg())
                     } else if !cell.in_month || is_future {
                         rgb(muted)
                     } else {
@@ -4362,7 +4570,7 @@ impl ShellView {
                                             .justify_center()
                                             .text_size(px(13.))
                                             .font_family(FAMILY_SEMIBOLD)
-                                            .text_color(rgb(0xff_ff_ff))
+                                            .text_color(rgb(crate::color::on_accent_fg()))
                                             .child("Xác nhận"),
                                     ),
                             ),
@@ -4424,7 +4632,7 @@ impl ShellView {
                             .text_size(px(10.5))
                             .font_family(FAMILY_SEMIBOLD)
                             .text_color(rgb(if key.as_deref() == Some("__me__") {
-                                0xff_ff_ff
+                                crate::color::on_accent_fg()
                             } else {
                                 ink
                             }))
@@ -4903,7 +5111,7 @@ impl ShellView {
         color: u32,
         max_w: f32,
     ) -> gpui::AnyElement {
-        let link_blue = token_rgb("--B55", "#0068ff");
+        let link_blue = crate::color::link_fg();
         let is_link = media::first_link(text).is_some_and(|u| text.trim() == u);
         let color = if is_link { link_blue } else { color };
         let mut colored_spans: Vec<(std::ops::Range<usize>, gpui::Hsla)> = Vec::new();
@@ -4982,6 +5190,7 @@ impl ShellView {
     /// Render a text message containing fenced or auto-detected source code blocks:
     /// clean monospace text directly on the chat bubble fill (no inner box fill),
     /// with preserved indentation/newlines, drag selection, and a one-click Copy button.
+    #[allow(clippy::too_many_arguments)]
     fn code_segments_body(
         &self,
         msg_id: u64,
@@ -4989,15 +5198,16 @@ impl ShellView {
         segments: Vec<crate::code_detect::MessageSegment>,
         ink: u32,
         muted: u32,
+        max_w: f32,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let dark = crate::color::is_dark();
-        let copy_hover = if dark { 0x30_36_3d } else { 0xd8_de_e4 };
+        let copy_hover = if dark { 0x2e_2e_2e } else { 0xd8_de_e4 };
         let mut col = div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .max_w(px(media::BUBBLE_INNER));
+            .max_w(px(max_w));
         for (seg_idx, seg) in segments.into_iter().enumerate() {
             let part = (seg_idx as u8).min(7);
             match seg {
@@ -5008,7 +5218,7 @@ impl ShellView {
                         part,
                         &t,
                         ink,
-                        media::BUBBLE_INNER,
+                        max_w,
                     ));
                 }
                 crate::code_detect::MessageSegment::Code { lang, code } => {
@@ -5021,7 +5231,7 @@ impl ShellView {
                         key,
                         order,
                         code,
-                        media::BUBBLE_INNER,
+                        max_w,
                         13.0,
                         19.5,
                         rgb(ink).into(),
@@ -5036,7 +5246,7 @@ impl ShellView {
                             .flex()
                             .flex_col()
                             .gap(px(4.))
-                            .max_w(px(media::BUBBLE_INNER))
+                            .max_w(px(max_w))
                             .child(
                                 div()
                                     .flex()
@@ -5060,7 +5270,7 @@ impl ShellView {
                                             .cursor_pointer()
                                             .text_size(px(11.5))
                                             .font_family(FAMILY_SEMIBOLD)
-                                            .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                                            .text_color(rgb(crate::color::link_fg()))
                                             .hover(move |st| st.bg(rgb(copy_hover)))
                                             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                                                 cx.stop_propagation();
@@ -5092,36 +5302,33 @@ impl ShellView {
         blue: u32,
         _muted: u32,
         _field: u32,
+        max_w: f32,
     ) -> gpui::AnyElement {
         // Plain URL rendered directly inside the bubble without a nested grey box.
         self.selectable_text(
-            msg_id,
-            msg_idx,
-            0,
-            href,
-            media::BUBBLE_INNER,
-            15.,
-            22.,
-            blue,
-            false,
+            msg_id, msg_idx, 0, href, max_w, 15., 22., blue, false,
         )
     }
 
-    /// One Electron `.card--group-photo`: cells in a row, caption once underneath.
+    /// One Electron `.card--group-photo`: cells scaled proportionally to
+    /// `metrics.album_max_w` (matching Zalo PC's `containerWidth` album layout),
+    /// caption once underneath.
     fn album_body(
         &self,
         album: &[ChatMsg],
         msg_id: u64,
         msg_idx: usize,
         ink: u32,
+        metrics: ChatLayoutMetrics,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        const MAX_W: f32 = 400.0;
         const GAP: f32 = 2.0;
+        let max_w = metrics.album_max_w;
         let cols = if album.len() <= 4 { album.len() } else { 3 };
         let cols = cols.max(1);
-        let cell_w = ((MAX_W - GAP * (cols as f32 - 1.0)) / cols as f32).max(72.0);
-        let cell_h = if cols >= 4 { 110.0 } else { 140.0 };
+        let cell_w = ((max_w - GAP * (cols as f32 - 1.0)) / cols as f32).max(48.0);
+        let scale = (max_w / 400.0).clamp(0.55, 1.0);
+        let cell_h = (if cols >= 4 { 110.0 } else { 140.0 } * scale).round();
         let field = token_rgb("--layer-background-subtle", "#ebecf0");
         let mut col = div().flex().flex_col().gap(px(GAP)).flex_none();
         for chunk in album.chunks(cols) {
@@ -5142,7 +5349,7 @@ impl ShellView {
                         msg_idx,
                         0,
                         &caption,
-                        MAX_W - 16.0,
+                        (max_w - 16.0).max(96.0),
                         14.0,
                         20.0,
                         ink,
@@ -5195,6 +5402,7 @@ impl ShellView {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bubble_body(
         &self,
         msg: &ChatMsg,
@@ -5202,9 +5410,11 @@ impl ShellView {
         fill: u32,
         ink: u32,
         muted: u32,
+        metrics: ChatLayoutMetrics,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let blue = token_rgb("--B60", "#005ae0");
+        let link_blue = crate::color::link_fg();
         let field = token_rgb("--input-field-bg-filled", "#f1f2f4");
         if msg.recalled {
             return wrapped_text(str_vi("STR_UNDO_MESSAGE", "Tin nhắn đã thu hồi"), muted);
@@ -5220,9 +5430,10 @@ impl ShellView {
                     })
                     .filter(|&(w, h)| w > 0 && h > 0)
                     .unwrap_or((msg.media_w, msg.media_h));
-                let (w, h) = media::photo_size(bw, bh);
+                let (w, h) = media::photo_size_within(bw, bh, metrics.photo_max_w);
                 let has_caption = !media::hide_marker_text(msg.kind, &msg.text);
-                let col_w = if has_caption { w.max(220.0) } else { w };
+                let min_cap_w = 220.0_f32.min(metrics.content_max_w);
+                let col_w = if has_caption { w.max(min_cap_w) } else { w };
                 let mut col = div().flex().flex_col().gap(px(6.)).w(px(col_w));
                 col = col.child(self.photo_block(msg, w, h, field, cx));
                 if has_caption {
@@ -5236,7 +5447,7 @@ impl ShellView {
                                 0,
                                 &msg.text,
                                 ink,
-                                (col_w - 16.0).max(160.0),
+                                (col_w - 16.0).max(96.0),
                             )),
                     );
                 }
@@ -5273,7 +5484,7 @@ impl ShellView {
                     None
                 };
                 let on_disk = local.is_some();
-                let card_w = zalo_design::FILE_CARD_W - media::BUBBLE_PAD * 2.0;
+                let card_w = (metrics.file_card_w - media::BUBBLE_PAD * 2.0).max(120.0);
                 let open_name = name.clone();
                 let open_path = local.clone();
                 let view_name = name.clone();
@@ -5374,7 +5585,7 @@ impl ShellView {
                                 .min_w(px(0.))
                                 .child(
                                     div()
-                                        .max_w(px(240.))
+                                        .max_w(px((card_w - 84.0).max(96.0)))
                                         .truncate()
                                         .text_size(px(14.))
                                         .line_height(px(20.))
@@ -5410,22 +5621,60 @@ impl ShellView {
                     .into_any_element()
             }
             MsgKind::Link => {
+                // Guarantee the bubble can never render empty even if a legacy row
+                // or malformed echo lacks `msg.href`: fall back to `first_link(&msg.text)`
+                // and always show the full `msg.text` (e.g. "@All https://...") when
+                // the message includes mentions or surrounding words.
+                let effective_href = if !msg.href.trim().is_empty() {
+                    msg.href.trim().to_owned()
+                } else {
+                    media::first_link(&msg.text).unwrap_or_default()
+                };
+                let display_text = if !msg.text.trim().is_empty() {
+                    msg.text.as_str()
+                } else {
+                    effective_href.as_str()
+                };
+                let has_surrounding_text = !display_text.trim().is_empty()
+                    && (effective_href.is_empty()
+                        || display_text.trim() != effective_href.trim());
                 let host = if msg.file_name.is_empty() {
-                    media::host_of(&msg.href).to_owned()
+                    media::host_of(&effective_href).to_owned()
                 } else {
                     msg.file_name.clone()
                 };
-                let href = msg.href.clone();
-                // Zalo PC link message: the URL in blue, then a card with
-                // thumbnail, bold title, two-line description and site.
-                let preview = self
-                    .link_previews
-                    .get(&msg.href)
-                    .cloned()
-                    .filter(|p| !p.is_empty());
+                let href = effective_href.clone();
+                // Zalo PC link message: the message/URL at top, then a card with
+                // thumbnail, bold title, two-line description and site (only when
+                // real preview metadata exists).
+                let preview = if effective_href.is_empty() {
+                    None
+                } else {
+                    self.link_previews
+                        .get(&effective_href)
+                        .cloned()
+                        .filter(|p| !p.is_empty())
+                };
                 let thumb = preview
                     .as_ref()
                     .and_then(|p| self.link_thumbs.get(&p.thumb).cloned());
+                let link_card_w = (metrics.link_card_w - media::BUBBLE_PAD * 2.0).max(120.0);
+                let header_el = |max_w: f32| {
+                    if has_surrounding_text {
+                        self.selectable_bubble_text(msg.id, msg_idx, 0, display_text, ink, max_w)
+                    } else {
+                        self.selectable_link_card(
+                            msg.id,
+                            msg_idx,
+                            &host,
+                            display_text,
+                            link_blue,
+                            muted,
+                            field,
+                            max_w,
+                        )
+                    }
+                };
                 div()
                     .id(("link-card", msg.id))
                     .cursor_pointer()
@@ -5438,11 +5687,9 @@ impl ShellView {
                         }
                     }))
                     .map(|el| match preview {
-                        None => el.child(self.selectable_link_card(
-                            msg.id, msg_idx, &host, &msg.href, blue, muted, field,
-                        )),
+                        None => el.child(header_el(metrics.bubble_inner_w)),
                         Some(p) => {
-                            let url_trim = msg.href.trim();
+                            let url_trim = effective_href.trim();
                             let title_is_url = p.title.trim().is_empty()
                                 || p.title.trim() == url_trim
                                 || p.title.trim().starts_with("http://")
@@ -5457,22 +5704,20 @@ impl ShellView {
                                 || p.thumb.contains("placeholder");
                             let show_thumb = if generic_thumb { None } else { thumb };
                             if title_is_url && desc_is_dup && show_thumb.is_none() {
-                                return el.child(self.selectable_link_card(
-                                    msg.id, msg_idx, &host, &msg.href, blue, muted, field,
-                                ));
+                                return el.child(header_el(metrics.bubble_inner_w));
                             }
                             let display_title = if title_is_url {
                                 host.clone()
                             } else {
                                 clip_chars(&p.title, 90)
                             };
+                            let thumb_h = (link_card_w * (156.0 / 300.0)).round().max(80.0);
+                            let inner_text_w = (link_card_w - 22.0).max(96.0);
                             el.flex()
                                 .flex_col()
-                                .w(px(300.))
+                                .w(px(link_card_w))
                                 .gap(px(6.))
-                                .child(self.selectable_text(
-                                    msg.id, msg_idx, 0, &msg.href, 296., 14., 20., blue, false,
-                                ))
+                                .child(header_el((link_card_w - 4.0).max(96.0)))
                                 .child(
                                     div()
                                         .flex()
@@ -5488,8 +5733,8 @@ impl ShellView {
                                         .when_some(show_thumb, |el, t| {
                                             el.child(
                                                 img(t)
-                                                    .w(px(300.))
-                                                    .h(px(156.))
+                                                    .w(px(link_card_w))
+                                                    .h(px(thumb_h))
                                                     .object_fit(gpui::ObjectFit::Cover),
                                             )
                                         })
@@ -5504,7 +5749,7 @@ impl ShellView {
                                                     msg_idx,
                                                     1,
                                                     &display_title,
-                                                    278.,
+                                                    inner_text_w,
                                                     14.,
                                                     20.,
                                                     ink,
@@ -5517,7 +5762,7 @@ impl ShellView {
                                                         msg_idx,
                                                         2,
                                                         &desc_clipped,
-                                                        278.,
+                                                        inner_text_w,
                                                         13.,
                                                         18.,
                                                         muted,
@@ -5527,7 +5772,7 @@ impl ShellView {
                                                 .child(
                                                     div()
                                                         .text_size(px(13.))
-                                                        .text_color(rgb(blue))
+                                                        .text_color(rgb(link_blue))
                                                         .truncate()
                                                         .child(if p.src.is_empty() {
                                                             host.clone()
@@ -5591,7 +5836,7 @@ impl ShellView {
                 div()
                     .flex()
                     .flex_col()
-                    .w(px(176.))
+                    .w(px(176.0_f32.min(metrics.compact_card_w)))
                     .child(
                         div()
                             .text_size(px(15.))
@@ -5637,7 +5882,7 @@ impl ShellView {
                             .cursor_pointer()
                             .text_size(px(15.))
                             .font_family(fonts::FAMILY_SEMIBOLD)
-                            .text_color(rgb(blue))
+                            .text_color(rgb(link_blue))
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.start_call(conv_of_call, call_back_video, cx);
                                 cx.notify();
@@ -5662,7 +5907,7 @@ impl ShellView {
                     .flex_row()
                     .items_center()
                     .gap(px(10.))
-                    .w(px(220.))
+                    .w(px(metrics.compact_card_w))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.toggle_voice(&play, cx);
@@ -5677,7 +5922,7 @@ impl ShellView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(rgb(0xffffff))
+                            .text_color(rgb(crate::color::on_accent_fg()))
                             .text_size(px(13.))
                             .child(if playing { "■" } else { "▶" }),
                     )
@@ -5707,9 +5952,14 @@ impl ShellView {
             }
             MsgKind::Video => {
                 let open = msg.clone();
-                let (w, h) = media::photo_size(msg.media_w.max(1), msg.media_h.max(1));
+                let (w, h) = media::photo_size_within(
+                    msg.media_w.max(1),
+                    msg.media_h.max(1),
+                    metrics.photo_max_w,
+                );
                 let (w, h) = if msg.media_w == 0 {
-                    (240., 160.)
+                    let vw = 240.0_f32.min(metrics.photo_max_w);
+                    (vw, (vw * (160.0 / 240.0)).round().max(90.0))
                 } else {
                     (w, h)
                 };
@@ -5721,7 +5971,7 @@ impl ShellView {
                     .h(px(h))
                     .rounded(px(zalo_design::CARD_RADIUS))
                     .overflow_hidden()
-                    .bg(rgb(0x1f_23_29))
+                    .bg(rgb(0x18_18_18))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.open_video(&open, cx);
@@ -5793,7 +6043,7 @@ impl ShellView {
                 div()
                     .flex()
                     .flex_col()
-                    .w(px(220.))
+                    .w(px(metrics.compact_card_w))
                     .child(
                         div()
                             .flex()
@@ -5806,7 +6056,7 @@ impl ShellView {
                                     .flex_none()
                                     .rounded(px(20.))
                                     .overflow_hidden()
-                                    .bg(rgb(token_rgb("--B55", "#0068ff")))
+                                    .bg(rgb(crate::color::neutral_avatar_bg()))
                                     .child(face),
                             )
                             .child(
@@ -5834,19 +6084,47 @@ impl ShellView {
                     )
                     .into_any_element()
             }
-            MsgKind::Poll => self.poll_bubble(msg, msg_idx, ink, muted, field, blue, cx),
-            MsgKind::Location => place_card(msg, "Vị trí", "Mở bản đồ", ink, muted, blue, cx),
-            MsgKind::Ecard => place_card(msg, "Thiệp", "Mở liên kết", ink, muted, blue, cx),
+            MsgKind::Poll => self.poll_bubble(msg, msg_idx, ink, muted, field, blue, metrics, cx),
+            MsgKind::Location => place_card(
+                msg,
+                "Vị trí",
+                "Mở bản đồ",
+                ink,
+                muted,
+                link_blue,
+                metrics.compact_card_w,
+                cx,
+            ),
+            MsgKind::Ecard => place_card(
+                msg,
+                "Thiệp",
+                "Mở liên kết",
+                ink,
+                muted,
+                link_blue,
+                metrics.compact_card_w,
+                cx,
+            ),
             MsgKind::Text => {
                 if let Some(note) = media::phone_note(&msg.text) {
-                    self.phone_link_card(msg, msg_idx, &note, ink, muted, cx)
+                    self.phone_link_card(msg, msg_idx, &note, ink, muted, metrics, cx)
                 } else if let Some(segments) = crate::code_detect::parse_message_segments(&msg.text)
                 {
-                    self.code_segments_body(msg.id, msg_idx, segments, ink, muted, cx)
+                    self.code_segments_body(
+                        msg.id,
+                        msg_idx,
+                        segments,
+                        ink,
+                        muted,
+                        metrics.bubble_inner_w,
+                        cx,
+                    )
                 } else if let Some(url) =
                     media::first_link(&msg.text).filter(|url| msg.text.trim() != url)
                 {
-                    self.text_with_link(msg, msg_idx, &url, ink, muted, blue, field, cx)
+                    self.text_with_link(
+                        msg, msg_idx, &url, ink, muted, link_blue, field, metrics, cx,
+                    )
                 } else {
                     self.selectable_bubble_text(
                         msg.id,
@@ -5854,7 +6132,7 @@ impl ShellView {
                         0,
                         &msg.text,
                         ink,
-                        media::BUBBLE_INNER,
+                        metrics.bubble_inner_w,
                     )
                 }
             }
@@ -5873,6 +6151,7 @@ impl ShellView {
         muted: u32,
         blue: u32,
         _field: u32,
+        metrics: ChatLayoutMetrics,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let preview = self
@@ -5891,11 +6170,13 @@ impl ShellView {
             .map(|p| p.title.clone())
             .unwrap_or_default();
         let desc = preview.as_ref().map(|p| p.desc.clone()).unwrap_or_default();
+        let preview_w = 280.0_f32.min(metrics.bubble_inner_w);
+        let preview_h = (preview_w * (120.0 / 280.0)).round().max(72.0);
         div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .max_w(px(media::BUBBLE_INNER))
+            .max_w(px(metrics.bubble_inner_w))
             .child(
                 div()
                     .id(("inline-link-text", msg.id))
@@ -5915,7 +6196,7 @@ impl ShellView {
                         0,
                         &msg.text,
                         ink,
-                        media::BUBBLE_INNER,
+                        metrics.bubble_inner_w,
                     )),
             )
             .when(preview.is_some(), |el| {
@@ -5936,7 +6217,7 @@ impl ShellView {
                             div()
                                 .flex()
                                 .flex_col()
-                                .w(px(280.))
+                                .w(px(preview_w))
                                 .rounded(px(6.))
                                 .overflow_hidden()
                                 .border_1()
@@ -5945,8 +6226,8 @@ impl ShellView {
                                 .when_some(thumb, |el, image| {
                                     el.child(
                                         img(image)
-                                            .w(px(280.))
-                                            .h(px(120.))
+                                            .w(px(preview_w))
+                                            .h(px(preview_h))
                                             .object_fit(ObjectFit::Cover),
                                     )
                                 })
@@ -5991,6 +6272,7 @@ impl ShellView {
 
     /// Linked phone: sender as the title, the number as a blue copy link,
     /// caption underneath. The clock stays on the canvas, outside the card.
+    #[allow(clippy::too_many_arguments)]
     fn phone_link_card(
         &self,
         msg: &ChatMsg,
@@ -5998,6 +6280,7 @@ impl ShellView {
         note: &media::PhoneNote,
         ink: u32,
         muted: u32,
+        metrics: ChatLayoutMetrics,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let blue = token_rgb("--link", "#0068ff");
@@ -6017,10 +6300,11 @@ impl ShellView {
         let shown = number.clone();
         let tip_text = "Sao chép, gọi Zalo hoặc kết bạn".to_owned();
         let caption = note.caption.clone();
+        let phone_w = metrics.compact_card_w;
         div()
             .flex()
             .flex_col()
-            .w(px(220.))
+            .w(px(phone_w))
             .gap(px(2.))
             .child(
                 div()
@@ -6055,7 +6339,7 @@ impl ShellView {
             )
             .when(!caption.is_empty(), |el| {
                 el.child(div().mt(px(2.)).child(self.selectable_text(
-                    msg.id, msg_idx, 1, &caption, 220., 14., 20., muted, false,
+                    msg.id, msg_idx, 1, &caption, phone_w, 14., 20., muted, false,
                 )))
             })
             .into_any_element()
@@ -6071,6 +6355,7 @@ impl ShellView {
         muted: u32,
         field: u32,
         blue: u32,
+        metrics: ChatLayoutMetrics,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let question = if msg.file_name.is_empty() {
@@ -6092,14 +6377,23 @@ impl ShellView {
         let closed = msg.poll_closed;
         let options = msg.poll_options.clone();
         let total: i64 = options.iter().map(|opt| opt.votes.max(0)).sum();
+        let poll_w = (metrics.poll_card_w - media::BUBBLE_PAD * 2.0).max(120.0);
         let mut col = div()
             .flex()
             .flex_col()
-            .w(px(308.))
-            .max_w(px(308.))
+            .w(px(poll_w))
+            .max_w(px(poll_w))
             .gap(px(6.))
             .child(self.selectable_text(
-                msg.id, msg_idx, 0, &question, 296., 15., 22., ink, true,
+                msg.id,
+                msg_idx,
+                0,
+                &question,
+                (poll_w - 12.0).max(96.0),
+                15.,
+                22.,
+                ink,
+                true,
             ));
         if closed {
             col = col.child(
@@ -6246,7 +6540,7 @@ impl ShellView {
                 el.child(
                     div()
                         .text_size(px(11.))
-                        .text_color(rgb(token_rgb("--B55", "#0068ff")))
+                        .text_color(rgb(crate::color::link_fg()))
                         .child("Nhấn để tải lại"),
                 )
             });
@@ -6274,6 +6568,7 @@ impl ShellView {
 }
 
 /// Location or e-card: eyebrow, title, optional subtitle, and a link when `href` is http(s).
+#[allow(clippy::too_many_arguments)]
 fn place_card(
     msg: &ChatMsg,
     eyebrow: &str,
@@ -6281,6 +6576,7 @@ fn place_card(
     ink: u32,
     muted: u32,
     blue: u32,
+    max_w: f32,
     cx: &mut Context<ShellView>,
 ) -> gpui::AnyElement {
     let marker = format!("[{eyebrow}]");
@@ -6309,7 +6605,7 @@ fn place_card(
     let open = href.starts_with("http://") || href.starts_with("https://");
     div()
         .id(("place", msg.id))
-        .w(px(240.))
+        .w(px(240.0_f32.min(max_w)))
         .flex()
         .flex_col()
         .gap(px(4.))
@@ -6451,7 +6747,7 @@ fn wrapped_text_max(text: &str, color: u32, max_w: f32) -> gpui::AnyElement {
     // neither breaks Vietnamese words on diacritics nor inflates bubble width.
     let is_link = media::first_link(text).is_some_and(|u| text.trim() == u);
     let color = if is_link {
-        token_rgb("--B55", "#0068ff")
+        crate::color::link_fg()
     } else {
         color
     };
@@ -6839,13 +7135,13 @@ fn same_block(a: &ChatMsg, b: &ChatMsg) -> bool {
 }
 
 /// Names under "Seen (n)" and "Received (n)", the same split as Zalo PC's popup.
-fn receipt_panel(pill: &OutgoingStatus) -> gpui::AnyElement {
+fn receipt_panel(pill: &OutgoingStatus, max_w: f32) -> gpui::AnyElement {
     let ink = token_rgb("--text-primary", "#081b3a");
     let muted = token_rgb("--text-secondary", "#5a6981");
     let mut col = div()
         .mt(px(4.))
         .p(px(8.))
-        .w(px(220.))
+        .w(px(220.0_f32.min(max_w)))
         .rounded(px(6.))
         .bg(rgb(token_rgb("--layer-background", "#ffffff")))
         .shadow_sm()
@@ -7027,13 +7323,17 @@ impl ShellView {
                 display,
                 init,
                 if row.is_group {
-                    0x0068ff
+                    crate::color::neutral_avatar_bg()
                 } else {
                     crate::sidebar::avatar_color(&row.thread_id)
                 },
             )
         }
-        None => ("Zalo".to_owned(), "Z".to_owned(), 0x0068ff),
+        None => (
+            "Zalo".to_owned(),
+            "Z".to_owned(),
+            crate::color::neutral_avatar_bg(),
+        ),
     };
     let is_group = conv.is_some_and(|row| row.is_group);
     let peer_click = conv
@@ -7052,7 +7352,10 @@ impl ShellView {
         .flex()
         .flex_row()
         .items_center()
+        .flex_1()
         .min_w(px(0.))
+        .overflow_hidden()
+        .mr(px(8.))
         .child(
             div()
                 .id("hdr-avatar")
@@ -7391,5 +7694,56 @@ mod tests {
         assert_eq!(mention_query("@gif:mèo"), None);
         assert_eq!(mention_query("@sticker"), None);
         assert_eq!(mention_query("@an đã gửi"), None);
+    }
+
+    #[test]
+    fn chat_layout_metrics_never_overflow_across_all_window_widths() {
+        // Wide desktop: chat pane 800 px -> full card caps, actions beside card.
+        let wide = ChatLayoutMetrics::for_chat_width(800.0, false);
+        assert!(!wide.actions_above);
+        assert_eq!(wide.album_max_w, 400.0);
+        assert_eq!(wide.bubble_max_w, media::BUBBLE_MAX);
+        assert_eq!(wide.file_card_w, zalo_design::FILE_CARD_W);
+        assert!(
+            ChatLayoutMetrics::AVATAR_SLOT + wide.album_max_w + ChatLayoutMetrics::ACTION_RESERVE
+                <= wide.row_inner_w + 0.01
+        );
+
+        // User's 960 px window (rail 64 + sidebar 344 -> chat pane 552 px):
+        // album & cards shrink smoothly so Avatar + Album + 4 Hover Actions fit inside 520 px.
+        let narrow_960 = ChatLayoutMetrics::for_chat_width(552.0, false);
+        assert!(!narrow_960.actions_above);
+        assert_eq!(narrow_960.row_inner_w, 520.0);
+        assert_eq!(narrow_960.album_max_w, 354.0);
+        assert!(
+            ChatLayoutMetrics::AVATAR_SLOT
+                + narrow_960.album_max_w
+                + ChatLayoutMetrics::ACTION_RESERVE
+                <= narrow_960.row_inner_w + 0.01
+        );
+        assert!(narrow_960.file_card_w <= narrow_960.content_max_w);
+        assert!(narrow_960.link_card_w <= narrow_960.content_max_w);
+        assert!(narrow_960.poll_card_w <= narrow_960.content_max_w);
+
+        // Medium-narrow 800 px window -> chat pane 392 px -> still fits beside.
+        let narrow_800 = ChatLayoutMetrics::for_chat_width(392.0, false);
+        assert!(!narrow_800.actions_above);
+        assert!(
+            ChatLayoutMetrics::AVATAR_SLOT
+                + narrow_800.content_max_w
+                + ChatLayoutMetrics::ACTION_RESERVE
+                <= narrow_800.row_inner_w + 0.01
+        );
+
+        // Ultra-narrow 640 px window -> chat pane 232 px -> actions dock above card.
+        let ultra = ChatLayoutMetrics::for_chat_width(232.0, false);
+        assert!(ultra.actions_above);
+        assert!(ChatLayoutMetrics::AVATAR_SLOT + ultra.content_max_w <= ultra.row_inner_w + 0.01);
+
+        // Multi-select reserves 40 px left checkbox gutter without clipping.
+        let multi = ChatLayoutMetrics::for_chat_width(552.0, true);
+        assert!(!multi.actions_above);
+        assert_eq!(multi.row_inner_w, 480.0);
+        assert!(ChatLayoutMetrics::AVATAR_SLOT + multi.content_max_w <= multi.row_inner_w + 0.01);
     }
 }

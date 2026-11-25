@@ -1287,16 +1287,61 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
                 };
             }
             _ => {
-                let href = field("href").unwrap_or_default();
-                m.link_title = field("title").unwrap_or_default();
-                m.link_desc = field("description").unwrap_or_default();
-                m.media_url = https(content.get("thumb")).unwrap_or_default();
-                m.text = if href.is_empty() {
-                    field("title").unwrap_or_else(|| "[Liên kết]".into())
+                let raw_href = field("href").unwrap_or_default();
+                let raw_title = field("title").unwrap_or_default();
+                let media_title = params
+                    .get("mediaTitle")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let src = params
+                    .get("src")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                let href = if crate::media::is_http_url(&raw_href) {
+                    raw_href
                 } else {
-                    href
+                    crate::media::first_link(&raw_title).unwrap_or(raw_href)
                 };
-                m.kind = if crate::media::first_link(&m.text).is_some() {
+                // In Zalo PC `recommened.link`, `content.title` holds the user's
+                // actual message text (e.g. "@All https://example.com") while
+                // `params.mediaTitle` holds the webpage `<title>`. Older/mobile
+                // clients put the webpage title in `content.title` (without the URL).
+                let title_is_user_msg = !raw_title.is_empty()
+                    && !href.is_empty()
+                    && (raw_title.contains(&href)
+                        || crate::media::first_link(&raw_title).is_some());
+                m.href = href.clone();
+                m.file_name = src.unwrap_or_else(|| crate::media::host_of(&m.href).to_owned());
+                m.link_title = if let Some(mt) = media_title {
+                    mt
+                } else if title_is_user_msg {
+                    String::new()
+                } else {
+                    raw_title.clone()
+                };
+                m.link_desc = field("description")
+                    .or_else(|| field("desc"))
+                    .unwrap_or_default();
+                m.media_url = https(content.get("thumb")).unwrap_or_default();
+                m.text = if title_is_user_msg {
+                    raw_title
+                } else if !href.is_empty() {
+                    href
+                } else if !raw_title.is_empty() {
+                    raw_title
+                } else {
+                    "[Liên kết]".into()
+                };
+                m.kind = if crate::media::is_http_url(&m.href)
+                    || crate::media::first_link(&m.text).is_some()
+                {
+                    if m.href.is_empty() {
+                        m.href = crate::media::first_link(&m.text).unwrap_or_default();
+                    }
                     MsgKind::Link
                 } else {
                     MsgKind::Text
@@ -1312,11 +1357,12 @@ pub fn parse_item(value: &Value, is_group: bool, self_uin: &str) -> Option<Incom
                     .or_else(|| field("title"))
                     .or_else(|| field("description")),
             }?;
-            m.kind = if crate::media::first_link(&text).is_some_and(|u| u == text) {
-                MsgKind::Link
+            if crate::media::first_link(&text).is_some_and(|u| u == text) {
+                m.kind = MsgKind::Link;
+                m.href = text.clone();
             } else {
-                MsgKind::Text
-            };
+                m.kind = MsgKind::Text;
+            }
             m.text = text;
         }
     }
@@ -1595,6 +1641,15 @@ pub(crate) fn store_all(path: &Path, list: &mut [Incoming]) {
                     "size": m.duration_ms,
                     "title": m.file_name,
                 }))
+            } else if m.kind == MsgKind::Link && !m.href.is_empty() {
+                Some(serde_json::json!({
+                    "kind": "link",
+                    "href": m.href,
+                    "title": m.link_title,
+                    "desc": m.link_desc,
+                    "src": m.file_name,
+                    "thumb": m.media_url,
+                }))
             } else if matches!(m.kind, MsgKind::Voice | MsgKind::Video) && !m.href.is_empty() {
                 // Voice / video: zalo-gui ignores unknown kinds, GPUI reads them back.
                 let kind = if m.kind == MsgKind::Voice {
@@ -1764,9 +1819,43 @@ mod tests {
             "content": {"action": "", "href": "https://dev.to/x", "title": "T", "description": "D", "thumb": "https://t/x.jpg"}});
         let l = parse_item(&link, false, "9").unwrap();
         assert_eq!(
-            (l.kind, l.link_title.as_str(), l.link_desc.as_str()),
-            (MsgKind::Link, "T", "D")
+            (l.kind, l.href.as_str(), l.text.as_str(), l.link_title.as_str(), l.link_desc.as_str()),
+            (MsgKind::Link, "https://dev.to/x", "https://dev.to/x", "T", "D")
         );
+        // Official Zalo PC `recommened.link` echo where `content.title` is the user's
+        // full message text (with `@All` mention) and `params.mediaTitle` is the page title.
+        let pc_link = serde_json::json!({
+            "uidFrom": "0",
+            "idTo": "4263295552360969008",
+            "cliMsgId": "1795604752138",
+            "msgId": "8528321999999",
+            "msgType": "chat.recommended",
+            "content": {
+                "action": "recommened.link",
+                "href": "https://lza.lol",
+                "title": "@All https://lza.lol",
+                "description": "",
+                "thumb": "",
+                "params": "{\"mediaTitle\":\"LZA Site\",\"src\":\"lza.lol\"}"
+            }
+        });
+        let pl = parse_item(&pc_link, true, "9").unwrap();
+        assert_eq!(pl.kind, MsgKind::Link);
+        assert_eq!(pl.href, "https://lza.lol");
+        assert_eq!(pl.text, "@All https://lza.lol");
+        assert_eq!(pl.link_title, "LZA Site");
+        assert_eq!(pl.file_name, "lza.lol");
+        // Standalone plain-text URL must also populate `m.href` so rendering is never blank.
+        let plain_url = serde_json::json!({
+            "uidFrom": "0",
+            "idTo": "4263295552360969008",
+            "msgType": "webchat",
+            "content": "https://lza.lol"
+        });
+        let pu = parse_item(&plain_url, true, "9").unwrap();
+        assert_eq!(pu.kind, MsgKind::Link);
+        assert_eq!(pu.href, "https://lza.lol");
+        assert_eq!(pu.text, "https://lza.lol");
         let person = serde_json::json!({"uidFrom": "5", "msgType": "chat.recommended",
             "content": {"action": "recommened.user", "title": "Lan", "description": "Bạn",
                 "thumb": "https://ava.example/a.jpg"}});

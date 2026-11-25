@@ -37,8 +37,6 @@ pub enum RailPopup {
     ZCloud,
     /// "zBusiness Tools" 314 × 291, 3-column tiles.
     Tools,
-    /// "Starred Messages" list (opened from Tools).
-    Starred,
     /// Product catalogs from `/api/prodcatalog/catalog/list`.
     Catalog,
 }
@@ -171,20 +169,17 @@ impl ShellView {
             ))
             .child(self.rail_bottom_tab(
                 "rail-tools",
-                if matches!(
-                    self.rail_popup,
-                    Some(RailPopup::Tools | RailPopup::Starred | RailPopup::Catalog)
-                ) {
+                if self.starred_open
+                    || matches!(self.rail_popup, Some(RailPopup::Tools | RailPopup::Catalog))
+                {
                     ic::BRIEFCASE_ON
                 } else {
                     ic::BRIEFCASE
                 },
                 "☰",
                 str_vi("STR_TOOLS", "Công cụ"),
-                matches!(
-                    self.rail_popup,
-                    Some(RailPopup::Tools | RailPopup::Starred | RailPopup::Catalog)
-                ),
+                self.starred_open
+                    || matches!(self.rail_popup, Some(RailPopup::Tools | RailPopup::Catalog)),
                 Some(Rail::Tools),
                 cx,
             ))
@@ -340,7 +335,6 @@ impl ShellView {
         let panel = match popup {
             RailPopup::ZCloud => self.zcloud_panel(cx).into_any_element(),
             RailPopup::Tools => self.tools_panel(cx).into_any_element(),
-            RailPopup::Starred => self.starred_panel(cx).into_any_element(),
             RailPopup::Catalog => self.catalog_panel(cx).into_any_element(),
         };
         let popup_box = div()
@@ -351,7 +345,7 @@ impl ShellView {
             .child(panel);
         let positioned = match popup {
             RailPopup::ZCloud => popup_box.bottom(px(77.)),
-            RailPopup::Tools | RailPopup::Starred | RailPopup::Catalog => popup_box.bottom(px(68.)),
+            RailPopup::Tools | RailPopup::Catalog => popup_box.bottom(px(68.)),
         };
         div()
             .id("rail-popup-layer")
@@ -396,7 +390,7 @@ impl ShellView {
                     .relative()
                     .h(px(196.))
                     .bg(rgb(if crate::color::is_dark() {
-                        0x1c_2b_3c
+                        0x1c_1c_1c
                     } else {
                         0xe5_f8_ff
                     }))
@@ -472,7 +466,7 @@ impl ShellView {
                         .justify_center()
                         .text_size(px(15.))
                         .font_family(FAMILY_SEMIBOLD)
-                        .text_color(rgb(0xff_ff_ff))
+                        .text_color(rgb(crate::color::on_accent_fg()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             // Zalo PC opens this paywall in an embedded web window.
                             cx.open_url("https://cloud.zbox.vn/pc-paywall?utm_source=pc_entry&utm_medium=leftsidebar");
@@ -541,7 +535,12 @@ impl ShellView {
                                 el.on_click(cx.listener(move |this, _, _, cx| {
                                     match action {
                                         ToolTile::Starred => {
-                                            this.rail_popup = Some(RailPopup::Starred)
+                                            this.rail_popup = None;
+                                            this.starred_open = true;
+                                            this.compact_show_chat = false;
+                                            if this.rail == Rail::Contacts {
+                                                this.rail = Rail::Chats;
+                                            }
                                         }
                                         ToolTile::Catalog => {
                                             this.rail_popup = Some(RailPopup::Catalog)
@@ -590,82 +589,345 @@ impl ShellView {
             })
     }
 
-    fn starred_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Left-sidebar "Tin đánh dấu" view matching Zalo PC (replaces conversation list under search bar).
+    pub(crate) fn starred_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
-        let mut items: Vec<(u64, String, String)> = Vec::new();
+        let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
+        let star_gold = token_rgb("--Y60", "#e0ac00");
+        let line = crate::color::border_vanish();
+        let query = self.search_query.trim().to_lowercase();
+
+        let mut all_items: Vec<(i64, u64, u64, String, String, String, String)> = Vec::new();
         for conv in &self.convs {
             for msg in self.messages_of(conv.id) {
                 if self.starred.contains(&msg.id) {
-                    items.push((conv.id, conv.name.clone(), msg.text.clone()));
+                    let preview = starred_msg_preview(msg);
+                    let sender = if conv.is_group && !msg.from_me && !msg.sender.is_empty() {
+                        msg.sender.clone()
+                    } else if msg.from_me {
+                        str_vi("STR_YOU", "Bạn").to_owned()
+                    } else {
+                        String::new()
+                    };
+                    all_items.push((
+                        msg.at_ms,
+                        msg.id,
+                        conv.id,
+                        conv.name.clone(),
+                        sender,
+                        preview,
+                        msg.time.clone(),
+                    ));
                 }
             }
         }
-        let empty = items.is_empty();
+        all_items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        let total = all_items.len();
+        let items: Vec<_> = if query.is_empty() {
+            all_items
+        } else {
+            all_items
+                .into_iter()
+                .filter(|(_, _, _, conv_name, sender, preview, _)| {
+                    conv_name.to_lowercase().contains(&query)
+                        || sender.to_lowercase().contains(&query)
+                        || preview.to_lowercase().contains(&query)
+                })
+                .collect()
+        };
+
+        let title = str_vi("STR_STARRED_MESSAGES_0", "Tin đánh dấu");
+        let empty_copy = str_vi(
+            "STR_STAR_EMPTY_LIST",
+            "Đánh dấu tin nhắn để có thể tìm lại một cách nhanh chóng. Các tin nhắn được đánh dấu sẽ xuất hiện ở đây.",
+        );
+        let unstar_tip = str_vi("STR_TOOLTIP_UNSTAR_MSG", "Bỏ đánh dấu tin nhắn");
+        let close_tip = str_vi("STR_CLOSE", "Đóng");
+
+        let star_badge_bg = if crate::color::is_dark() {
+            hsla(42. / 360., 0.65, 0.50, 0.14)
+        } else {
+            hsla(42. / 360., 0.92, 0.55, 0.16)
+        };
+        let star_ring = if crate::color::is_dark() {
+            hsla(42. / 360., 0.65, 0.55, 0.28)
+        } else {
+            hsla(42. / 360., 0.85, 0.50, 0.30)
+        };
+
         div()
-            .w(px(314.))
-            .max_h(px(420.))
-            .rounded(px(8.))
-            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
-            .border_1()
-            .border_color(crate::color::border_subtle())
-            .shadow_lg()
+            .id("starred-sidebar")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .child(
                 div()
-                    .pt(px(16.))
-                    .px(px(16.))
-                    .pb(px(8.))
-                    .text_size(px(14.))
-                    .font_family(FAMILY_SEMIBOLD)
-                    .text_color(rgb(ink))
-                    .child("Tin đánh dấu"),
-            )
-            .child(
-                div()
-                    .px(px(16.))
-                    .pb(px(8.))
-                    .text_size(px(12.))
-                    .text_color(rgb(muted))
-                    .child(crate::i18n::t(
-                        "Lưu trên máy này, giống Electron IndexedDB StarMessage. Không có API ghim sao lên máy chủ.",
-                    )),
-            )
-            .when(empty, |el| {
-                el.child(
-                    div()
-                        .px(px(16.))
-                        .pb(px(16.))
-                        .text_size(px(13.))
-                        .text_color(rgb(muted))
-                        .child("Chưa có tin nào. Bấm phải vào tin → «Đánh dấu tin nhắn»."),
-                )
-            })
-            .child(
-                div()
-                    .id("starred-list")
                     .flex()
-                    .flex_col()
-                    .overflow_y_scroll()
-                    .pb(px(8.))
-                    .children(items.into_iter().enumerate().map(|(i, (conv, name, text))| {
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.))
+                    .pt(px(4.))
+                    .pb(px(12.))
+                    .border_b_1()
+                    .border_color(line)
+                    .child(
                         div()
-                            .id(("starred", i as u64))
-                            .px(px(16.))
-                            .py(px(8.))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .line_height(px(22.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .child(title),
+                            )
+                            .when(total > 0, |el| {
+                                el.child(
+                                    div()
+                                        .px(px(7.))
+                                        .py(px(1.))
+                                        .rounded(px(10.))
+                                        .bg(rgb(subtle))
+                                        .text_size(px(12.))
+                                        .text_color(rgb(muted))
+                                        .child(total.to_string()),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("starred-sidebar-close")
+                            .size(px(28.))
+                            .rounded(px(14.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .cursor_pointer()
-                            .hover(|st| st.bg(rgb(hover)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.rail_popup = None;
-                                this.select_conv(conv);
+                            .text_color(rgb(muted))
+                            .hover(move |st| st.bg(rgb(hover)).text_color(rgb(ink)))
+                            .tooltip(move |_, cx| tip(close_tip, cx))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.starred_open = false;
+                                this.clear_sidebar_search(cx);
                                 cx.notify();
                             }))
-                            .child(div().text_size(px(12.)).text_color(rgb(muted)).child(name))
-                            .child(div().text_size(px(14.)).text_color(rgb(ink)).truncate().child(crate::i18n::t(&text)))
-                    })),
+                            .child(fonts::icon_el('\u{EA9F}', "×", 16.)),
+                    ),
             )
+            .when(total == 0, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .px(px(32.))
+                        .pb(px(56.))
+                        .gap(px(18.))
+                        .child(
+                            div()
+                                .size(px(84.))
+                                .rounded(px(42.))
+                                .bg(star_badge_bg)
+                                .border_1()
+                                .border_color(star_ring)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(star_gold))
+                                .child(fonts::icon_el('\u{ED73}', "★", 40.)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(2.))
+                                .text_size(px(13.5))
+                                .line_height(px(20.))
+                                .text_color(rgb(muted))
+                                .children(
+                                    crate::media::wrap_ui_note(empty_copy, 260.)
+                                        .lines()
+                                        .map(|line| {
+                                            div()
+                                                .whitespace_nowrap()
+                                                .text_center()
+                                                .child(line.to_owned())
+                                        })
+                                        .collect::<Vec<_>>(),
+                                ),
+                        ),
+                )
+            })
+            .when(total > 0 && items.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .px(px(24.))
+                        .text_size(px(13.))
+                        .text_center()
+                        .text_color(rgb(muted))
+                        .child(crate::i18n::t("Không tìm thấy tin nhắn đánh dấu phù hợp.")),
+                )
+            })
+            .when(!items.is_empty(), |el| {
+                el.child(
+                    div()
+                        .id("starred-list")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .py(px(4.))
+                        .children(items.into_iter().enumerate().map(
+                            |(i, (_, msg_id, conv_id, conv_name, sender, preview, time))| {
+                                let snippet = if sender.is_empty() {
+                                    preview
+                                } else {
+                                    format!("{sender}: {preview}")
+                                };
+                                div()
+                                    .id(("starred", i as u64))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .px(px(16.))
+                                    .py(px(10.))
+                                    .border_b_1()
+                                    .border_color(line)
+                                    .cursor_pointer()
+                                    .hover(move |st| st.bg(rgb(hover)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.jump_to_msg_id(conv_id, msg_id);
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(8.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_size(px(13.))
+                                                    .font_family(FAMILY_SEMIBOLD)
+                                                    .text_color(rgb(ink))
+                                                    .child(conv_name),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_none()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(6.))
+                                                    .when(!time.is_empty(), |el| {
+                                                        el.child(
+                                                            div()
+                                                                .text_size(px(11.))
+                                                                .text_color(rgb(muted))
+                                                                .child(time),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        div()
+                                                            .id(("starred-rm", i as u64))
+                                                            .size(px(22.))
+                                                            .rounded(px(11.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .cursor_pointer()
+                                                            .text_color(rgb(star_gold))
+                                                            .hover(move |st| st.bg(rgb(subtle)))
+                                                            .tooltip(move |_, cx| {
+                                                                tip(unstar_tip, cx)
+                                                            })
+                                                            .on_mouse_down(
+                                                                gpui::MouseButton::Left,
+                                                                |_, _, cx| cx.stop_propagation(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.starred.remove(&msg_id);
+                                                                    this.save_starred();
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(fonts::icon_el(
+                                                                '\u{ED73}', "★", 13.,
+                                                            )),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .line_height(px(18.))
+                                            .text_color(rgb(muted))
+                                            .truncate()
+                                            .child(snippet),
+                                    )
+                            },
+                        )),
+                )
+            })
+    }
+}
+
+fn starred_msg_preview(msg: &crate::data::ChatMsg) -> String {
+    let trimmed = msg.text.trim();
+    if !trimmed.is_empty() {
+        return trimmed.replace('\n', " ");
+    }
+    match msg.kind {
+        crate::media::MsgKind::Photo => format!("[{}]", str_vi("STR_PHOTO", "Hình ảnh")),
+        crate::media::MsgKind::Video => format!("[{}]", str_vi("STR_VIDEO", "Video")),
+        crate::media::MsgKind::Sticker => format!("[{}]", str_vi("STR_STICKER", "Sticker")),
+        crate::media::MsgKind::Gif => "[GIF]".to_owned(),
+        crate::media::MsgKind::Voice => format!("[{}]", str_vi("STR_VOICE_MESSAGE", "Tin nhắn thoại")),
+        crate::media::MsgKind::File => {
+            if msg.file_name.is_empty() {
+                format!("[{}]", str_vi("STR_FILE", "Tệp"))
+            } else {
+                format!("[{}] {}", str_vi("STR_FILE", "Tệp"), msg.file_name)
+            }
+        }
+        crate::media::MsgKind::Link => {
+            if !msg.href.is_empty() {
+                msg.href.clone()
+            } else {
+                format!("[{}]", str_vi("STR_LINK", "Liên kết"))
+            }
+        }
+        crate::media::MsgKind::Card => format!("[{}]", str_vi("STR_CONTACT_CARD", "Danh thiếp")),
+        crate::media::MsgKind::Poll => format!("[{}]", str_vi("STR_POLL", "Bình chọn")),
+        crate::media::MsgKind::Location => format!("[{}]", str_vi("STR_LOCATION", "Vị trí")),
+        crate::media::MsgKind::Doodle => "[Hình vẽ]".to_owned(),
+        crate::media::MsgKind::Ecard => "[Thiệp]".to_owned(),
+        crate::media::MsgKind::Call | crate::media::MsgKind::MissedCall => {
+            format!("[{}]", str_vi("STR_CALL", "Cuộc gọi"))
+        }
+        crate::media::MsgKind::Text => String::new(),
     }
 }
 
@@ -679,11 +941,13 @@ enum ToolTile {
 }
 
 impl ShellView {
-    /// Names from `/api/prodcatalog/catalog/list`. Does not create products.
-    fn catalog_panel(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    /// Names from `/api/prodcatalog/catalog/list`.
+    fn catalog_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
+        let hover = token_rgb("--layer-background-hover", "#f1f2f4");
         let empty = self.catalog_rows.is_empty();
+        let busy = self.catalog_busy;
         div()
             .w(px(314.))
             .max_h(px(420.))
@@ -696,34 +960,58 @@ impl ShellView {
             .flex_col()
             .child(
                 div()
-                    .pt(px(16.))
+                    .pt(px(14.))
                     .px(px(16.))
                     .pb(px(8.))
-                    .text_size(px(14.))
-                    .font_family(FAMILY_SEMIBOLD)
-                    .text_color(rgb(ink))
-                    .child("Danh mục sản phẩm"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(ink))
+                            .child("Danh mục sản phẩm"),
+                    )
+                    .child(
+                        div()
+                            .id("catalog-refresh")
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(hover)))
+                            .text_size(px(12.))
+                            .text_color(rgb(crate::color::link_fg()))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.reload_catalog(cx);
+                                cx.notify();
+                            }))
+                            .child(if busy { "Đang tải…" } else { "Tải lại" }),
+                    ),
             )
-            .child(
+            .child({
+                let note = if self.catalog_note.is_empty() {
+                    "Danh mục sản phẩm trên tài khoản Zalo Business"
+                } else {
+                    self.catalog_note.as_str()
+                };
                 div()
                     .px(px(16.))
-                    .pb(px(8.))
+                    .pb(px(10.))
                     .text_size(px(12.))
                     .text_color(rgb(muted))
-                    .child(if self.catalog_note.is_empty() {
-                        "Danh sách từ máy chủ. Máy này không tạo hay xóa sản phẩm.".to_owned()
-                    } else {
-                        self.catalog_note.clone()
-                    }),
-            )
-            .when(empty && self.catalog_note.is_empty(), |el| {
+                    .child(crate::media::wrap_ui_note(note, 276.))
+            })
+            .when(empty && self.catalog_note.is_empty() && !busy, |el| {
                 el.child(
                     div()
                         .px(px(16.))
                         .pb(px(16.))
                         .text_size(px(13.))
                         .text_color(rgb(muted))
-                        .child("Chưa có danh mục."),
+                        .child("Chưa có danh mục sản phẩm nào."),
                 )
             })
             .child(
@@ -739,6 +1027,7 @@ impl ShellView {
                             .id(("catalog", i as u64))
                             .px(px(16.))
                             .py(px(8.))
+                            .hover(move |s| s.bg(rgb(hover)))
                             .text_size(px(14.))
                             .text_color(rgb(ink))
                             .child(name.clone())

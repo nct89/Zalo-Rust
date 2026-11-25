@@ -304,6 +304,21 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
             }
             return;
         }
+        "link" => {
+            meta.kind = MsgKind::Link;
+            let href = text("href");
+            if is_http_url(&href) {
+                meta.href = href;
+            }
+            let src = text("src");
+            meta.title = if src.is_empty() {
+                host_of(&meta.href).to_owned()
+            } else {
+                src
+            };
+            meta.url = text("thumb");
+            return;
+        }
         "poll" => {
             meta.kind = MsgKind::Poll;
             if let Some(body) = poll_from_value(&value) {
@@ -1125,18 +1140,28 @@ pub fn text_box_w(wrapped: &str) -> f32 {
     max.clamp(24.0, BUBBLE_INNER)
 }
 
-/// Fitted photo size inside the bubble.
+/// Fitted photo size inside the bubble using the default [`PHOTO_MAX_W`] cap.
+#[cfg(test)]
 #[must_use]
 pub fn photo_size(width: u32, height: u32) -> (f32, f32) {
+    photo_size_within(width, height, PHOTO_MAX_W)
+}
+
+/// Fitted photo size constrained to `max_w` (matching Zalo PC's responsive
+/// `max-width: 100%` photo card scaling in narrow conversation panes).
+#[must_use]
+pub fn photo_size_within(width: u32, height: u32, max_w: f32) -> (f32, f32) {
+    let cap_w = max_w.clamp(96.0, PHOTO_MAX_W);
     if width == 0 || height == 0 {
-        return (180.0, 120.0);
+        let w = 180.0_f32.min(cap_w);
+        return (w, (w * (120.0 / 180.0)).max(64.0));
     }
     let aspect = width as f32 / height as f32;
-    let mut w = PHOTO_MAX_W.min(width as f32);
+    let mut w = cap_w.min(width as f32);
     let mut h = w / aspect;
     if h > PHOTO_MAX_H {
         h = PHOTO_MAX_H;
-        w = h * aspect;
+        w = (h * aspect).min(cap_w);
     }
     (w.max(48.0), h.max(48.0))
 }
@@ -2320,5 +2345,14 @@ mod tests {
         assert_eq!(format_call_duration(9), "0 phút 9 giây");
         assert_eq!(format_call_duration(125), "2 phút 5 giây");
         assert_eq!(format_call_duration(3660), "1 giờ 1 phút 0 giây");
+    }
+
+    #[test]
+    fn stored_link_attachment_round_trips_href_and_host() {
+        let raw = r#"{"kind":"link","href":"https://lza.lol","title":"LZA","desc":"","src":"lza.lol","thumb":""}"#;
+        let meta = classify("@All https://lza.lol", Some(raw));
+        assert_eq!(meta.kind, MsgKind::Link);
+        assert_eq!(meta.href, "https://lza.lol");
+        assert_eq!(meta.title, "lza.lol");
     }
 }

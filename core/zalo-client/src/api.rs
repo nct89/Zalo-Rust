@@ -1989,6 +1989,119 @@ impl ZaloApi {
         self.get_encrypted_cm(&host, path, &payload).await
     }
 
+    /// Fetches the server-side muted conversations list (`/api/social/profile/getmute`, cmd 11280).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when not logged in, or on transport, JSON,
+    /// Zalo or decryption errors.
+    pub async fn get_mute_conversations(&self) -> Result<Value, ClientError> {
+        let host = self
+            .profile_host
+            .as_deref()
+            .or(self.friend_host.as_deref())
+            .unwrap_or("https://tt-profile-wpa.zaloapp.com");
+        let payload = serde_json::json!({ "imei": self.device.imei });
+        self.get_encrypted(host, "/api/social/profile/getmute", &payload)
+            .await
+    }
+
+    /// Fetches conversations marked as unread across devices (`/api/conv/getUnreadMark`, cmd 12011).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when not logged in, or on transport, JSON,
+    /// Zalo or decryption errors.
+    pub async fn get_unread_marks(&self) -> Result<Value, ClientError> {
+        let host = self
+            .service_base("conversation", "https://tt-convers-wpa.chat.zalo.me")
+            .to_owned();
+        let val = self
+            .get_encrypted(&host, "/api/conv/getUnreadMark", &serde_json::json!({}))
+            .await?;
+        Ok(unwrap_string_json_data(val))
+    }
+
+    /// Fetches server last-seen cursors for a set of group and 1-1 conversations
+    /// (`/api/preloadconvers/get-last-seen`, cmd 12009).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when not logged in, or on transport, JSON,
+    /// Zalo or decryption errors.
+    pub async fn get_last_seen(
+        &self,
+        group_ids: &[String],
+        direct_ids: &[String],
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .chat_host
+            .clone()
+            .unwrap_or_else(|| "https://tt-chat2-wpa.chat.zalo.me".to_owned());
+        let bare_groups: Vec<&str> = group_ids
+            .iter()
+            .map(|id| id.trim_start_matches("g_"))
+            .collect();
+        let param = serde_json::json!({
+            "group": bare_groups,
+            "oneone": direct_ids,
+        })
+        .to_string();
+        let payload = serde_json::json!({ "param": param });
+        self.get_encrypted(&host, "/api/preloadconvers/get-last-seen", &payload)
+            .await
+    }
+
+    /// Fetches cloud messages for multiple groups on login (`/api/cm/mget`, cmd 12503).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when `group_cloud_message` is missing or on transport/Zalo errors.
+    pub async fn group_cloud_mget(&self, group_ids: &[String]) -> Result<Value, ClientError> {
+        let host = self
+            .group_cloud_host
+            .clone()
+            .ok_or_else(|| ClientError::Unexpected("no group_cloud_message host".to_owned()))?;
+        let bare: Vec<&str> = group_ids
+            .iter()
+            .map(|id| id.trim_start_matches("g_"))
+            .collect();
+        let payload = serde_json::json!({ "groupIds": bare });
+        self.get_encrypted_cm(&host, "/api/cm/mget", &payload).await
+    }
+
+    /// Loads group cloud history around or before `global_msg_id` (`/api/cm/rgetv2`, cmd 12508).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when `group_cloud_message` is missing or on transport/Zalo errors.
+    pub async fn group_cloud_jump(
+        &self,
+        group_id: &str,
+        global_msg_id: &str,
+        count: u32,
+        jump: bool,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .group_cloud_host
+            .clone()
+            .ok_or_else(|| ClientError::Unexpected("no group_cloud_message host".to_owned()))?;
+        let gid = if global_msg_id.is_empty() || global_msg_id == "0" {
+            "9223372036854775808"
+        } else {
+            global_msg_id
+        };
+        let payload = serde_json::json!({
+            "groupId": group_id.trim_start_matches("g_"),
+            "globalMsgId": gid,
+            "count": count,
+            "msgJump": if jump { 1 } else { 0 },
+            "msgIds": [],
+            "src": -1,
+        });
+        self.get_encrypted_cm(&host, "/api/cm/rgetv2", &payload).await
+    }
+
     /// Calls `group_cloud_message` (`/api/cm/getrecentv2`, `/api/cm/getoldv2`),
     /// which requires `nretry=0` in the query string (without it, Zalo returns
     /// error `604`) and wraps its decrypted `data` field as a JSON-encoded string.

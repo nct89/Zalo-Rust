@@ -1425,7 +1425,7 @@ impl Render for InstallerView {
                                     .items_center()
                                     .font_family(FAMILY_SEMIBOLD)
                                     .text_size(px(12.5))
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .bg(rgb(blue))
                                     .cursor_pointer()
                                     .hover(|s| s.bg(rgb(blue_hover)))

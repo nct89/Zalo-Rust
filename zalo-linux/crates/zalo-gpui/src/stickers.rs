@@ -1491,7 +1491,7 @@ impl ShellView {
     fn sticker_store_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let blue = token_rgb("--blue", "#0068ff");
+        let blue = token_rgb("--B55", "#0068ff");
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
         let card = token_rgb("--layer-background", "#ffffff");
         let busy = self.stickers.personal_busy;
@@ -1552,7 +1552,11 @@ impl ShellView {
                             .border_1()
                             .border_color(crate::color::border_subtle())
                             .text_size(px(11.5))
-                            .text_color(rgb(if installed { muted } else { 0xff_ffff }))
+                            .text_color(rgb(if installed {
+                                muted
+                            } else {
+                                crate::color::on_accent_fg()
+                            }))
                             .when(!busy, |el| {
                                 el.on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
@@ -2178,7 +2182,11 @@ fn gif_chip(
         .cursor_pointer()
         .text_size(px(12.))
         .bg(rgb(if on { active_bg } else { chip_bg }))
-        .text_color(rgb(if on { 0xffffff } else { ink }))
+        .text_color(rgb(if on {
+            crate::color::on_accent_fg()
+        } else {
+            ink
+        }))
         .on_click(on_click)
         .child(label.into())
 }

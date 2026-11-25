@@ -117,6 +117,8 @@ pub enum PinMode {
     SetPin { conv: Option<u64> },
     /// Open a hidden chat (`conv`) or show all hidden chats.
     Unlock { conv: Option<u64> },
+    /// Reset hidden-chat PIN and unhide all hidden chats (`/api/hiddenconvers/reset`).
+    ResetHidden,
     /// Create or change the screen-lock code.
     LockSet,
     /// Turn the screen lock off (needs the current code).
@@ -296,6 +298,7 @@ impl ShellView {
         let (a, b) = match mode {
             PinMode::SetPin { .. } => ("Nhập mã PIN (4 chữ số)", "Nhập lại mã PIN"),
             PinMode::Unlock { .. } => ("Nhập mã PIN", ""),
+            PinMode::ResetHidden => ("", ""),
             PinMode::LockSet => ("Mã khóa mới (ít nhất 4 ký tự)", "Nhập lại mã khóa"),
             PinMode::LockOff => ("Mã khóa hiện tại", ""),
         };
@@ -369,6 +372,57 @@ impl ShellView {
                 self.prefs.set("lockHash", Value::String(String::new()));
                 self.set_note("Đã tắt khóa màn hình");
             }
+            PinMode::ResetHidden => {
+                if !self.has_session || cfg!(test) {
+                    self.dialog = None;
+                    self.hidden_srv.pin_md5.clear();
+                    self.hidden_srv.unlocked = false;
+                    self.hidden.clear();
+                    self.save_conv_flags();
+                    self.set_note("Đã đặt lại mã PIN và bỏ ẩn toàn bộ trò chuyện");
+                    return;
+                }
+                let Some(dir) = self.session_dir.clone() else {
+                    return;
+                };
+                if let Some(Dialog::Pin(d)) = self.dialog.as_mut() {
+                    d.busy = true;
+                    d.error = None;
+                }
+                cx.spawn(async move |this, cx| {
+                    let got = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::bridge::block_api(&dir, |api| async move {
+                                api.reset_hidden_chats()
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|e| e.to_string())
+                            })
+                        })
+                        .await;
+                    let _ = this.update(cx, |view, cx| {
+                        match got {
+                            Ok(()) => {
+                                view.dialog = None;
+                                view.hidden_srv.pin_md5.clear();
+                                view.hidden_srv.unlocked = false;
+                                view.hidden.clear();
+                                view.save_conv_flags();
+                                view.set_note("Đã đặt lại mã PIN và bỏ ẩn toàn bộ trò chuyện");
+                            }
+                            Err(e) => {
+                                if let Some(Dialog::Pin(d)) = view.dialog.as_mut() {
+                                    d.busy = false;
+                                    d.error = Some(e);
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
             PinMode::SetPin { conv } => {
                 let Some(dir) = self.session_dir.clone().filter(|_| self.has_session) else {
                     return;
@@ -418,20 +472,40 @@ impl ShellView {
     pub(crate) fn pin_el(&self, d: &PinDialog, cx: &mut Context<Self>) -> impl IntoElement {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
-        let (title, desc, two) = match d.mode {
+        let (title, desc, two, show_inputs) = match d.mode {
             PinMode::SetPin { .. } => (
                 "Thiết lập mã PIN",
                 "Mã PIN dùng để mở các trò chuyện bị ẩn. Hãy ghi nhớ mã này, Zalo không thể khôi phục giúp bạn.",
                 true,
+                true,
             ),
-            PinMode::Unlock { .. } => ("Nhập mã PIN", "Nhập mã PIN để xem trò chuyện đã ẩn.", false),
+            PinMode::Unlock { .. } => (
+                "Nhập mã PIN",
+                "Nhập mã PIN để xem trò chuyện đã ẩn.",
+                false,
+                true,
+            ),
+            PinMode::ResetHidden => (
+                "Đặt lại mã PIN",
+                "Đặt lại mã PIN sẽ xóa mã PIN hiện tại và bỏ ẩn toàn bộ các cuộc trò chuyện đã ẩn trên tài khoản. Bạn có chắc muốn tiếp tục?",
+                false,
+                false,
+            ),
             PinMode::LockSet => (
                 "Tạo mã khóa màn hình",
                 "Mã khóa lưu trên máy này. Nhấn Ctrl + L để khóa Zalo khi bạn rời máy.",
                 true,
+                true,
             ),
-            PinMode::LockOff => ("Tắt khóa màn hình", "Nhập mã khóa hiện tại để tắt.", false),
+            PinMode::LockOff => (
+                "Tắt khóa màn hình",
+                "Nhập mã khóa hiện tại để tắt.",
+                false,
+                true,
+            ),
         };
+        let is_unlock = matches!(d.mode, PinMode::Unlock { .. });
+        let is_reset = matches!(d.mode, PinMode::ResetHidden);
         let field = |input: Entity<LineInput>| {
             div()
                 .w_full()
@@ -464,10 +538,29 @@ impl ShellView {
                         div()
                             .text_size(px(14.))
                             .text_color(rgb(muted))
-                            .child(crate::media::wrap_bubble_text(desc, 390.)),
+                            .child(crate::media::wrap_bubble_text(desc, 360.)),
                     )
-                    .child(field(d.first.clone()))
-                    .when(two, |el| el.child(field(d.second.clone())))
+                    .when(show_inputs, |el| {
+                        el.child(field(d.first.clone()))
+                            .when(two, |el| el.child(field(d.second.clone())))
+                    })
+                    .when(is_unlock, |el| {
+                        el.child(
+                            div()
+                                .id("pin-forgot-reset")
+                                .cursor_pointer()
+                                .text_size(px(13.))
+                                .text_color(rgb(crate::color::link_fg()))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if let Some(Dialog::Pin(dlg)) = this.dialog.as_mut() {
+                                        dlg.mode = PinMode::ResetHidden;
+                                        dlg.error = None;
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("Quên mã PIN? Đặt lại mã PIN"),
+                        )
+                    })
                     .when_some(d.error.clone(), |el, e| {
                         el.child(
                             div()
@@ -480,7 +573,9 @@ impl ShellView {
             .child(crate::dialogs::dialog_footer(
                 "Hủy",
                 if d.busy {
-                    "Đang lưu…"
+                    "Đang xử lý…"
+                } else if is_reset {
+                    "Đặt lại PIN"
                 } else {
                     "Xác nhận"
                 },
@@ -625,7 +720,7 @@ impl ShellView {
                             .justify_center()
                             .rounded(px(4.))
                             .bg(rgb(blue))
-                            .text_color(rgb(0xffffff))
+                            .text_color(rgb(crate::color::on_accent_fg()))
                             .font_family(FAMILY_SEMIBOLD)
                             .cursor_pointer()
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -715,7 +810,7 @@ impl ShellView {
                             .rounded(px(3.))
                             .bg(rgb(blue))
                             .hover(|st| st.bg(rgb(blue_hover)))
-                            .text_color(rgb(0xff_ff_ff))
+                            .text_color(rgb(crate::color::on_accent_fg()))
                             .text_size(px(14.))
                             .font_family(FAMILY_SEMIBOLD)
                             .cursor_pointer()

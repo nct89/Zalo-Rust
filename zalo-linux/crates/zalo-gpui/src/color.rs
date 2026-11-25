@@ -79,10 +79,232 @@ pub fn border_vanish() -> gpui::Hsla {
 #[must_use]
 pub fn modal_scrim() -> gpui::Hsla {
     if is_dark() {
-        gpui::hsla(0., 0., 0., 0.58)
+        gpui::hsla(0., 0., 0., 0.65)
     } else {
         gpui::hsla(0., 0., 0., 0.35)
     }
+}
+
+/// Primary interactive/CTA fill: Zalo blue `#0068ff` in light mode,
+/// high-contrast neutral `#f0f0f0` in dark mode (zero blue on dark).
+#[must_use]
+pub fn accent_bg() -> u32 {
+    if is_dark() {
+        0xf0_f0_f0
+    } else {
+        0x00_68_ff
+    }
+}
+
+/// High-contrast foreground (text / icon) rendered on top of [`accent_bg`].
+#[must_use]
+pub fn on_accent_fg() -> u32 {
+    if is_dark() {
+        0x12_12_12
+    } else {
+        0xff_ff_ff
+    }
+}
+
+/// Accent foreground for active neutral labels and chips on dark surfaces.
+#[must_use]
+pub fn accent_fg() -> u32 {
+    if is_dark() {
+        0xf0_f0_f0
+    } else {
+        0x00_5a_e0
+    }
+}
+
+/// High-contrast blue foreground for `@mention`, URLs, phone numbers, and
+/// text links (Zalo dark token `#66a6ff` — readable on dark neutral bubbles,
+/// never used as a background fill on dark surfaces).
+#[must_use]
+pub fn link_fg() -> u32 {
+    if is_dark() {
+        0x66_a6_ff
+    } else {
+        0x00_68_ff
+    }
+}
+
+/// Subtle tinted surface for active chips, selected items, and callout banners.
+#[must_use]
+pub fn accent_subtle_bg() -> u32 {
+    if is_dark() {
+        0x26_26_26
+    } else {
+        0xe5_f1_ff
+    }
+}
+
+/// Translucent highlight for text selection and drag selection.
+#[must_use]
+pub fn selection_highlight() -> gpui::Hsla {
+    if is_dark() {
+        gpui::hsla(0., 0., 1., 0.22)
+    } else {
+        gpui::rgba(0x00_68_ff_44).into()
+    }
+}
+
+/// Disabled primary CTA fill (translucent blue in light, subtle neutral in dark).
+#[must_use]
+pub fn accent_disabled_bg() -> gpui::Hsla {
+    if is_dark() {
+        gpui::hsla(0., 0., 1., 0.14)
+    } else {
+        gpui::hsla(0.6, 0.9, 0.5, 0.35)
+    }
+}
+
+/// Disabled primary CTA foreground.
+#[must_use]
+pub fn accent_disabled_fg() -> u32 {
+    if is_dark() {
+        0x73_73_73
+    } else {
+        0xff_ff_ff
+    }
+}
+
+/// Toggle switch track when OFF.
+#[must_use]
+pub fn switch_off_bg() -> u32 {
+    if is_dark() {
+        0x3a_3a_3a
+    } else {
+        0xc5_ca_d3
+    }
+}
+
+/// Toggle switch knob color for `on` / `off` states.
+#[must_use]
+pub fn switch_knob_fg(on: bool) -> u32 {
+    if is_dark() {
+        if on {
+            0x12_12_12
+        } else {
+            0xb8_b8_b8
+        }
+    } else {
+        0xff_ff_ff
+    }
+}
+
+/// Default fallback avatar background (neutral gray in dark mode, Zalo blue in light mode).
+#[must_use]
+pub fn neutral_avatar_bg() -> u32 {
+    if is_dark() {
+        0x33_33_33
+    } else {
+        0x00_68_ff
+    }
+}
+
+/// Card / elevated panel surface in settings & dialogs.
+#[must_use]
+pub fn card_bg() -> u32 {
+    if is_dark() {
+        0x1f_1f_1f
+    } else {
+        0xf4_f6_f8
+    }
+}
+
+/// Card / elevated panel hover fill.
+#[must_use]
+pub fn card_hover_bg() -> u32 {
+    if is_dark() {
+        0x29_29_29
+    } else {
+        0xea_ee_f4
+    }
+}
+
+/// Card / elevated panel border color.
+#[must_use]
+pub fn card_border() -> u32 {
+    if is_dark() {
+        0x30_30_30
+    } else {
+        0xe1_e5_ea
+    }
+}
+
+/// Pure-neutral (`R == G == B`) dark mode overrides: zero blue/slate/navy tints
+/// on dark surfaces, bubbles, selected rows, badges, buttons, or links.
+fn dark_neutral_override(name: &str) -> Option<u32> {
+    Some(match name {
+        // Primary chrome & canvas surfaces (pure neutral black/gray)
+        "--title-bar" => 0x0a_0a_0a,
+        "--layer-background-navbar-normal" | "--surface-background" => 0x0d_0d_0d,
+        "--layer-background-CSC" => 0x12_12_12,
+        "--surface-background-subtle"
+        | "--surface-background-overlay"
+        | "--layer-background-leftmenu" => 0x14_14_14,
+        "--layer-background" | "--surface-alt" => 0x18_18_18,
+        "--layer-background-disabled" => 0x1c_1c_1c,
+        "--layer-background-subtle"
+        | "--layer-background-leftmenu-hover"
+        | "--layer-neutral-information-background" => 0x20_20_20,
+        "--input-field-bg-filled" | "--input-field-bg-outline" => 0x22_22_22,
+        "--layer-background-hover" | "--reaction-background" => 0x24_24_24,
+        "--layer-background-selected"
+        | "--layer-background-leftmenu-selected"
+        | "--layer-information-background"
+        | "--accent-blue-bg-subtle"
+        | "--B10" => 0x28_28_28,
+        "--input-field-bg-filled-hover" => 0x29_29_29,
+        "--button-secondary-neutral-normal" => 0x2a_2a_2a,
+        "--N20" => 0x2c_2c_2c,
+        "--layer-background-inverse-subtle" | "--icon-hover-bg" => 0x2e_2e_2e,
+        "--button-secondary-neutral-hover" => 0x36_36_36,
+        "--N30" => 0x38_38_38,
+
+        // Chat bubbles (pure neutral, clearly separated from canvas & each other)
+        "--white-message" => 0x21_21_21,
+        "--white-message-selected" => 0x2b_2b_2b,
+        "--white-quote" => 0x1a_1a_1a,
+        "--blue-message" => 0x2e_2e_2e,
+        "--blue-message-selected" => 0x38_38_38,
+        "--blue-quote" => 0x24_24_24,
+
+        // Neutral text & icon hierarchy
+        "--text-primary" | "--icon-primary" | "--icon-navbar-normal" => 0xe8_e8_e8,
+        "--text-secondary" | "--icon-secondary" => 0xa3_a3_a3,
+        "--text-placeholder" | "--text-disabled" | "--icon-disabled" => 0x73_73_73,
+        "--text-quote" => 0xcc_cc_cc,
+        "--text-on-color" => 0xff_ff_ff,
+
+        // Primary interactive buttons & neutral active fills (zero blue backgrounds on dark)
+        "--button-primary-normal"
+        | "--accent-blue-bg"
+        | "--B55"
+        | "--B60"
+        | "--blue" => 0xf0_f0_f0,
+        "--button-primary-hover" => 0xff_ff_ff,
+        "--button-primary-pressed" => 0xd4_d4_d4,
+        "--button-primary-text" => 0x12_12_12,
+
+        // Foreground-only link, @mention, phone number, and text-action blue
+        // (matches Zalo PC dark token `#66a6ff` for crisp readability on dark neutral bubbles)
+        "--accent-blue-text"
+        | "--text-information"
+        | "--link"
+        | "--text-mention" => 0x66_a6_ff,
+
+        // Semantic status colors tuned for crisp contrast on dark surfaces
+        "--R60" | "--danger" | "--text-errors" => 0xef_53_50,
+        "--G60" | "--G70" | "--text-success" | "--success" => 0x4a_de_80,
+        "--Y60" | "--text-warning" => 0xfb_bf_24,
+
+        // Neutral dividers / borders when resolved as opaque RGB
+        "--divider" => 0x2b_2b_2b,
+        "--divider-subtle" => 0x22_22_22,
+        "--border" => 0x36_36_36,
+        _ => return None,
+    })
 }
 
 /// `rgba(r,g,b,a)` / `hsla(h,s%,l%,a)` composited over `base` (0xRRGGBB).
@@ -166,13 +388,15 @@ pub fn token_rgb(name: &str, fallback: &str) -> u32 {
         }
     }
 
-    let table = if dark {
-        zalo_design::dark(name).or_else(|| zalo_design::light(name))
+    let resolved = if dark {
+        dark_neutral_override(name).or_else(|| {
+            let table = zalo_design::dark(name).or_else(|| zalo_design::light(name));
+            table.and_then(|v| parse_hex(v).or_else(|| parse_alpha(v, 0x18_18_18)))
+        })
     } else {
         zalo_design::light(name)
+            .and_then(|v| parse_hex(v).or_else(|| parse_alpha(v, 0xff_ff_ff)))
     };
-    let base = if dark { 0x22_26_2b } else { 0xff_ff_ff };
-    let resolved = table.and_then(|v| parse_hex(v).or_else(|| parse_alpha(v, base)));
 
     if let Ok(mut guard) = cache.write() {
         guard.insert(name.to_owned(), resolved);
@@ -229,5 +453,56 @@ mod tests {
         assert_eq!(token_rgb("--input-field-bg-filled", "#000"), 0xf1f2_f4);
         assert_eq!(token_rgb("--blue-message", "#000"), 0xe5f1_ff);
         assert_eq!(token_rgb("--white-message", "#000"), 0xff_ffff);
+    }
+
+    #[test]
+    fn dark_overrides_are_pure_neutral_without_blue_tint() {
+        let neutral_keys = [
+            "--title-bar",
+            "--layer-background-navbar-normal",
+            "--layer-background-CSC",
+            "--layer-background",
+            "--layer-background-subtle",
+            "--layer-background-hover",
+            "--layer-background-selected",
+            "--input-field-bg-filled",
+            "--white-message",
+            "--blue-message",
+            "--N20",
+            "--N30",
+            "--B10",
+            "--B55",
+            "--B60",
+            "--button-primary-normal",
+            "--button-primary-text",
+            "--accent-blue-bg",
+            "--accent-blue-bg-subtle",
+            "--text-primary",
+            "--text-secondary",
+            "--text-placeholder",
+        ];
+        for key in neutral_keys {
+            let rgb = dark_neutral_override(key).expect(key);
+            let r = (rgb >> 16) & 0xff;
+            let g = (rgb >> 8) & 0xff;
+            let b = rgb & 0xff;
+            assert_eq!(r, g, "{key} must be pure neutral (R == G == B), got #{rgb:06x}");
+            assert_eq!(g, b, "{key} must be pure neutral (R == G == B), got #{rgb:06x}");
+        }
+        // Foreground-only link / @mention / phone / info text uses bright blue `#66a6ff`
+        // for clear visibility on dark neutral surfaces and chat bubbles.
+        for key in ["--link", "--text-mention", "--text-information", "--accent-blue-text"] {
+            assert_eq!(dark_neutral_override(key), Some(0x66_a6_ff), "{key}");
+        }
+        // High-contrast button text vs primary fill
+        assert_ne!(
+            dark_neutral_override("--button-primary-normal"),
+            dark_neutral_override("--button-primary-text")
+        );
+        // Outgoing & incoming bubbles remain visually distinct
+        assert_ne!(
+            dark_neutral_override("--blue-message"),
+            dark_neutral_override("--white-message")
+        );
     }
 }

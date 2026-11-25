@@ -5,19 +5,30 @@ use gpui::{
     SharedString, Styled, Window,
 };
 
-/// Hover tooltip painted from a `STR_*` string.
+/// Hover tooltip painted from a `STR_*` string, following Zalo PC `.z-tooltip`
+/// (`max-width: 250px; word-wrap: break-word;`) so long tooltips wrap cleanly
+/// instead of overflowing across columns or past window bounds.
 pub(crate) struct Tip {
     text: SharedString,
 }
 
+const TOOLTIP_MAX_W: f32 = 250.0;
+const TOOLTIP_PAD_X: f32 = 8.0;
+
 impl Render for Tip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let dark = crate::color::is_dark();
+        let wrapped =
+            crate::media::wrap_text_at(&self.text, TOOLTIP_MAX_W - TOOLTIP_PAD_X * 2.0, 12.0, false);
+        let lines: Vec<String> = wrapped.lines().map(str::to_owned).collect();
         div()
-            .px(px(8.))
+            .flex()
+            .flex_col()
+            .max_w(px(TOOLTIP_MAX_W))
+            .px(px(TOOLTIP_PAD_X))
             .py(px(4.))
             .rounded(px(4.))
-            .bg(rgb(if dark { 0x18_1c_22 } else { 0x08_1b_3a }))
+            .bg(rgb(if dark { 0x1a_1a_1a } else { 0x08_1b_3a }))
             .border_1()
             .border_color(if dark {
                 gpui::hsla(0., 0., 1., 0.14)
@@ -26,7 +37,8 @@ impl Render for Tip {
             })
             .text_color(rgb(0xffffff))
             .text_size(px(12.))
-            .child(self.text.clone())
+            .line_height(px(17.))
+            .children(lines.into_iter().map(|line| div().child(line)))
     }
 }
 

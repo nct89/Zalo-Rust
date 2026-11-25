@@ -704,7 +704,7 @@ impl Render for ShotOverlayView {
                         .w(px(sw))
                         .h(px(sh))
                         .border(px(2.))
-                        .border_color(rgb(0x00_68_ff)),
+                        .border_color(rgb(0xf0_f0_f0)),
                 )
                 // Pixel dimensions badge
                 .child(
@@ -757,7 +757,7 @@ impl Render for ShotOverlayView {
                         .h(px(toolbar_h))
                         .px(px(8.))
                         .rounded(px(8.))
-                        .bg(rgb(0x1f_24_2d))
+                        .bg(rgb(0x18_18_18))
                         .border_1()
                         .border_color(hsla(0., 0., 1., 0.16))
                         .shadow_lg()
@@ -827,14 +827,14 @@ impl Render for ShotOverlayView {
                                 .h(px(26.))
                                 .px(px(12.))
                                 .rounded(px(5.))
-                                .bg(rgb(0x00_68_ff))
-                                .hover(|s| s.bg(rgb(0x00_5a_e0)))
+                                .bg(rgb(0xf0_f0_f0))
+                                .hover(|s| s.bg(rgb(0xff_ff_ff)))
                                 .cursor_pointer()
                                 .flex()
                                 .items_center()
                                 .text_size(px(12.))
                                 .font_family(FAMILY_SEMIBOLD)
-                                .text_color(rgb(0xff_ff_ff))
+                                .text_color(rgb(0x12_12_12))
                                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                     this.commit_send(window, cx);
                                 }))
@@ -897,12 +897,12 @@ impl Render for ShotOverlayView {
                                         .px(px(10.))
                                         .py(px(3.))
                                         .rounded(px(12.))
-                                        .bg(rgb(0x00_68_ff))
-                                        .hover(|s| s.bg(rgb(0x00_5a_e0)))
+                                        .bg(rgb(0xf0_f0_f0))
+                                        .hover(|s| s.bg(rgb(0xff_ff_ff)))
                                         .cursor_pointer()
                                         .text_size(px(12.))
                                         .font_family(FAMILY_SEMIBOLD)
-                                        .text_color(rgb(0xff_ff_ff))
+                                        .text_color(rgb(0x12_12_12))
                                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                             this.commit_send(window, cx);
                                         }))

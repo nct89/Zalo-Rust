@@ -332,7 +332,7 @@ impl ShellView {
                             .bg(rgb(blue))
                             .text_size(px(12.5))
                             .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(0xffffff))
+                            .text_color(rgb(crate::color::on_accent_fg()))
                             .hover(|s| s.opacity(0.9))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.stop_voice_record(false, cx);

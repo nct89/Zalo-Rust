@@ -905,9 +905,9 @@ pub(crate) fn ocr_marks(
                 .rounded(px(3.))
                 .cursor(CursorStyle::IBeam)
                 .when(is_sel, |el| {
-                    el.bg(gpui::rgba(0x00_68_ff_76))
+                    el.bg(hsla(0., 0., 1., 0.32))
                         .border_1()
-                        .border_color(gpui::rgba(0x4d_a3_ff_cc))
+                        .border_color(hsla(0., 0., 1., 0.78))
                 })
                 .when(!is_sel, |el| {
                     el.bg(hsla(0., 0., 1., 0.13))
@@ -927,9 +927,9 @@ pub(crate) fn ocr_marks(
                     .w(px(w))
                     .h(px(h))
                     .rounded(px(2.))
-                    .bg(gpui::rgba(0x00_68_ff_2e))
+                    .bg(hsla(0., 0., 1., 0.16))
                     .border_1()
-                    .border_color(gpui::rgba(0x4d_a3_ff_cc)),
+                    .border_color(hsla(0., 0., 1., 0.72)),
             )
         })
         .into_any_element()

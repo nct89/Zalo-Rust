@@ -747,7 +747,7 @@ impl Element for LineElement {
                         };
                         selections.push(fill(
                             Bounds::from_corners(point(x0, row_top), point(x1, row_bot)),
-                            gpui::rgba(0x00_68_ff_55),
+                            crate::color::selection_highlight(),
                         ));
                     }
                 }
@@ -835,7 +835,7 @@ impl Element for LineElement {
                             bounds.bottom(),
                         ),
                     ),
-                    gpui::rgba(0x00_68_ff_55),
+                    crate::color::selection_highlight(),
                 )],
                 None,
             )

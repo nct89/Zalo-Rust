@@ -730,7 +730,7 @@ impl Render for NoticeView {
                                 div()
                                     .h_full()
                                     .w(px(progress_w))
-                                    .bg(rgb(0x0068ff)),
+                                    .bg(rgb(crate::color::accent_bg())),
                             ),
                     )
                     .child(
@@ -795,7 +795,11 @@ fn avatar_el(
 }
 
 fn letter_avatar(initial: String, accent: u32) -> impl IntoElement {
-    let fill = if accent == 0 { 0x0068ff } else { accent };
+    let fill = if accent == 0 {
+        crate::color::neutral_avatar_bg()
+    } else {
+        accent
+    };
     div()
         .size(px(52.))
         .rounded(px(26.))

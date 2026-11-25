@@ -630,13 +630,13 @@ impl ShellView {
     /// Sidebar Backup banner rendered below `list_tabs` / `sync_banner_el`.
     pub(crate) fn backup_banner_el(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let dark = crate::color::is_dark();
-        let bg = if dark { 0x1e_29_3b } else { 0xe8_f2_ff };
+        let bg = if dark { 0x1e_1e_1e } else { 0xe8_f2_ff };
         let ok_bg = if dark { 0x17_33_26 } else { 0xe8_f7_ee };
         let err_bg = if dark { 0x3b_1f_22 } else { 0xfd_ed_ed };
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let blue = token_rgb("--B55", "#0068ff");
-        let border = if dark { 0x33_41_55 } else { 0xc7_dd_ff };
+        let border = if dark { 0x30_30_30 } else { 0xc7_dd_ff };
 
         match &self.backup_ui.banner {
             BackupBannerState::Hidden => None,
@@ -736,7 +736,7 @@ impl ShellView {
                                     .rounded(px(4.))
                                     .bg(rgb(blue))
                                     .text_size(px(12.))
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.start_mobile_restore(cx);
@@ -827,7 +827,7 @@ impl ShellView {
                                             .rounded(px(4.))
                                             .bg(rgb(blue))
                                             .text_size(px(12.))
-                                            .text_color(rgb(0xff_ff_ff))
+                                            .text_color(rgb(crate::color::on_accent_fg()))
                                             .cursor_pointer()
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.start_fresh_backup(cx);
@@ -883,8 +883,8 @@ impl ShellView {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let blue = token_rgb("--B55", "#0068ff");
-        let border = if dark { 0x3a_3e_46 } else { 0xe1_e5_ea };
-        let sec_bg = if dark { 0x2a_2c_31 } else { 0xf1_f2_f4 };
+        let border = crate::color::card_border();
+        let sec_bg = if dark { 0x26_26_26 } else { 0xf1_f2_f4 };
 
         let body: gpui::AnyElement = match &self.backup_ui.popup {
             BackupPopupState::None => div().into_any_element(),
@@ -955,7 +955,7 @@ impl ShellView {
                                 .bg(rgb(blue))
                                 .text_size(px(13.))
                                 .font_family(FAMILY_SEMIBOLD)
-                                .text_color(rgb(0xff_ff_ff))
+                                .text_color(rgb(crate::color::on_accent_fg()))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.confirm_new_backup(ConfirmSourcePopup::Intro, cx);
@@ -1029,7 +1029,7 @@ impl ShellView {
                                     .bg(rgb(blue))
                                     .text_size(px(13.))
                                     .font_family(FAMILY_SEMIBOLD)
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.confirm_restore_on_mobile(cx);
@@ -1068,7 +1068,7 @@ impl ShellView {
                                 .rounded(px(6.))
                                 .bg(rgb(blue))
                                 .text_size(px(13.))
-                                .text_color(rgb(0xff_ff_ff))
+                                .text_color(rgb(crate::color::on_accent_fg()))
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.backup_ui.popup = BackupPopupState::None;
@@ -1109,7 +1109,7 @@ impl ShellView {
                                     .rounded(px(6.))
                                     .bg(rgb(blue))
                                     .text_size(px(13.))
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.backup_ui.popup = BackupPopupState::None;
@@ -1156,7 +1156,7 @@ impl ShellView {
                                     .rounded(px(6.))
                                     .bg(rgb(blue))
                                     .text_size(px(13.))
-                                    .text_color(rgb(0xff_ff_ff))
+                                    .text_color(rgb(crate::color::on_accent_fg()))
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.backup_ui.popup = BackupPopupState::None;

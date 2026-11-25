@@ -1361,7 +1361,7 @@ impl ShellView {
         let fg = if !enabled {
             muted
         } else if primary {
-            0xffffff
+            crate::color::on_accent_fg()
         } else {
             ink
         };

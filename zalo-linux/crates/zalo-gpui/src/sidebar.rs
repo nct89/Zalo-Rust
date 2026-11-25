@@ -78,26 +78,35 @@ fn preview_marked(text: &str, title: &str, fallback: &str) -> String {
 
 impl ShellView {
     /// `#contact-search` + tabs + rows, or the four contact entries.
+    /// In Zalo PC `Compact` mode (`<= 880 px`), expands to fill the full remaining
+    /// width (`#sidebarNav.compact-mode { width: 100% }` / `.conv-list-compact`).
     pub(crate) fn sidebar_column(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let paper = token_rgb("--layer-background", "#ffffff");
         let line = crate::color::border_subtle();
+        let compact = self.compact_level == crate::shell::CompactLevel::Compact;
         div()
             .id("conv-list")
             .flex()
             .flex_col()
-            .flex_none()
-            .w(px(zalo_design::CONV_LIST_INNER_W))
+            .when(compact, |el| el.flex_1().min_w(px(0.)))
+            .when(!compact, |el| {
+                el.flex_none().w(px(zalo_design::CONV_LIST_INNER_W))
+            })
             .h_full()
+            .overflow_hidden()
             .bg(rgb(paper))
-            .child(div().w(px(1.)).h_full().absolute().right_0().bg(line))
+            .when(!compact, |el| {
+                el.child(div().w(px(1.)).h_full().absolute().right_0().bg(line))
+            })
             .child(self.search_bar(cx))
-            .when(lists_chats(self.rail), |el| {
+            .when(self.starred_open, |el| el.child(self.starred_sidebar(cx)))
+            .when(!self.starred_open && lists_chats(self.rail), |el| {
                 el.child(self.list_tabs(cx))
                     .when_some(self.sync_banner_el(cx), |el, banner| el.child(banner))
                     .when_some(self.backup_banner_el(cx), |el, banner| el.child(banner))
                     .child(self.conv_rows(cx))
             })
-            .when(self.rail == Rail::Contacts, |el| {
+            .when(!self.starred_open && self.rail == Rail::Contacts, |el| {
                 el.child(self.contacts_nav(cx))
             })
     }
@@ -618,7 +627,7 @@ impl ShellView {
         };
         let initial = avatar_initials(&row.name);
         let fill = if row.is_group {
-            0x0068ff
+            crate::color::neutral_avatar_bg()
         } else {
             avatar_color(&row.thread_id)
         };
@@ -894,6 +903,7 @@ impl ShellView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.contact_tab = tab;
                 this.selected = None;
+                this.compact_show_chat = true;
                 if tab == ContactTab::Requests {
                     this.load_requests(cx);
                 } else if tab == ContactTab::Invites {
@@ -970,6 +980,31 @@ impl ShellView {
                     .bg(rgb(paper))
                     .border_b_1()
                     .border_color(line)
+                    .when(
+                        self.compact_level == crate::shell::CompactLevel::Compact,
+                        |el| {
+                            let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+                            el.child(
+                                div()
+                                    .id("contacts-compact-back")
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(32.))
+                                    .rounded(px(16.))
+                                    .cursor_pointer()
+                                    .text_color(rgb(ink))
+                                    .hover(move |st| st.bg(rgb(hover)))
+                                    .tooltip(|_, cx| tip("Quay lại danh bạ", cx))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.compact_show_chat = false;
+                                        cx.notify();
+                                    }))
+                                    .child(fonts::icon_el(ic::CHEVRON_LEFT, "‹", 18.)),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .flex()
@@ -1085,7 +1120,7 @@ fn cloud_avatar(size: f32) -> impl IntoElement {
     div()
         .size(px(size))
         .rounded(px(size / 2.0))
-        .bg(rgb(0x0068ff))
+        .bg(rgb(crate::color::neutral_avatar_bg()))
         .flex()
         .items_center()
         .justify_center()
@@ -1279,12 +1314,20 @@ fn upper_char(c: char) -> String {
 /// digits of `userId` modulo 9 (`YfZ7` / `fLyd`).
 #[must_use]
 pub(crate) fn avatar_color(user_id: &str) -> u32 {
-    const FILLS: [u32; 9] = [
+    const LIGHT_FILLS: [u32; 9] = [
         0x0066ff, 0x0fc3ff, 0x37b361, 0xeb5e00, 0x5a2db4, 0x6f3fcf, 0xf31bc8, 0x0066ff, 0x0066ff,
+    ];
+    const DARK_FILLS: [u32; 9] = [
+        0x303030, 0x383838, 0x404040, 0x343434, 0x3c3c3c, 0x444444, 0x2e2e2e, 0x363636, 0x3e3e3e,
     ];
     let tail: String = user_id.chars().rev().take(4).collect::<String>().chars().rev().collect();
     let n = tail.parse::<u32>().unwrap_or(0);
-    FILLS[(n as usize) % FILLS.len()]
+    let fills = if crate::color::is_dark() {
+        &DARK_FILLS
+    } else {
+        &LIGHT_FILLS
+    };
+    fills[(n as usize) % fills.len()]
 }
 
 /// Coloured disc used for a person, and for a collage cell without a photo.
@@ -1440,7 +1483,7 @@ pub(crate) fn group_mark(size: f32) -> impl IntoElement {
     div()
         .size(px(size))
         .rounded(px(size / 2.0))
-        .bg(rgb(0x0068ff))
+        .bg(rgb(crate::color::neutral_avatar_bg()))
         .border_1()
         .border_color(hsla(0., 0., 0., 0.1))
         .flex()
