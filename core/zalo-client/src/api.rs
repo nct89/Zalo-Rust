@@ -2102,6 +2102,78 @@ impl ZaloApi {
         self.get_encrypted_cm(&host, "/api/cm/rgetv2", &payload).await
     }
 
+    /// Loads group cloud history path from `global_msg_id` (`/api/cm/getpath`, cmd 12504,
+    /// `getCloudMessagePath`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when `group_cloud_message` is missing or on transport/Zalo errors.
+    pub async fn group_cloud_getpath(
+        &self,
+        group_id: &str,
+        global_msg_id: &str,
+        count: u32,
+        reverse: u8,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .group_cloud_host
+            .clone()
+            .ok_or_else(|| ClientError::Unexpected("no group_cloud_message host".to_owned()))?;
+        let payload =
+            crate::ops::group_cloud_getpath_payload(group_id, global_msg_id, count, reverse);
+        self.get_encrypted_cm(&host, "/api/cm/getpath", &payload)
+            .await
+    }
+
+    /// Loads cloud thread context around a specific group message (`/api/cm/getpath`, cmd 12504,
+    /// `getCloudThread`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when `group_cloud_message` is missing or on transport/Zalo errors.
+    pub async fn group_cloud_thread(
+        &self,
+        owner_id: &str,
+        group_id: &str,
+        cli_msg_id: &str,
+        global_msg_id: &str,
+        reverse: u8,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .group_cloud_host
+            .clone()
+            .ok_or_else(|| ClientError::Unexpected("no group_cloud_message host".to_owned()))?;
+        let payload = crate::ops::group_cloud_thread_payload(
+            owner_id,
+            group_id,
+            cli_msg_id,
+            global_msg_id,
+            reverse,
+        );
+        self.get_encrypted_cm(&host, "/api/cm/getpath", &payload)
+            .await
+    }
+
+    /// Downloads a PC batch of group cloud messages (`/api/cm/pc/dl`, cmd 12509).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when `group_cloud_message` is missing or on transport/Zalo errors.
+    pub async fn group_cloud_pc_dl(
+        &self,
+        group_id: &str,
+        global_msg_id: &str,
+        count: u32,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .group_cloud_host
+            .clone()
+            .ok_or_else(|| ClientError::Unexpected("no group_cloud_message host".to_owned()))?;
+        let payload = crate::ops::group_cloud_pc_dl_payload(group_id, global_msg_id, count);
+        self.get_encrypted_cm(&host, "/api/cm/pc/dl", &payload)
+            .await
+    }
+
     /// Calls `group_cloud_message` (`/api/cm/getrecentv2`, `/api/cm/getoldv2`),
     /// which requires `nretry=0` in the query string (without it, Zalo returns
     /// error `604`) and wraps its decrypted `data` field as a JSON-encoded string.
@@ -2754,6 +2826,76 @@ impl ZaloApi {
         format!("{host}/api/{}/", if is_group { "group" } else { "message" })
     }
 
+    /// Returns the next-gen photo upload host (`zpw_service_map_v3["up_file"]`),
+    /// matching Zalo PC `getPhotoDomain()` (`compact3945.js:16,210`).
+    #[must_use]
+    pub fn photo_upload_host(&self) -> Option<&str> {
+        self.service_hosts
+            .get("up_file")
+            .and_then(|hosts| hosts.first())
+            .map(String::as_str)
+            .filter(|h| !h.is_empty())
+    }
+
+    /// Uploads a photo via the next-gen chunked endpoint on `up_file`
+    /// (`/api/message/upload/photo` cmd 12651 or `/api/group/upload/photo` cmd 12652).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] if `up_file` host is unavailable or on transport/Zalo errors.
+    pub async fn upload_photo_v2(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        bytes: &[u8],
+        file_name: &str,
+        client_id: u64,
+    ) -> Result<PhotoUpload, ClientError> {
+        let host = self
+            .photo_upload_host()
+            .ok_or_else(|| ClientError::Unexpected("no up_file host".to_owned()))?
+            .to_owned();
+        let path = if is_group {
+            "/api/group/upload/photo"
+        } else {
+            "/api/message/upload/photo"
+        };
+        let url = format!("{host}{path}");
+        let up = self
+            .upload_chunks_with_extra(
+                &url, thread_id, is_group, bytes, file_name, client_id, "photoId", None,
+            )
+            .await?;
+        PhotoUpload::from_value(&up.root, bytes.len())
+    }
+
+    /// Uploads a photo preferring the next-gen `up_file` endpoint (`/api/*/upload/photo`)
+    /// when configured in `zpw_service_map_v3`, falling back automatically to legacy
+    /// `photo_original/upload` if `up_file` is absent or returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when both upload channels fail.
+    pub async fn upload_photo_best(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        bytes: Vec<u8>,
+        file_name: &str,
+        client_id: u64,
+    ) -> Result<PhotoUpload, ClientError> {
+        if self.photo_upload_host().is_some() {
+            if let Ok(up) = self
+                .upload_photo_v2(thread_id, is_group, &bytes, file_name, client_id)
+                .await
+            {
+                return Ok(up);
+            }
+        }
+        self.upload_photo(thread_id, is_group, bytes, file_name, client_id)
+            .await
+    }
+
     /// Uploads one image (`photo_original/upload`, single chunk) for
     /// `thread_id` (a user id, or a group id with or without `g_`).
     ///
@@ -3181,8 +3323,8 @@ impl ZaloApi {
     }
 
     /// One chunked upload (`chunkContent` + encrypted `params`), shared by
-    /// async files and video. `id_key` is `fileId` or `photoId`. An id of
-    /// `"-1"` is ignored so a later chunk can replace it.
+    /// async files, video, next-gen photo, and voice. `id_key` is `fileId` or
+    /// `photoId`. An id of `"-1"` is ignored so a later chunk can replace it.
     async fn upload_chunks(
         &self,
         url: &str,
@@ -3192,6 +3334,24 @@ impl ZaloApi {
         file_name: &str,
         client_id: u64,
         id_key: &str,
+    ) -> Result<ChunkedUpload, ClientError> {
+        self.upload_chunks_with_extra(
+            url, thread_id, is_group, bytes, file_name, client_id, id_key, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_chunks_with_extra(
+        &self,
+        url: &str,
+        thread_id: &str,
+        is_group: bool,
+        bytes: &[u8],
+        file_name: &str,
+        client_id: u64,
+        id_key: &str,
+        extra: Option<(&str, Value)>,
     ) -> Result<ChunkedUpload, ClientError> {
         const CHUNK: usize = crate::ops::ASYNC_CHUNK_BYTES as usize;
         if bytes.is_empty() {
@@ -3204,8 +3364,17 @@ impl ZaloApi {
         for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
             let (id, data) = self
                 .post_upload_chunk_data(
-                    url, thread_id, is_group, chunk, file_name, client_id, total_size, total,
-                    index, id_key,
+                    url,
+                    thread_id,
+                    is_group,
+                    chunk,
+                    file_name,
+                    client_id,
+                    total_size,
+                    total,
+                    index,
+                    id_key,
+                    extra.as_ref().map(|(k, v)| (*k, v.clone())),
                 )
                 .await?;
             if !id.is_empty() && id != "-1" {
@@ -3221,6 +3390,7 @@ impl ZaloApi {
 
     /// One `chunkContent` POST. Returns the id field (possibly empty) and the
     /// decrypted body.
+    #[allow(clippy::too_many_arguments)]
     async fn post_upload_chunk_data(
         &self,
         url: &str,
@@ -3233,6 +3403,7 @@ impl ZaloApi {
         total_chunks: usize,
         index: usize,
         id_key: &str,
+        extra: Option<(&str, Value)>,
     ) -> Result<(String, Value), ClientError> {
         let target = thread_id.strip_prefix("g_").unwrap_or(thread_id);
         let mut payload = serde_json::json!({
@@ -3246,6 +3417,9 @@ impl ZaloApi {
             "chunkId": index + 1,
         });
         payload[if is_group { "grid" } else { "toid" }] = Value::from(target);
+        if let Some((k, v)) = extra {
+            payload[k] = v;
+        }
         let mut query = self.common_params();
         query.insert(
             "type".to_owned(),
@@ -3306,9 +3480,87 @@ impl ZaloApi {
                 total_chunks as usize,
                 index as usize,
                 id_key,
+                None,
             )
             .await?;
         Ok(id)
+    }
+
+    /// Uploads a large voice note in 3 MiB chunks (`/api/message/voice/upload` cmd 12060
+    /// or `/api/group/voice/upload` cmd 12063). Sets `fileType` (`"amr"` or `"aac"`)
+    /// matching Zalo PC `compact0934.js:978`. Returns `(file_id, immediate_url)` where
+    /// `immediate_url` is non-empty if the server already returned the voice URL synchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors, or if no `fileId` arrived.
+    pub async fn upload_voice_chunks(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        bytes: &[u8],
+        file_name: &str,
+        client_id: u64,
+    ) -> Result<(String, String), ClientError> {
+        let url = format!("{}voice/upload", self.file_base(is_group));
+        let file_type = if file_name.to_ascii_lowercase().ends_with(".amr") {
+            "amr"
+        } else {
+            "aac"
+        };
+        let up = self
+            .upload_chunks_with_extra(
+                &url,
+                thread_id,
+                is_group,
+                bytes,
+                file_name,
+                client_id,
+                "fileId",
+                Some(("fileType", Value::from(file_type))),
+            )
+            .await?;
+        let immediate = upload_http_url(&up.root);
+        if up.id.is_empty() && immediate.is_empty() {
+            return Err(ClientError::Unexpected(
+                "voice/upload returned no fileId".to_owned(),
+            ));
+        }
+        Ok((up.id, immediate))
+    }
+
+    /// Uploads a thumbnail image (`/api/message/upthumb`, cmd 11293, `compact3178.js:1361`)
+    /// and returns its CDN URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on empty input, transport/Zalo errors, or missing `url`.
+    pub async fn upload_thumb(
+        &self,
+        client_id: u64,
+        is_group: bool,
+        bytes: Vec<u8>,
+        file_name: &str,
+    ) -> Result<String, ClientError> {
+        if bytes.is_empty() {
+            return Err(ClientError::Unexpected("empty thumbnail".to_owned()));
+        }
+        let payload = crate::ops::upthumb_payload(client_id, &self.device.imei, is_group);
+        let name = if file_name.is_empty() {
+            "thumb.jpg"
+        } else {
+            file_name
+        };
+        let val = self
+            .post_avatar_file("/api/message/upthumb", payload, bytes, name)
+            .await?;
+        let url = upload_http_url(&val);
+        if url.is_empty() {
+            return Err(ClientError::Unexpected(
+                "upthumb returned no url".to_owned(),
+            ));
+        }
+        Ok(url)
     }
 
     /// Sends the message for an uploaded async file (`asyncfile/msg`), with

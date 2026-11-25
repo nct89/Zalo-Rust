@@ -92,6 +92,8 @@ pub enum Dialog {
     UpdateAvailable,
     /// "Contact / Support" dialog (from Settings › Help › Contact).
     Contact,
+    /// Warning modal shown when `/api/message/scanurl` flags an external URL as unsafe.
+    UnsafeUrl(String),
 }
 
 /// Paste Excel table / clipboard content containing both image and text.
@@ -649,6 +651,7 @@ impl ShellView {
             Some(Dialog::About) => self.about_el(cx).into_any_element(),
             Some(Dialog::UpdateAvailable) => self.update_available_el(cx).into_any_element(),
             Some(Dialog::Contact) => self.contact_el(cx).into_any_element(),
+            Some(Dialog::UnsafeUrl(url)) => self.unsafe_url_el(url, cx).into_any_element(),
             None => return div().into_any_element(),
         };
         div()
@@ -1867,11 +1870,19 @@ impl ShellView {
             let me_uid = self.self_uid().unwrap_or_default().to_owned();
             for msg in &msgs {
                 let local = msg.media_path.clone().filter(|p| p.is_file());
-                match (msg.kind, local) {
+                let has_photo_url = msg.kind == crate::media::MsgKind::Photo
+                    && crate::media::is_http_url(&msg.media_url);
+                match (msg.kind, has_photo_url, local) {
+                    (crate::media::MsgKind::Photo, true, _) => {
+                        for (i, dest) in dests.iter().enumerate() {
+                            self.send_photo_by_url_now(dest, msg, i as i64);
+                        }
+                    }
                     (
                         crate::media::MsgKind::Photo
                         | crate::media::MsgKind::Gif
                         | crate::media::MsgKind::Doodle,
+                        _,
                         Some(path),
                     ) => {
                         for dest in &dests {
@@ -1879,7 +1890,7 @@ impl ShellView {
                             self.send_photo_now(path.clone(), "");
                         }
                     }
-                    (crate::media::MsgKind::File, Some(path)) => {
+                    (crate::media::MsgKind::File, _, Some(path)) => {
                         for dest in &dests {
                             self.select_conv(dest.id);
                             self.send_file_now(path.clone());
@@ -1945,14 +1956,20 @@ impl ShellView {
             self.select_conv(dest.id);
             for msg in &msgs {
                 let local = msg.media_path.clone().filter(|p| p.is_file());
-                match (msg.kind, local) {
+                let has_photo_url = msg.kind == crate::media::MsgKind::Photo
+                    && crate::media::is_http_url(&msg.media_url);
+                match (msg.kind, has_photo_url, local) {
+                    (crate::media::MsgKind::Photo, true, _) => {
+                        self.send_photo_by_url_now(dest, msg, 0);
+                    }
                     (
                         crate::media::MsgKind::Photo
                         | crate::media::MsgKind::Gif
                         | crate::media::MsgKind::Doodle,
+                        _,
                         Some(path),
                     ) => self.send_photo_now(path, ""),
-                    (crate::media::MsgKind::File, Some(path)) => self.send_file_now(path),
+                    (crate::media::MsgKind::File, _, Some(path)) => self.send_file_now(path),
                     _ => self.forward_to(dest, msg),
                 }
             }
@@ -3045,6 +3062,121 @@ impl ShellView {
                     .child(
                         div()
                             .id("contact-close-btn")
+                            .px(px(18.))
+                            .h(px(34.))
+                            .rounded(px(4.))
+                            .bg(rgb(primary_bg))
+                            .hover(move |s| s.bg(rgb(primary_hover)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(primary_fg))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog = None;
+                                cx.notify();
+                            }))
+                            .child(crate::color::str_vi("STR_CLOSE", "Đóng")),
+                    ),
+            )
+    }
+
+    fn unsafe_url_el(&self, url: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let panel_bg = token_rgb("--layer-background-subtle", "#ebecf0");
+        let danger = token_rgb("--text-errors", "#d91b1b");
+        let primary_bg = token_rgb("--button-primary-normal", "#0068ff");
+        let primary_hover = token_rgb("--button-primary-hover", "#0045ad");
+        let primary_fg = token_rgb("--button-primary-text", "#ffffff");
+        let sec_bg = token_rgb("--button-neutral-normal", "#eaedf0");
+        let sec_hover = token_rgb("--button-neutral-hover", "#dfe2e7");
+        let url_open = url.to_owned();
+        let url_display = url.to_owned();
+
+        modal_card(440.)
+            .child(self.dialog_title_bar("Cảnh báo liên kết không an toàn", cx))
+            .child(
+                div()
+                    .w_full()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(13.))
+                            .line_height(px(19.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(danger))
+                            .child("Hệ thống quét bảo mật Zalo đánh dấu đường dẫn này có nguy cơ gây hại hoặc lừa đảo."),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(6.))
+                            .bg(rgb(panel_bg))
+                            .border_1()
+                            .border_color(crate::color::border_subtle())
+                            .px(px(12.))
+                            .py(px(10.))
+                            .whitespace_normal()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(ink))
+                            .child(url_display),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .whitespace_normal()
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(rgb(muted))
+                            .child("Chỉ tiếp tục nếu bạn thực sự tin tưởng nguồn gửi đường dẫn này."),
+                    ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(crate::color::border_subtle())
+                    .child(
+                        div()
+                            .id("unsafe-url-open-anyway")
+                            .px(px(14.))
+                            .h(px(34.))
+                            .rounded(px(4.))
+                            .bg(rgb(sec_bg))
+                            .hover(move |s| s.bg(rgb(sec_hover)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(danger))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.dialog = None;
+                                crate::os_util::open_url(&url_open);
+                                cx.notify();
+                            }))
+                            .child("Vẫn mở liên kết"),
+                    )
+                    .child(
+                        div()
+                            .id("unsafe-url-close")
                             .px(px(18.))
                             .h(px(34.))
                             .rounded(px(4.))

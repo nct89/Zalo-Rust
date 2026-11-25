@@ -95,11 +95,22 @@ fn save_and_decode_atomic(dest: &Path, bytes: &[u8], max_edge: u32) -> Option<Ar
     img
 }
 
+/// Context needed to automatically renew an expired CDN link via `/api/message/renewlink`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenewHint {
+    /// Conversation thread id (`uid` or `g_<grid>`).
+    pub thread_id: String,
+    /// True for group threads.
+    pub is_group: bool,
+    /// Zalo forward/renew `msgType` (`MSGTYPE_FORWARD_PHOTO`, `MSGTYPE_FORWARD_VIDEO`, …).
+    pub msg_type: i64,
+}
+
 /// Fetch and decode a single media job using the shared pooled HTTP client.
 /// Returns immediately on cache hit; never blocks behind unrelated photos.
 #[allow(dead_code)]
 pub fn run_one(session_dir: Option<&Path>, job: Job) -> Done {
-    run_one_with_retry(session_dir, job, false)
+    run_one_with_renew(session_dir, job, false, None)
 }
 
 /// Fetch and decode a single media job with CDN propagation retry backoff.
@@ -109,6 +120,17 @@ pub fn run_one(session_dir: Option<&Path>, job: Job) -> Done {
 /// `sent_at`). Retrying transiently avoids falsely marking brand-new photos as
 /// expired ("Ảnh đã hết hạn").
 pub fn run_one_with_retry(session_dir: Option<&Path>, job: Job, recent: bool) -> Done {
+    run_one_with_renew(session_dir, job, recent, None)
+}
+
+/// Same as [`run_one_with_retry`], plus automatic `/api/message/renewlink` recovery
+/// when `renew` is provided and all CDN retries fail on an expired URL.
+pub fn run_one_with_renew(
+    session_dir: Option<&Path>,
+    job: Job,
+    recent: bool,
+    renew: Option<RenewHint>,
+) -> Done {
     let path = job
         .path
         .clone()
@@ -120,6 +142,7 @@ pub fn run_one_with_retry(session_dir: Option<&Path>, job: Job, recent: bool) ->
                 msg_id: job.msg_id,
                 image: Some(image),
                 path: Some(local.clone()),
+                renewed_url: None,
             };
         }
         // Remove corrupt/zero-byte cache file so a fresh download can recover it.
@@ -131,6 +154,7 @@ pub fn run_one_with_retry(session_dir: Option<&Path>, job: Job, recent: bool) ->
         msg_id: job.msg_id,
         path: None,
         image: None,
+        renewed_url: None,
     };
     let (Some(dir), Some(dest)) = (session_dir, path) else {
         return done;
@@ -170,6 +194,57 @@ pub fn run_one_with_retry(session_dir: Option<&Path>, job: Job, recent: bool) ->
             }
         }
     }
+    // Expired CDN URL fallback: ask Zalo `/api/message/renewlink` for a fresh URL.
+    if let Some(hint) = renew {
+        let api_renew = Arc::clone(&api);
+        let req = zalo_client::RenewLinkRequest {
+            thread_id: hint.thread_id,
+            is_group: hint.is_group,
+            msg_type: hint.msg_type,
+            msg_info: serde_json::json!({
+                "oriUrl": job.url,
+                "hdUrl": job.url,
+                "thumbUrl": job.url,
+                "url": job.url,
+            }),
+            client_id: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(1),
+            is_e2ee: false,
+            is_original: false,
+        };
+        let renewed = rt.block_on(async move {
+            tokio::time::timeout(Duration::from_secs(10), api_renew.renew_link(&req))
+                .await
+                .ok()
+                .and_then(|res| res.ok())
+        });
+        if let Some(fresh_url) = renewed
+            .as_ref()
+            .and_then(|r| r.best_url())
+            .map(str::to_owned)
+        {
+            let api_dl = Arc::clone(&api);
+            let url_dl = fresh_url.clone();
+            let bytes = rt.block_on(async move {
+                tokio::time::timeout(FETCH_TIMEOUT, api_dl.fetch_limited(&url_dl, MAX_BYTES))
+                    .await
+                    .ok()
+                    .and_then(|res| res.ok())
+                    .filter(|b| !b.is_empty())
+            });
+            if let Some(bytes) = bytes {
+                let fresh_dest = media::cache_path_for(&fresh_url).unwrap_or(dest);
+                if let Some(image) = save_and_decode_atomic(&fresh_dest, &bytes, job.max_edge) {
+                    done.image = Some(image);
+                    done.path = Some(fresh_dest);
+                    done.renewed_url = Some(fresh_url);
+                    return done;
+                }
+            }
+        }
+    }
     done
 }
 
@@ -194,6 +269,8 @@ pub struct Done {
     pub path: Option<PathBuf>,
     /// Decoded bitmap ready for `img()`.
     pub image: Option<Arc<RenderImage>>,
+    /// Fresh CDN URL returned by `/api/message/renewlink` when recovery succeeded.
+    pub renewed_url: Option<String>,
 }
 
 /// Decode local / cached files and fetch the rest. Blocking (JXL decode is
@@ -213,6 +290,7 @@ pub fn run_batch(session_dir: Option<&Path>, jobs: Vec<Job>) -> Vec<Done> {
                 msg_id: job.msg_id,
                 image: media::decode_thumb(path, job.max_edge),
                 path: Some(path.clone()),
+                renewed_url: None,
             }),
             None => missing.push((job, path)),
         }
@@ -235,6 +313,7 @@ pub fn run_batch(session_dir: Option<&Path>, jobs: Vec<Job>) -> Vec<Done> {
             msg_id: job.msg_id,
             path: None,
             image: None,
+            renewed_url: None,
         };
         if let (Some(bytes), Some(path)) = (bytes, path) {
             if std::fs::write(&path, &bytes).is_ok() {

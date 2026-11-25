@@ -121,6 +121,10 @@ pub const CMD_BACKUP_GET_METADATA: u16 = 632;
 pub const CMD_BACKUP_SIGNAL_RESTORE: u16 = 633;
 /// Backup (PC → phone): fetch server backup configs (`retention_time`).
 pub const CMD_BACKUP_GET_CONFIGS: u16 = 634;
+/// Query per-member delivered/seen status for 1-1 conversations (`GET_STATUS_MSG`).
+pub const CMD_GET_STATUS_MSG: u16 = 575;
+/// Query per-member delivered/seen status for group conversations (`GET_STATUS_MSG_GROUP`).
+pub const CMD_GET_STATUS_MSG_GROUP: u16 = 576;
 
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const CLOSE_DUPLICATE: u16 = 3000;
@@ -670,7 +674,9 @@ pub fn offline_pull_frame(
 fn is_rpc_envelope_cmd(cmd: u16) -> bool {
     matches!(
         cmd,
-        CMD_SYNC_REQUEST
+        CMD_GET_STATUS_MSG
+            | CMD_GET_STATUS_MSG_GROUP
+            | CMD_SYNC_REQUEST
             | CMD_SYNC_ACK_DELETE
             | CMD_SYNC_WAKEUP
             | CMD_BACKUP_INIT
@@ -2021,6 +2027,38 @@ mod tests {
                 assert_eq!(data["data"]["reqId"], "bk_req_1");
             }
             other => panic!("expected Event, got {other:?}"),
+        }
+
+        for cmd in [CMD_GET_STATUS_MSG, CMD_GET_STATUS_MSG_GROUP] {
+            let frame = Frame::json(
+                cmd,
+                0,
+                &json!({
+                    "error_code": 0,
+                    "encrypt": 0,
+                    "data": {
+                        "reqId": format!("req_{cmd}_1"),
+                        "statusInfos": [{"ids": [{"id": "42", "seen": "99", "deliver": "100"}]}]
+                    }
+                }),
+            );
+            let evs = decoder.handle_all(&frame).expect("decode status rpc");
+            assert_eq!(evs.len(), 1);
+            match &evs[0] {
+                ListenerEvent::Event {
+                    cmd: got_cmd,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(*got_cmd, cmd);
+                    let parsed = crate::ops::parse_status_msg_response(data);
+                    assert_eq!(parsed.len(), 1);
+                    assert_eq!(parsed[0].uid, "42");
+                    assert_eq!(parsed[0].seen_msg_id, 99);
+                    assert_eq!(parsed[0].deliver_msg_id, 100);
+                }
+                other => panic!("expected Event for {cmd}, got {other:?}"),
+            }
         }
     }
 

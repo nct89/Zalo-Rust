@@ -13,9 +13,19 @@ pub const MSG_TEXT: i64 = 1;
 pub const MSG_VOICE: i64 = 3;
 /// `MSG_FILE` (`share.file`) in the same enum.
 pub const MSG_FILE: i64 = 19;
+/// Forward `msgType` for a file (`MSGTYPE_FORWARD_FILE` in `compact0293.js`).
+pub const MSGTYPE_FORWARD_FILE: i64 = 1;
+/// Forward `msgType` for a photo (`MSGTYPE_FORWARD_PHOTO` in `compact0293.js`).
+pub const MSGTYPE_FORWARD_PHOTO: i64 = 2;
+/// Forward `msgType` for a voice note (`MSGTYPE_FORWARD_VOICE` in `compact0293.js`).
+pub const MSGTYPE_FORWARD_VOICE: i64 = 3;
+/// Forward `msgType` for a GIF (`MSGTYPE_FORWARD_GIF` in `compact0293.js`).
+pub const MSGTYPE_FORWARD_GIF: i64 = 4;
 /// Forward `msgType` for a video (`MSGTYPE_FORWARD_VIDEO` in the PC bundle).
 /// This is not `CLI_MSG_TYPE_VIDEO` (44).
 pub const MSGTYPE_FORWARD_VIDEO: i64 = 5;
+/// Above this byte size, voice notes switch from single-POST `voicemp3` to chunked `voice/upload`.
+pub const VOICE_DIRECT_MAX_BYTES: u64 = 1024 * 1024;
 /// CDN that turns AMR into MP3 (`compact1847.js` `voice.voiceUrl`, player in `compact3576.js`).
 pub const VOICE_MP3_HOST: &str = "https://cache.voice.talk.zdn.vn";
 /// `updateListArchivedChat` actionType: add to Other (`O = 0`).
@@ -658,6 +668,462 @@ pub fn forward_video_payload(
             "msgInfo": msg_info,
         })
     }
+}
+
+/// Photo metadata sent via `/api/message/photo_url` (11775) or `/api/group/photo_url` (11830).
+/// Matches Zalo PC `sendPhotoByUrl` (`compact3178.js:3027`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhotoUrlSendInfo {
+    /// Caption / title (may be empty).
+    pub title: String,
+    /// Normal / original URL (`oriUrl`).
+    pub ori_url: String,
+    /// Thumbnail URL (`thumbUrl`).
+    pub thumb_url: String,
+    /// HD URL (`hdUrl`, falls back to `ori_url` when empty).
+    pub hd_url: String,
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// Optional serialized JSON properties object (`properties`, default `"{}"`).
+    pub properties: String,
+}
+
+/// Payload for `/api/message/photo_url` or `/api/group/photo_url` (`sendPhotoByUrl`).
+#[must_use]
+pub fn photo_url_payload(
+    thread_id: &str,
+    is_group: bool,
+    client_id: u64,
+    info: &PhotoUrlSendInfo,
+) -> Value {
+    let target = strip_group(thread_id);
+    let hd = if info.hd_url.is_empty() {
+        info.ori_url.as_str()
+    } else {
+        info.hd_url.as_str()
+    };
+    let thumb = if info.thumb_url.is_empty() {
+        info.ori_url.as_str()
+    } else {
+        info.thumb_url.as_str()
+    };
+    let props = if info.properties.trim().is_empty() {
+        "{}".to_owned()
+    } else {
+        info.properties.clone()
+    };
+    let mut payload = json!({
+        "clientId": client_id,
+        "title": info.title,
+        "oriUrl": info.ori_url,
+        "thumbUrl": thumb,
+        "hdUrl": hd,
+        "width": info.width,
+        "height": info.height,
+        "properties": props,
+        "zsource": -1,
+        "ttl": 0,
+    });
+    if is_group {
+        payload["grid"] = Value::from(target);
+        payload["visibility"] = Value::from(0);
+    } else {
+        payload["toId"] = Value::from(target);
+    }
+    payload
+}
+
+/// Request parameters for `/api/message/renewlink` (`compact3178.js:2660`, cmd 12094).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenewLinkRequest {
+    /// Destination conversation id (user id or `g_<grid>`).
+    pub thread_id: String,
+    /// True for group conversations (or My Cloud `sendToMe`).
+    pub is_group: bool,
+    /// `MSGTYPE_FORWARD_FILE` (1), `MSGTYPE_FORWARD_PHOTO` (2), or `MSGTYPE_FORWARD_VIDEO` (5).
+    pub msg_type: i64,
+    /// Media URL metadata object (`url`/`oriUrl`/`hdUrl`/`thumbUrl`/`normalUrl`).
+    pub msg_info: Value,
+    /// Request client id.
+    pub client_id: u64,
+    /// Whether the media is E2EE encrypted (`isE2EE`).
+    pub is_e2ee: bool,
+    /// Whether the original photo resolution was requested (`isOriginal`).
+    pub is_original: bool,
+}
+
+/// Decoded result from `/api/message/renewlink` (`compact3043.js:1858-1871`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenewLinkResult {
+    /// Renewed file/video URL (`fileUrl` or `url`).
+    pub file_url: String,
+    /// Renewed normal/original photo URL (`normal` or `oriUrl`).
+    pub ori_url: String,
+    /// Renewed HD photo URL (`hd` or `hdUrl`).
+    pub hd_url: String,
+    /// Renewed thumbnail URL (`thumb` or `thumbUrl`).
+    pub thumb_url: String,
+    /// Server reported `async: true` (needs async control event / retry).
+    pub is_async: bool,
+}
+
+impl RenewLinkResult {
+    /// Best renewed URL usable for displaying/downloading the media.
+    #[must_use]
+    pub fn best_url(&self) -> Option<&str> {
+        [
+            self.hd_url.as_str(),
+            self.ori_url.as_str(),
+            self.file_url.as_str(),
+            self.thumb_url.as_str(),
+        ]
+        .into_iter()
+        .find(|u| u.starts_with("https://") || u.starts_with("http://"))
+    }
+}
+
+/// Strips Zalo's `jxl://` scheme prefix if present (`removeJxlProtocol`).
+fn strip_jxl_protocol(url: &str) -> String {
+    url.strip_prefix("jxl://")
+        .map(|rest| format!("https://{rest}"))
+        .unwrap_or_else(|| url.to_owned())
+}
+
+/// Payload for `/api/message/renewlink` (`compact3178.js:2660`).
+#[must_use]
+pub fn renew_link_payload(req: &RenewLinkRequest, imei: &str) -> Value {
+    let mut info = req
+        .msg_info
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    for key in ["hdUrl", "thumbUrl", "normalUrl", "url"] {
+        if let Some(s) = info.get(key).and_then(Value::as_str).map(strip_jxl_protocol) {
+            info.insert(key.to_owned(), Value::String(s));
+        }
+    }
+    if let Some(ori) = info.get("oriUrl").and_then(Value::as_str).map(strip_jxl_protocol) {
+        info.insert("url".to_owned(), Value::String(ori.clone()));
+        info.insert("oriUrl".to_owned(), Value::String(ori));
+    }
+    info.insert("isE2EE".to_owned(), json!(if req.is_e2ee { 1 } else { 0 }));
+    info.insert(
+        "isOriginal".to_owned(),
+        json!(if req.is_original { 1 } else { 0 }),
+    );
+    let target = strip_group(&req.thread_id);
+    json!({
+        "toId": target,
+        "msgType": req.msg_type,
+        "msgInfo": Value::Object(info).to_string(),
+        "clientId": req.client_id,
+        "imei": imei,
+        "isGroup": if req.is_group { 1 } else { 0 },
+    })
+}
+
+/// Parses a decrypted `/api/message/renewlink` response (`compact3043.js:1858-1871`).
+#[must_use]
+pub fn renew_link_result_from(value: &Value) -> RenewLinkResult {
+    let root = value.get("data").unwrap_or(value);
+    let pick = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|k| root.get(*k).and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let is_async = match root.get("async") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0,
+        _ => false,
+    };
+    RenewLinkResult {
+        file_url: pick(&["fileUrl", "url"]),
+        ori_url: pick(&["normal", "oriUrl", "normalUrl"]),
+        hd_url: pick(&["hd", "hdUrl"]),
+        thumb_url: pick(&["thumb", "thumbUrl"]),
+        is_async,
+    }
+}
+
+/// Decoded result of `/api/message/scanurl` (cmd 12400, `compact3178.js:5170`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanUrlResult {
+    /// `true` when Zalo marks the URL safe (or omitted `isSafe`), `false` when flagged malicious.
+    pub is_safe: bool,
+    /// Raw decrypted response object.
+    pub raw: Value,
+}
+
+/// Payload for `/api/message/scanurl` (`{ "url": ... }`).
+#[must_use]
+pub fn scan_url_payload(url: &str) -> Value {
+    json!({ "url": url })
+}
+
+/// Parses a decrypted `/api/message/scanurl` response (`compact4490.js:213`).
+#[must_use]
+pub fn scan_url_result_from(value: &Value) -> ScanUrlResult {
+    let root = value.get("data").unwrap_or(value);
+    let is_safe = match root.get("isSafe") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(1) != 0,
+        Some(Value::String(s)) => s != "false" && s != "0",
+        _ => true,
+    };
+    ScanUrlResult {
+        is_safe,
+        raw: root.clone(),
+    }
+}
+
+/// Payload for `/api/message/upthumb` (cmd 11293, `compact3178.js:1361`).
+#[must_use]
+pub fn upthumb_payload(client_id: u64, imei: &str, is_group: bool) -> Value {
+    let mut payload = json!({
+        "clientId": client_id,
+        "imei": imei,
+    });
+    if is_group {
+        payload["isGroup"] = Value::from(1);
+    }
+    payload
+}
+
+/// Voice forward payload (`/api/message/forward` or `/api/group/forward`, `msgType` 3)
+/// used after chunked `voice/upload` finishes (`compact3043.js:10440`).
+#[must_use]
+pub fn forward_voice_payload(
+    thread_id: &str,
+    is_group: bool,
+    client_id: u64,
+    imei: &str,
+    voice_url: &str,
+    m4a_url: Option<&str>,
+) -> Value {
+    let mut msg = serde_json::Map::new();
+    msg.insert("voiceUrl".to_owned(), json!(voice_url));
+    if let Some(m4a) = m4a_url.filter(|s| !s.is_empty()) {
+        msg.insert("m4aUrl".to_owned(), json!(m4a));
+    }
+    let msg_info = Value::Object(msg).to_string();
+    let target = strip_group(thread_id);
+    if is_group {
+        json!({
+            "grid": target,
+            "visibility": 0,
+            "msgType": MSGTYPE_FORWARD_VOICE,
+            "clientId": client_id,
+            "msgInfo": msg_info,
+        })
+    } else {
+        json!({
+            "toId": target,
+            "imei": imei,
+            "msgType": MSGTYPE_FORWARD_VOICE,
+            "clientId": client_id,
+            "msgInfo": msg_info,
+        })
+    }
+}
+
+/// One member's seen/delivered message-id cursors returned by
+/// `/api/message/getStatusMsg`, `/api/group/getStatusMsg`, or WS `575`/`576`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemberMsgStatus {
+    /// Member / peer uid.
+    pub uid: String,
+    /// Highest server `msgId` seen by this user (`0` if none).
+    pub seen_msg_id: i64,
+    /// Highest server `msgId` delivered to this user (`0` if none).
+    pub deliver_msg_id: i64,
+}
+
+/// Builds the inner `data` array shared by HTTP `getStatusMsg` and WS `575`/`576`
+/// (`compact2150.js:420-429`).
+#[must_use]
+pub fn get_status_msg_data(target_id: &str, member_ids: &[String], is_group: bool) -> Value {
+    let bare = strip_group(target_id);
+    if is_group {
+        json!([{ "tId": bare, "ids": member_ids }])
+    } else {
+        json!([{ "tId": bare }])
+    }
+}
+
+/// HTTP payload for `/api/message/getStatusMsg` (12016) or `/api/group/getStatusMsg` (12017)
+/// (`compact3178.js:5414-5439`).
+#[must_use]
+pub fn get_status_msg_http_payload(
+    target_id: &str,
+    member_ids: &[String],
+    is_group: bool,
+) -> Value {
+    let data = get_status_msg_data(target_id, member_ids, is_group);
+    json!({ "param": json!({ "data": data }).to_string() })
+}
+
+/// WebSocket JSON body for `CMD_GET_STATUS_MSG` (575) / `CMD_GET_STATUS_MSG_GROUP` (576)
+/// (`compact3857.js:193-198`).
+#[must_use]
+pub fn get_status_msg_ws_body(
+    req_id: &str,
+    target_id: &str,
+    member_ids: &[String],
+    is_group: bool,
+) -> Value {
+    let data = get_status_msg_data(target_id, member_ids, is_group);
+    json!({
+        "reqId": req_id,
+        "data": data,
+    })
+}
+
+fn value_i64(v: Option<&Value>) -> i64 {
+    match v {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn value_uid(v: Option<&Value>) -> Option<String> {
+    match v {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Parses `statusInfos: [{ ids: [{ id, seen, deliver }] }]` from either HTTP `getStatusMsg`
+/// (whose `data` may be a JSON string) or WebSocket `575`/`576` reply (`compact2150.js:340-405`).
+#[must_use]
+pub fn parse_status_msg_response(value: &Value) -> Vec<MemberMsgStatus> {
+    // Unwrap possible `{ data: "<json>" }` or `{ data: { statusInfos: ... } }` nesting.
+    let parsed_str;
+    let level1 = match value.get("data") {
+        Some(Value::String(s)) => {
+            parsed_str = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+            &parsed_str
+        }
+        Some(v) => v,
+        None => value,
+    };
+    let parsed_inner;
+    let root = match level1.get("data") {
+        Some(Value::String(s)) => {
+            parsed_inner = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+            &parsed_inner
+        }
+        Some(v) => v,
+        None => level1,
+    };
+
+    let mut out = Vec::new();
+    let infos = root
+        .get("statusInfos")
+        .and_then(Value::as_array)
+        .or_else(|| level1.get("statusInfos").and_then(Value::as_array))
+        .or_else(|| root.as_array());
+    let Some(infos) = infos else {
+        return out;
+    };
+    for info in infos {
+        let Some(ids) = info.get("ids").and_then(Value::as_array) else {
+            // Some responses put { id, seen, deliver } directly in the array.
+            if let Some(uid) = value_uid(info.get("id")) {
+                if uid != "0" {
+                    out.push(MemberMsgStatus {
+                        uid,
+                        seen_msg_id: value_i64(info.get("seen")),
+                        deliver_msg_id: value_i64(info.get("deliver")),
+                    });
+                }
+            }
+            continue;
+        };
+        for entry in ids {
+            let Some(uid) = value_uid(entry.get("id")) else {
+                continue;
+            };
+            if uid == "0" {
+                continue;
+            }
+            let seen = value_i64(entry.get("seen"));
+            let deliver = value_i64(entry.get("deliver"));
+            if let Some(existing) = out.iter_mut().find(|r: &&mut MemberMsgStatus| r.uid == uid) {
+                existing.seen_msg_id = existing.seen_msg_id.max(seen);
+                existing.deliver_msg_id = existing.deliver_msg_id.max(deliver);
+            } else {
+                out.push(MemberMsgStatus {
+                    uid,
+                    seen_msg_id: seen,
+                    deliver_msg_id: deliver,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Payload for `/api/cm/getpath` (`getCloudMessagePath`, cmd 12504, `compact3178.js:4761`).
+#[must_use]
+pub fn group_cloud_getpath_payload(
+    group_id: &str,
+    global_msg_id: &str,
+    count: u32,
+    reverse: u8,
+) -> Value {
+    let bare = strip_group(group_id);
+    let gid: Value = if global_msg_id.is_empty() || global_msg_id == "0" {
+        json!(0)
+    } else if let Ok(n) = global_msg_id.parse::<i64>() {
+        json!(n)
+    } else {
+        json!(global_msg_id)
+    };
+    json!({
+        "groupId": bare,
+        "globalMsgId": gid,
+        "count": count,
+        "reverse": reverse,
+    })
+}
+
+/// Payload for `/api/cm/getpath` thread lookup (`getCloudThread`, cmd 12504, `compact3178.js:5275`).
+#[must_use]
+pub fn group_cloud_thread_payload(
+    owner_id: &str,
+    group_id: &str,
+    cli_msg_id: &str,
+    global_msg_id: &str,
+    reverse: u8,
+) -> Value {
+    json!({
+        "ownerId": owner_id,
+        "groupId": strip_group(group_id),
+        "cliMsgId": cli_msg_id,
+        "globalMsgId": global_msg_id,
+        "reverse": reverse,
+    })
+}
+
+/// Payload for `/api/cm/pc/dl` (cmd 12509, `group_cloud_message` PC download batch).
+#[must_use]
+pub fn group_cloud_pc_dl_payload(group_id: &str, global_msg_id: &str, count: u32) -> Value {
+    let gid = if global_msg_id.is_empty() || global_msg_id == "0" {
+        "0"
+    } else {
+        global_msg_id
+    };
+    json!({
+        "groupId": strip_group(group_id),
+        "globalMsgId": gid,
+        "count": count,
+    })
 }
 
 /// Reaction list item (`sendReaction` in `compact2514.js`).
@@ -1800,6 +2266,131 @@ impl ZaloApi {
         };
         self.post_encrypted(&base, path, &payload).await
     }
+
+    /// Sends a photo directly by cached CDN URL without re-uploading bytes
+    /// (`/api/message/photo_url` cmd 11775, `/api/group/photo_url` cmd 11830).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn send_photo_by_url(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        client_id: u64,
+        info: &PhotoUrlSendInfo,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .file_host
+            .clone()
+            .unwrap_or_else(|| "https://tt-files-wpa.chat.zalo.me".to_owned());
+        let path = if is_group {
+            "/api/group/photo_url"
+        } else {
+            "/api/message/photo_url"
+        };
+        let payload = photo_url_payload(thread_id, is_group, client_id, info);
+        self.post_encrypted(&host, path, &payload).await
+    }
+
+    /// Requests fresh CDN URLs for an expired photo, video, or file
+    /// (`/api/message/renewlink`, cmd 12094).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn renew_link(
+        &self,
+        req: &RenewLinkRequest,
+    ) -> Result<RenewLinkResult, ClientError> {
+        let host = self
+            .file_host
+            .clone()
+            .unwrap_or_else(|| "https://tt-files-wpa.chat.zalo.me".to_owned());
+        let payload = renew_link_payload(req, &self.device.imei);
+        let value = self
+            .post_encrypted(&host, "/api/message/renewlink", &payload)
+            .await?;
+        Ok(renew_link_result_from(&value))
+    }
+
+    /// Scans an external URL for phishing / malware (`/api/message/scanurl`, cmd 12400)
+    /// with a 5-second timeout matching Zalo PC (`compact3178.js:5176`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on timeout, transport, Zalo or decryption errors.
+    pub async fn scan_url(&self, url: &str) -> Result<ScanUrlResult, ClientError> {
+        let host = self
+            .file_host
+            .clone()
+            .unwrap_or_else(|| "https://tt-files-wpa.chat.zalo.me".to_owned());
+        let payload = scan_url_payload(url);
+        let value = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.post_encrypted(&host, "/api/message/scanurl", &payload),
+        )
+        .await
+        .map_err(|_| ClientError::Unexpected("scanurl timed out".to_owned()))??;
+        Ok(scan_url_result_from(&value))
+    }
+
+    /// Forwards / finalizes a chunk-uploaded voice message (`msgType` 3) on the file host
+    /// (`/api/message/forward` or `/api/group/forward`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn forward_voice(
+        &self,
+        thread_id: &str,
+        is_group: bool,
+        client_id: u64,
+        voice_url: &str,
+        m4a_url: Option<&str>,
+    ) -> Result<Value, ClientError> {
+        let host = self
+            .file_host
+            .clone()
+            .unwrap_or_else(|| "https://tt-files-wpa.chat.zalo.me".to_owned());
+        let path = if is_group {
+            "/api/group/forward"
+        } else {
+            "/api/message/forward"
+        };
+        let payload = forward_voice_payload(
+            thread_id,
+            is_group,
+            client_id,
+            &self.device.imei,
+            voice_url,
+            m4a_url,
+        );
+        self.post_encrypted(&host, path, &payload).await
+    }
+
+    /// Queries per-member delivered/seen cursors for a 1-1 or group conversation
+    /// (`/api/message/getStatusMsg` cmd 12016, `/api/group/getStatusMsg` cmd 12017).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] on transport, Zalo or decryption errors.
+    pub async fn get_status_msg(
+        &self,
+        target_id: &str,
+        member_ids: &[String],
+        is_group: bool,
+    ) -> Result<Vec<MemberMsgStatus>, ClientError> {
+        let payload = get_status_msg_http_payload(target_id, member_ids, is_group);
+        let value = if is_group {
+            self.post_encrypted(&self.group_base(), "/api/group/getStatusMsg", &payload)
+                .await?
+        } else {
+            self.post_encrypted(&self.chat_base(), "/api/message/getStatusMsg", &payload)
+                .await?
+        };
+        Ok(parse_status_msg_response(&value))
+    }
 }
 
 #[cfg(test)]
@@ -2197,5 +2788,132 @@ mod tests {
         assert_eq!(fm2["totalIds"], 1);
         assert_eq!(fm2["msgType"], "1");
         assert_eq!(fm2["grids"][0]["grid"], "88");
+    }
+
+    #[test]
+    fn group_2b_payloads_and_parsers_match_zalo_pc() {
+        // 1. sendPhotoByUrl (1-1 & group)
+        let photo_info = PhotoUrlSendInfo {
+            title: "Ảnh đẹp".into(),
+            ori_url: "https://cdn.zdn.vn/ori.jpg".into(),
+            thumb_url: "https://cdn.zdn.vn/thumb.jpg".into(),
+            hd_url: "https://cdn.zdn.vn/hd.jpg".into(),
+            width: 1200,
+            height: 800,
+            properties: String::new(),
+        };
+        let p_dm = photo_url_payload("1001", false, 55, &photo_info);
+        assert_eq!(p_dm["toId"], "1001");
+        assert_eq!(p_dm["oriUrl"], "https://cdn.zdn.vn/ori.jpg");
+        assert_eq!(p_dm["hdUrl"], "https://cdn.zdn.vn/hd.jpg");
+        assert_eq!(p_dm["properties"], "{}");
+        assert!(p_dm.get("grid").is_none());
+
+        let p_grp = photo_url_payload("g_9001", true, 56, &photo_info);
+        assert_eq!(p_grp["grid"], "9001");
+        assert_eq!(p_grp["visibility"], 0);
+        assert!(p_grp.get("toId").is_none());
+
+        // 2. renewLink + scanUrl
+        let renew_req = RenewLinkRequest {
+            thread_id: "g_77".into(),
+            is_group: true,
+            msg_type: MSGTYPE_FORWARD_PHOTO,
+            msg_info: json!({
+                "oriUrl": "jxl://cdn.zdn.vn/old.jxl",
+                "hdUrl": "jxl://cdn.zdn.vn/old_hd.jxl",
+                "thumbUrl": "https://cdn.zdn.vn/old_t.jpg"
+            }),
+            client_id: 777,
+            is_e2ee: false,
+            is_original: true,
+        };
+        let rp = renew_link_payload(&renew_req, "imei-x");
+        assert_eq!(rp["toId"], "77");
+        assert_eq!(rp["msgType"], MSGTYPE_FORWARD_PHOTO);
+        assert_eq!(rp["isGroup"], 1);
+        let parsed_info: Value = serde_json::from_str(rp["msgInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_info["url"], "https://cdn.zdn.vn/old.jxl");
+        assert_eq!(parsed_info["hdUrl"], "https://cdn.zdn.vn/old_hd.jxl");
+        assert_eq!(parsed_info["isOriginal"], 1);
+        assert_eq!(parsed_info["isE2EE"], 0);
+
+        let rres = renew_link_result_from(&json!({
+            "data": {
+                "normal": "https://cdn.zdn.vn/new_ori.jpg",
+                "hd": "https://cdn.zdn.vn/new_hd.jpg",
+                "thumb": "https://cdn.zdn.vn/new_thumb.jpg"
+            }
+        }));
+        assert_eq!(rres.best_url(), Some("https://cdn.zdn.vn/new_hd.jpg"));
+        assert!(!rres.is_async);
+
+        let sp = scan_url_payload("https://bad.example");
+        assert_eq!(sp["url"], "https://bad.example");
+        assert!(!scan_url_result_from(&json!({"data": {"isSafe": false}})).is_safe);
+        assert!(scan_url_result_from(&json!({"data": {"isSafe": true}})).is_safe);
+        assert!(scan_url_result_from(&json!({"data": {}})).is_safe);
+
+        // 3. upthumb + forward_voice
+        let ut = upthumb_payload(888, "imei-1", true);
+        assert_eq!(ut["clientId"], 888);
+        assert_eq!(ut["isGroup"], 1);
+        let fv = forward_voice_payload("g_55", true, 889, "imei-1", "https://v.zdn.vn/a.aac", None);
+        assert_eq!(fv["grid"], "55");
+        assert_eq!(fv["msgType"], MSGTYPE_FORWARD_VOICE);
+        let fv_info: Value = serde_json::from_str(fv["msgInfo"].as_str().unwrap()).unwrap();
+        assert_eq!(fv_info["voiceUrl"], "https://v.zdn.vn/a.aac");
+
+        // 4. getStatusMsg (HTTP + WS + parser)
+        let http_st = get_status_msg_http_payload(
+            "g_42",
+            &["101".into(), "102".into()],
+            true,
+        );
+        let inner_param: Value = serde_json::from_str(http_st["param"].as_str().unwrap()).unwrap();
+        assert_eq!(inner_param["data"][0]["tId"], "42");
+        assert_eq!(inner_param["data"][0]["ids"][0], "101");
+
+        let ws_st = get_status_msg_ws_body("req_576_1", "g_42", &["101".into()], true);
+        assert_eq!(ws_st["reqId"], "req_576_1");
+        assert_eq!(ws_st["data"][0]["tId"], "42");
+
+        let parsed_http = parse_status_msg_response(&json!({
+            "data": "{\"error_code\":0,\"data\":{\"statusInfos\":[{\"ids\":[{\"id\":\"101\",\"seen\":\"9000\",\"deliver\":\"9005\"},{\"id\":\"0\",\"seen\":\"9999\"}]}]}}"
+        }));
+        assert_eq!(parsed_http.len(), 1);
+        assert_eq!(parsed_http[0].uid, "101");
+        assert_eq!(parsed_http[0].seen_msg_id, 9000);
+        assert_eq!(parsed_http[0].deliver_msg_id, 9005);
+
+        let parsed_ws = parse_status_msg_response(&json!({
+            "error_code": 0,
+            "data": {
+                "statusInfos": [{
+                    "ids": [{ "id": "202", "seen": 8001, "deliver": 8002 }]
+                }]
+            }
+        }));
+        assert_eq!(parsed_ws.len(), 1);
+        assert_eq!(parsed_ws[0].uid, "202");
+        assert_eq!(parsed_ws[0].seen_msg_id, 8001);
+        assert_eq!(parsed_ws[0].deliver_msg_id, 8002);
+
+        // 5. Cloud history getpath / thread / pc/dl
+        let gp = group_cloud_getpath_payload("g_500", "12345", 50, 0);
+        assert_eq!(gp["groupId"], "500");
+        assert_eq!(gp["globalMsgId"], 12345);
+        assert_eq!(gp["count"], 50);
+        assert_eq!(gp["reverse"], 0);
+
+        let gt = group_cloud_thread_payload("11", "g_500", "22", "33", 1);
+        assert_eq!(gt["ownerId"], "11");
+        assert_eq!(gt["groupId"], "500");
+        assert_eq!(gt["reverse"], 1);
+
+        let dl = group_cloud_pc_dl_payload("g_500", "12345", 50);
+        assert_eq!(dl["groupId"], "500");
+        assert_eq!(dl["globalMsgId"], "12345");
+        assert_eq!(dl["count"], 50);
     }
 }

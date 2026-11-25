@@ -28,16 +28,20 @@ pub use features::{
 };
 pub use listener::{
     run_listener, run_listener_with, Frame, ListenerConfig, ListenerError, ListenerEvent,
+    CMD_GET_STATUS_MSG, CMD_GET_STATUS_MSG_GROUP,
 };
 pub use ops::{
-    avatar_url_from, conv_id, voice_href_is_amr, voice_play_href, DeleteItem, LastOnline,
-    LinkSendInfo, MediaItem, MediaPage, MediaPreview, MentionItem, MultiUndoItem, QuoteTarget,
-    Reaction, ARCHIVE_ADD, ARCHIVE_REMOVE,
+    avatar_url_from, conv_id, get_status_msg_ws_body, parse_status_msg_response,
+    voice_href_is_amr, voice_play_href, DeleteItem, LastOnline, LinkSendInfo, MediaItem, MediaPage,
+    MediaPreview, MemberMsgStatus, MentionItem, MultiUndoItem, PhotoUrlSendInfo, QuoteTarget,
+    Reaction, RenewLinkRequest, RenewLinkResult, ScanUrlResult, ARCHIVE_ADD, ARCHIVE_REMOVE,
     AVATAR_ERR_NO_PERMISSION, AVATAR_ERR_OVERSIZE, AVATAR_MAX_BYTES, AVATAR_MIN_BYTES,
     AVATAR_MIN_EDGE, AVATAR_SIZE, CONV_TYPE_GROUP, CONV_TYPE_OA, CONV_TYPE_USER, MEDIA_ERR_GONE,
     MEDIA_PREVIEW_LIMIT, MEDIA_STORE_FALLBACK, MEDIA_STORE_SEND2ME_FALLBACK, MEDIA_TYPE_FILE,
-    MEDIA_TYPE_IMAGE, MEDIA_TYPE_LINK, MSG_FILE, MSG_TEXT, MSG_VOICE, PIN_ADD, PIN_REMOVE,
-    SET_MUTE, SHAREFILE_MAX_BYTES, UNSET_MUTE, VOICE_MP3_HOST,
+    MEDIA_TYPE_IMAGE, MEDIA_TYPE_LINK, MSGTYPE_FORWARD_FILE, MSGTYPE_FORWARD_GIF,
+    MSGTYPE_FORWARD_PHOTO, MSGTYPE_FORWARD_VIDEO, MSGTYPE_FORWARD_VOICE, MSG_FILE, MSG_TEXT,
+    MSG_VOICE, PIN_ADD, PIN_REMOVE, SET_MUTE, SHAREFILE_MAX_BYTES, UNSET_MUTE,
+    VOICE_DIRECT_MAX_BYTES, VOICE_MP3_HOST,
 };
 pub use qr::{render_terminal, QrError};
 pub use session::{SessionError, StoredSession};

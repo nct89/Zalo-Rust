@@ -464,6 +464,12 @@ pub struct ShellView {
     pub(crate) cloud_history_busy: HashSet<String>,
     /// Group threads with no older cloud history left on the server.
     pub(crate) cloud_history_exhausted: HashSet<String>,
+    /// Cached `/api/message/scanurl` safety verdicts keyed by normalized lowercase URL.
+    pub(crate) scan_url_cache: HashMap<String, bool>,
+    /// Threads currently querying per-member delivered/seen cursors (`getStatusMsg` / WS 575/576).
+    pub(crate) status_fetch_busy: HashSet<String>,
+    /// Threads whose message status has been fetched at least once this session.
+    pub(crate) status_fetched: HashSet<String>,
 }
 
 /// Newest messages built per open conversation (see `msg_window`).
@@ -903,6 +909,9 @@ impl ShellView {
             reload_store_pending: None,
             cloud_history_busy: HashSet::new(),
             cloud_history_exhausted: HashSet::new(),
+            scan_url_cache: HashMap::new(),
+            status_fetch_busy: HashSet::new(),
+            status_fetched: HashSet::new(),
         };
         if let Some(saved) = this.prefs.json("receipts") {
             this.read_sync.load_cursors(&saved);
@@ -1922,27 +1931,48 @@ impl ShellView {
         }
         let dir = self.session_dir.clone();
         let now = data::now_ms();
-        let mut jobs: Vec<(crate::fetch::Job, bool)> = std::mem::take(&mut self.media_queue)
-            .into_iter()
-            .map(|job| {
-                let recent = self
-                    .messages
-                    .values()
-                    .find_map(|list| list.iter().find(|m| m.id == job.msg_id).map(|m| m.at_ms))
-                    .is_some_and(|at| at == 0 || now.saturating_sub(at) < 5 * 60_000);
-                (job, recent)
-            })
-            .collect();
+        let mut jobs: Vec<(crate::fetch::Job, bool, Option<crate::fetch::RenewHint>)> =
+            std::mem::take(&mut self.media_queue)
+                .into_iter()
+                .map(|job| {
+                    let meta = self.messages.values().find_map(|list| {
+                        list.iter()
+                            .find(|m| m.id == job.msg_id)
+                            .map(|m| (m.at_ms, m.thread_id.clone(), m.kind))
+                    });
+                    let recent = meta
+                        .as_ref()
+                        .is_some_and(|(at, _, _)| *at == 0 || now.saturating_sub(*at) < 5 * 60_000);
+                    let renew = meta.and_then(|(_, tid, kind)| {
+                        if !self.has_session || !data::live_allowed(&tid) {
+                            return None;
+                        }
+                        let msg_type = match kind {
+                            crate::media::MsgKind::Photo | crate::media::MsgKind::Doodle => {
+                                zalo_client::MSGTYPE_FORWARD_PHOTO
+                            }
+                            crate::media::MsgKind::Video => zalo_client::MSGTYPE_FORWARD_VIDEO,
+                            _ => return None,
+                        };
+                        Some(crate::fetch::RenewHint {
+                            is_group: tid.starts_with("g_"),
+                            thread_id: tid,
+                            msg_type,
+                        })
+                    });
+                    (job, recent, renew)
+                })
+                .collect();
         // Newest first so newly received / bottom photos appear immediately.
         jobs.reverse();
         let bg = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             use futures::StreamExt;
             let mut stream = futures::stream::iter(jobs)
-                .map(move |(job, recent)| {
+                .map(move |(job, recent, renew)| {
                     let dir = dir.clone();
                     bg.spawn(async move {
-                        crate::fetch::run_one_with_retry(dir.as_deref(), job, recent)
+                        crate::fetch::run_one_with_renew(dir.as_deref(), job, recent, renew)
                     })
                 })
                 .buffer_unordered(crate::fetch::BUDGET);
@@ -1986,10 +2016,15 @@ impl ShellView {
                     self.media_failed.insert(item.msg_id);
                 }
             }
-            if let Some(path) = item.path {
+            if item.path.is_some() || item.renewed_url.is_some() {
                 for msgs in self.messages.values_mut() {
                     if let Some(msg) = msgs.iter_mut().find(|m| m.id == item.msg_id) {
-                        msg.media_path = Some(path.clone());
+                        if let Some(path) = item.path.as_ref() {
+                            msg.media_path = Some(path.clone());
+                        }
+                        if let Some(fresh_url) = item.renewed_url.as_ref() {
+                            msg.media_url = fresh_url.clone();
+                        }
                         break;
                     }
                 }
@@ -3192,15 +3227,31 @@ impl ShellView {
                 .background_executor()
                 .spawn(async move {
                     crate::bridge::block_api(&dir, |api| async move {
-                        let val = if oldest_gmi.is_empty() {
-                            api.group_cloud_mget(std::slice::from_ref(&tid_req))
+                        if oldest_gmi.is_empty() {
+                            let val = api
+                                .group_cloud_mget(std::slice::from_ref(&tid_req))
                                 .await
-                                .map_err(|e| e.to_string())?
-                        } else {
-                            api.group_cloud_jump(&tid_req, &oldest_gmi, 50, false)
-                                .await
-                                .map_err(|e| e.to_string())?
-                        };
+                                .map_err(|e| e.to_string())?;
+                            return Ok(cloud_group_items_from(&val, &tid_req, &self_uid));
+                        }
+                        if let Ok(val) = api.group_cloud_jump(&tid_req, &oldest_gmi, 50, false).await
+                        {
+                            let items = cloud_group_items_from(&val, &tid_req, &self_uid);
+                            if !items.is_empty() {
+                                return Ok(items);
+                            }
+                        }
+                        if let Ok(val) = api.group_cloud_getpath(&tid_req, &oldest_gmi, 50, 0).await
+                        {
+                            let items = cloud_group_items_from(&val, &tid_req, &self_uid);
+                            if !items.is_empty() {
+                                return Ok(items);
+                            }
+                        }
+                        let val = api
+                            .group_cloud_pc_dl(&tid_req, &oldest_gmi, 50)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         Ok(cloud_group_items_from(&val, &tid_req, &self_uid))
                     })
                 })
@@ -3226,6 +3277,248 @@ impl ShellView {
                     }
                     Err(err) => {
                         view.set_note(format!("Không tải được lịch sử cũ: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Loads missing group cloud history around a quoted message (`/api/cm/getpath` with
+    /// `/api/cm/rgetv2` jump fallback) and scrolls directly to the quoted bubble.
+    pub(crate) fn load_group_cloud_quote(
+        &mut self,
+        conv_id: u64,
+        quote_global_id: i64,
+        quote_cli_id: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
+        if cfg!(test) || !self.has_session || quote_global_id <= 0 {
+            return;
+        }
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| c.is_group && c.live) else {
+            return;
+        };
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let tid_req = conv.thread_id.clone();
+        let gmi_str = quote_global_id.to_string();
+        let self_uid = self.self_uid().unwrap_or_default().to_owned();
+        self.set_note("Đang tìm tin nhắn gốc trên máy chủ…");
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if let Ok(val) = api.group_cloud_getpath(&tid_req, &gmi_str, 50, 0).await {
+                            let items = cloud_group_items_from(&val, &tid_req, &self_uid);
+                            if !items.is_empty() {
+                                return Ok(items);
+                            }
+                        }
+                        let val = api
+                            .group_cloud_jump(&tid_req, &gmi_str, 50, true)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok(cloud_group_items_from(&val, &tid_req, &self_uid))
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(items) if !items.is_empty() => {
+                        let before = view.messages_of(conv_id).len();
+                        for m in items {
+                            view.apply_incoming(m, false, false);
+                        }
+                        let added = view.messages_of(conv_id).len().saturating_sub(before);
+                        if added > 0 {
+                            view.msg_window += added;
+                            view.warm_media(conv_id);
+                        }
+                        if let Some((new_w, child_idx)) = crate::chat::quote_scroll_index(
+                            view.messages_of(conv_id),
+                            view.msg_window,
+                            Some(quote_global_id),
+                            quote_cli_id,
+                        ) {
+                            if new_w > view.msg_window {
+                                view.msg_window = new_w;
+                                view.warm_media(conv_id);
+                            }
+                            if let Some(c) = view.conv(conv_id).cloned() {
+                                let (hidden, rows) = view.build_msg_rows(&c);
+                                view.sync_msg_list(c.id, rows.len(), hidden);
+                            }
+                            view.msg_list.scroll_to_reveal_item(child_idx);
+                            view.set_note("Đã tải tin nhắn gốc từ máy chủ");
+                        } else {
+                            view.set_note("Không tìm thấy tin nhắn gốc trên máy chủ");
+                        }
+                    }
+                    _ => view.set_note("Không tìm thấy tin nhắn gốc trong lịch sử đã tải"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Scans an external chat link via `/api/message/scanurl` before opening it in the browser,
+    /// matching Zalo PC `scanUrl` (`compact4490.js`). Fails open on timeout/network error,
+    /// and blocks with [`Dialog::UnsafeUrl`] when Zalo flags `isSafe == false`.
+    pub(crate) fn open_url_checked(&mut self, url: String, cx: &mut Context<Self>) {
+        let trimmed = url.trim().to_owned();
+        if !crate::media::is_http_url(&trimmed) {
+            crate::os_util::open_url(&trimmed);
+            return;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if let Some(&safe) = self.scan_url_cache.get(&key) {
+            if safe {
+                crate::os_util::open_url(&trimmed);
+            } else {
+                self.dialog = Some(crate::dialogs::Dialog::UnsafeUrl(trimmed));
+                cx.notify();
+            }
+            return;
+        }
+        if cfg!(test) || !self.has_session {
+            crate::os_util::open_url(&trimmed);
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            crate::os_util::open_url(&trimmed);
+            return;
+        };
+        let url_req = trimmed.clone();
+        cx.spawn(async move |this, cx| {
+            let safe = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.scan_url(&url_req)
+                            .await
+                            .map(|r| r.is_safe)
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await
+                .unwrap_or(true);
+            let _ = this.update(cx, |view, cx| {
+                if view.scan_url_cache.len() >= 100 {
+                    view.scan_url_cache.clear();
+                }
+                view.scan_url_cache.insert(key, safe);
+                if safe {
+                    crate::os_util::open_url(&trimmed);
+                } else {
+                    view.dialog = Some(crate::dialogs::Dialog::UnsafeUrl(trimmed));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Queries per-member delivered/seen cursors for `conv_id`, preferring live WebSocket
+    /// `CMD_GET_STATUS_MSG` (`575`) / `CMD_GET_STATUS_MSG_GROUP` (`576`) when connected and
+    /// falling back transparently to HTTP `/api/message/getStatusMsg` / `/api/group/getStatusMsg`.
+    pub(crate) fn fetch_message_status(
+        &mut self,
+        conv_id: u64,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if cfg!(test) || !self.has_session {
+            return;
+        }
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| c.live) else {
+            return;
+        };
+        let tid = conv.thread_id.clone();
+        if self.status_fetch_busy.contains(&tid) {
+            return;
+        }
+        if !force && self.status_fetched.contains(&tid) {
+            return;
+        }
+        if conv.is_group
+            && self
+                .members_known(&tid)
+                .is_some_and(|n| n > crate::read_sync::MAX_GROUP_SEEN_MEMBERS)
+        {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let mine = self.self_member_ids();
+        let member_ids: Vec<String> = if conv.is_group {
+            self.profiles
+                .map
+                .get(&tid)
+                .map(|p| {
+                    p.member_ids
+                        .iter()
+                        .filter(|uid| !uid.is_empty() && !mine.contains(uid.as_str()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let is_group = conv.is_group;
+        let tid_req = tid.clone();
+        self.status_fetch_busy.insert(tid.clone());
+        cx.spawn(async move |this, cx| {
+            let rows = cx
+                .background_executor()
+                .spawn(async move {
+                    // 1. Prefer WebSocket RPC 575/576 when socket is online (Zalo PC MsgSources.SOCKET).
+                    let hub = crate::ws_rpc::WsRpcHub::global();
+                    if hub.is_online() {
+                        let cmd = if is_group {
+                            zalo_client::CMD_GET_STATUS_MSG_GROUP
+                        } else {
+                            zalo_client::CMD_GET_STATUS_MSG
+                        };
+                        let req_id = hub.next_req_id(cmd);
+                        let body =
+                            zalo_client::get_status_msg_ws_body(&req_id, &tid_req, &member_ids, is_group);
+                        let ws_res = crate::ws_rpc::async_rt().block_on(
+                            hub.request(cmd, 0, &req_id, &body, 4_000),
+                        );
+                        if let Ok(val) = ws_res {
+                            let parsed = zalo_client::parse_status_msg_response(&val);
+                            if !parsed.is_empty() {
+                                return Ok(parsed);
+                            }
+                        }
+                    }
+                    // 2. Fallback to HTTP `/api/message/getStatusMsg` or `/api/group/getStatusMsg`.
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.get_status_msg(&tid_req, &member_ids, is_group)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.status_fetch_busy.remove(&tid);
+                view.status_fetched.insert(tid.clone());
+                if let Ok(list) = rows {
+                    let self_uid = view.self_uid().map(str::to_owned);
+                    if view.read_sync.apply_member_statuses(
+                        &tid,
+                        is_group,
+                        self_uid.as_deref(),
+                        &list,
+                    ) {
+                        view.prefs.set("receipts", view.read_sync.cursors_json());
                     }
                 }
                 cx.notify();
@@ -5048,6 +5341,7 @@ impl ShellView {
                 dest_id: thread_id, ..
             }
             | LiveAction::SendPhoto { thread_id, .. }
+            | LiveAction::SendPhotoByUrl { thread_id, .. }
             | LiveAction::SendFile { thread_id, .. }
             | LiveAction::SendSticker { thread_id, .. }
             | LiveAction::SendGif { thread_id, .. }
@@ -5423,9 +5717,69 @@ impl ShellView {
         }
     }
 
-    /// Local bubble + real upload (`upload_photo` → `send_photo`).
+    /// Local bubble + real upload (`upload_photo_best` → `send_photo`).
     pub(crate) fn send_photo_now(&mut self, path: PathBuf, caption: &str) {
         self.send_photo_now_at(path, caption, 0, 0, 1, 0);
+    }
+
+    /// Forward/share an existing CDN photo by URL (`/api/message/photo_url` or `/api/group/photo_url`)
+    /// without re-uploading bytes, matching Zalo PC `sendPhotoByUrl`.
+    pub(crate) fn send_photo_by_url_now(
+        &mut self,
+        dest: &ChatConv,
+        src: &ChatMsg,
+        stagger_ms: i64,
+    ) {
+        let now = data::now_ms().saturating_add(stagger_ms);
+        let id = self.next_msg_id;
+        self.next_msg_id += 1;
+        let caption = if src.text == "[Hình ảnh]" {
+            String::new()
+        } else {
+            src.text.clone()
+        };
+        let mut msg = ChatMsg::text_msg(
+            id,
+            dest.id,
+            dest.thread_id.clone(),
+            true,
+            str_vi("STR_YOU", "Bạn").to_owned(),
+            self.self_uid().unwrap_or_default().to_owned(),
+            if caption.is_empty() {
+                "[Hình ảnh]".to_owned()
+            } else {
+                caption.clone()
+            },
+            data::vn_hm(now),
+            now,
+            Some(now),
+            None,
+        );
+        msg.kind = crate::media::MsgKind::Photo;
+        msg.media_path = src.media_path.clone();
+        msg.media_url = src.media_url.clone();
+        msg.media_w = src.media_w;
+        msg.media_h = src.media_h;
+        self.push_message(msg);
+        self.warm_media(dest.id);
+        if dest.live && self.has_session {
+            let info = zalo_client::PhotoUrlSendInfo {
+                title: caption,
+                ori_url: src.media_url.clone(),
+                thumb_url: src.media_url.clone(),
+                hd_url: src.media_url.clone(),
+                width: src.media_w,
+                height: src.media_h,
+                properties: "{}".to_owned(),
+            };
+            self.maybe_live(LiveAction::SendPhotoByUrl {
+                client_id: now as u64,
+                thread_id: dest.thread_id.clone(),
+                is_group: dest.is_group,
+                info,
+            });
+            self.set_note("Đang chia sẻ ảnh…");
+        }
     }
 
     /// `stagger_ms` keeps `client_id` unique when several photos leave in one tick.
@@ -5704,6 +6058,9 @@ impl Render for ShellView {
         }
         if self.rail_popup == Some(crate::rail::RailPopup::Catalog) {
             self.warm_catalog(cx);
+        }
+        if let Some(id) = self.selected {
+            self.fetch_message_status(id, false, cx);
         }
         self.drain_media_queue(cx);
         self.drain_sticker_thumbs(cx);
@@ -6537,13 +6894,19 @@ fn cloud_group_items_from(
         raw_msgs.extend(arr.iter());
     } else if let Some(arr) = root.get("msgs").and_then(serde_json::Value::as_array) {
         raw_msgs.extend(arr.iter());
+    } else if let Some(arr) = root.get("groupMsgs").and_then(serde_json::Value::as_array) {
+        raw_msgs.extend(arr.iter());
     } else if let Some(arr) = root.get("messages").and_then(serde_json::Value::as_array) {
+        raw_msgs.extend(arr.iter());
+    } else if let Some(arr) = root.get("path").and_then(serde_json::Value::as_array) {
         raw_msgs.extend(arr.iter());
     } else if let Some(obj) = root.as_object() {
         for v in obj.values() {
             if let Some(arr) = v.as_array() {
                 raw_msgs.extend(arr.iter());
             } else if let Some(arr) = v.get("msgs").and_then(serde_json::Value::as_array) {
+                raw_msgs.extend(arr.iter());
+            } else if let Some(arr) = v.get("groupMsgs").and_then(serde_json::Value::as_array) {
                 raw_msgs.extend(arr.iter());
             }
         }
@@ -7193,5 +7556,35 @@ mod tests {
         assert!(!compact_580.actions_above);
         assert_eq!(compact_580.chat_pane_w, 516.0);
         assert!(compact_580.content_max_w >= 318.0);
+    }
+
+    #[test]
+    fn cloud_group_items_from_parses_getpath_and_pc_dl_shapes() {
+        let sample = |id: &str, body: &str| {
+            serde_json::json!({
+                "msgId": id,
+                "cliMsgId": id,
+                "uidFrom": "1001",
+                "idTo": "900",
+                "dName": "An",
+                "msgType": "webchat",
+                "content": body,
+                "ts": "1730000000000"
+            })
+        };
+        let via_path = serde_json::json!({
+            "data": { "path": [sample("101", "tin cũ từ getpath")] }
+        });
+        let items = cloud_group_items_from(&via_path, "g_900", "9999");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_id, "g_900");
+        assert_eq!(items[0].text, "tin cũ từ getpath");
+
+        let via_gmsgs = serde_json::json!({
+            "data": { "groupMsgs": [sample("102", "tin từ pc/dl")] }
+        });
+        let items2 = cloud_group_items_from(&via_gmsgs, "g_900", "9999");
+        assert_eq!(items2.len(), 1);
+        assert_eq!(items2[0].text, "tin từ pc/dl");
     }
 }

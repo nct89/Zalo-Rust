@@ -465,7 +465,9 @@ async fn run(
                 ListenerEvent::Event { cmd, data, .. }
                     if matches!(
                         cmd,
-                        zalo_client::listener::CMD_SYNC_REQUEST
+                        zalo_client::listener::CMD_GET_STATUS_MSG
+                            | zalo_client::listener::CMD_GET_STATUS_MSG_GROUP
+                            | zalo_client::listener::CMD_SYNC_REQUEST
                             | zalo_client::listener::CMD_SYNC_ACK_DELETE
                             | zalo_client::listener::CMD_SYNC_WAKEUP
                             | zalo_client::listener::CMD_BACKUP_INIT

@@ -6,9 +6,10 @@
 use std::path::PathBuf;
 
 use zalo_client::{
-    conv_id, DeleteItem, Device, GifRef, LinkSendInfo, MentionItem, MultiUndoItem, QuoteTarget,
-    Reaction, StickerRef, StoredSession, ZaloApi, ARCHIVE_ADD, ARCHIVE_REMOVE, MSG_FILE, MSG_TEXT,
-    MSG_VOICE, PIN_ADD, PIN_REMOVE, SET_MUTE, UNSET_MUTE,
+    conv_id, DeleteItem, Device, GifRef, LinkSendInfo, MentionItem, MultiUndoItem,
+    PhotoUrlSendInfo, QuoteTarget, Reaction, StickerRef, StoredSession, ZaloApi, ARCHIVE_ADD,
+    ARCHIVE_REMOVE, MSG_FILE, MSG_TEXT, MSG_VOICE, PIN_ADD, PIN_REMOVE, SET_MUTE, UNSET_MUTE,
+    VOICE_DIRECT_MAX_BYTES,
 };
 
 use crate::data::live_allowed;
@@ -164,6 +165,17 @@ pub enum LiveAction {
         group_total: u32,
         /// `idInGroup`.
         group_index: u32,
+    },
+    /// Send a cached/existing photo by URL without re-uploading (`/api/*/photo_url`).
+    SendPhotoByUrl {
+        /// `clientId` shared with the local bubble.
+        client_id: u64,
+        /// Destination thread.
+        thread_id: String,
+        /// Group vs 1-1.
+        is_group: bool,
+        /// Photo URL metadata (`oriUrl`, `thumbUrl`, `hdUrl`, dimensions, title).
+        info: PhotoUrlSendInfo,
     },
     /// Upload + send one file (`sharefile_full`).
     SendFile {
@@ -338,6 +350,7 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
         dest_id: thread_id, ..
     }
     | LiveAction::SendPhoto { thread_id, .. }
+    | LiveAction::SendPhotoByUrl { thread_id, .. }
     | LiveAction::SendFile { thread_id, .. }
     | LiveAction::SendSticker { thread_id, .. }
     | LiveAction::SendGif { thread_id, .. }
@@ -374,7 +387,7 @@ pub fn spawn_live(action: LiveAction, session_dir: PathBuf) {
         }
     }
     let label = match &action {
-        LiveAction::SendPhoto { .. } => Some("Gửi ảnh"),
+        LiveAction::SendPhoto { .. } | LiveAction::SendPhotoByUrl { .. } => Some("Gửi ảnh"),
         LiveAction::SendFile { .. } => Some("Gửi file"),
         LiveAction::SendSticker { .. } => Some("Gửi sticker"),
         LiveAction::SendGif { .. } => Some("Gửi GIF"),
@@ -925,7 +938,7 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
         } => {
             let (jpeg, w, h) = encode_upload(&path)?;
             let up = api
-                .upload_photo(
+                .upload_photo_best(
                     &thread_id,
                     is_group,
                     jpeg,
@@ -937,6 +950,15 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             let group = (group_total > 1 && group_layout_id != 0)
                 .then_some((group_layout_id, group_total, group_index));
             api.send_photo(&thread_id, is_group, &up, w, h, &caption, group)
+                .await
+        }
+        LiveAction::SendPhotoByUrl {
+            client_id: cid,
+            thread_id,
+            is_group,
+            info,
+        } => {
+            api.send_photo_by_url(&thread_id, is_group, cid, &info)
                 .await
         }
         LiveAction::SendFile {
@@ -997,10 +1019,55 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
             is_group,
             bytes,
             file_name,
-        } => api
-            .send_voice(&thread_id, is_group, bytes, &file_name, cid)
-            .await
-            .map(|_| serde_json::Value::Null),
+        } => {
+            let use_chunks =
+                bytes.len() as u64 > VOICE_DIRECT_MAX_BYTES && crate::realtime::listening();
+            if use_chunks {
+                let (file_id, immediate) = api
+                    .upload_voice_chunks(&thread_id, is_group, &bytes, &file_name, cid)
+                    .await
+                    .map_err(|e| format!("voice upload: {e}"))?;
+                let voice_url = if !immediate.is_empty() {
+                    immediate
+                } else {
+                    crate::realtime::wait_file_url(&file_id, std::time::Duration::from_secs(90))
+                        .ok_or("máy chủ chưa báo voice_done sau 90 s")?
+                };
+                api.forward_voice(&thread_id, is_group, cid, &voice_url, None)
+                    .await
+            } else {
+                match api
+                    .send_voice(&thread_id, is_group, bytes.clone(), &file_name, cid)
+                    .await
+                {
+                    Ok(_) => Ok(serde_json::Value::Null),
+                    Err(err) if crate::realtime::listening() => {
+                        if let Ok((file_id, immediate)) = api
+                            .upload_voice_chunks(&thread_id, is_group, &bytes, &file_name, cid)
+                            .await
+                        {
+                            let voice_url = if !immediate.is_empty() {
+                                Some(immediate)
+                            } else {
+                                crate::realtime::wait_file_url(
+                                    &file_id,
+                                    std::time::Duration::from_secs(60),
+                                )
+                            };
+                            if let Some(url) = voice_url {
+                                api.forward_voice(&thread_id, is_group, cid, &url, None)
+                                    .await
+                            } else {
+                                Err(err)
+                            }
+                        } else {
+                            Err(err)
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
         LiveAction::SendVideo {
             client_id: cid,
             thread_id,
@@ -1025,10 +1092,19 @@ async fn dispatch(api: &ZaloApi, action: LiveAction) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("upload: {e}"))?;
             let thumb_url = match thumb.as_ref().and_then(|p| std::fs::read(p).ok()) {
-                Some(tb) if !tb.is_empty() => api
-                    .upload_video_thumb(&thread_id, is_group, &tb, "thumb.jpg", cid)
-                    .await
-                    .unwrap_or_default(),
+                Some(tb) if !tb.is_empty() => {
+                    let primary = api
+                        .upload_video_thumb(&thread_id, is_group, &tb, "thumb.jpg", cid)
+                        .await
+                        .unwrap_or_default();
+                    if !primary.is_empty() {
+                        primary
+                    } else {
+                        api.upload_thumb(cid, is_group, tb, "thumb.jpg")
+                            .await
+                            .unwrap_or_default()
+                    }
+                }
                 _ => String::new(),
             };
             let url = crate::realtime::wait_file_url(&file_id, std::time::Duration::from_secs(120))

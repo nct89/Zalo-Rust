@@ -1868,7 +1868,7 @@ impl ShellView {
             }
             MenuAction::RenameAlias { uid, name } => self.open_alias(uid, name, cx),
             MenuAction::RemoveFriend { uid, name } => self.open_remove_friend(uid, name),
-            MenuAction::OpenUrl(url) => crate::os_util::open_url(url),
+            MenuAction::OpenUrl(url) => self.open_url_checked(url.to_owned(), cx),
             MenuAction::OpenSettingsPage(page) => {
                 self.settings_page = page;
                 self.set_rail(crate::rail::Rail::Settings);

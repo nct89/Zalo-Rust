@@ -174,6 +174,53 @@ impl ReadSync {
         cleared
     }
 
+    /// Merges per-member delivered/seen cursors returned by `/api/message/getStatusMsg`,
+    /// `/api/group/getStatusMsg`, or WebSocket `575`/`576`. Returns `true` if any cursor advanced.
+    pub fn apply_member_statuses(
+        &mut self,
+        thread_id: &str,
+        is_group: bool,
+        self_uid: Option<&str>,
+        rows: &[zalo_client::MemberMsgStatus],
+    ) -> bool {
+        if thread_id.is_empty() || rows.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for row in rows {
+            if row.uid.is_empty() || row.uid == "0" || self_uid == Some(row.uid.as_str()) {
+                continue;
+            }
+            if row.seen_msg_id > 0 {
+                let top_seen = self.peer_seen.entry(thread_id.to_owned()).or_insert(0);
+                if row.seen_msg_id > *top_seen {
+                    *top_seen = row.seen_msg_id;
+                    changed = true;
+                }
+            }
+            if row.deliver_msg_id > 0 {
+                let top_deliv = self.peer_delivered.entry(thread_id.to_owned()).or_insert(0);
+                if row.deliver_msg_id > *top_deliv {
+                    *top_deliv = row.deliver_msg_id;
+                    changed = true;
+                }
+            }
+            if is_group || row.seen_msg_id > 0 || row.deliver_msg_id > 0 {
+                let map = self.members.entry(thread_id.to_owned()).or_default();
+                let cursor = map.entry(row.uid.clone()).or_default();
+                if row.seen_msg_id > cursor.seen {
+                    cursor.seen = row.seen_msg_id;
+                    changed = true;
+                }
+                if row.deliver_msg_id > cursor.deliver {
+                    cursor.deliver = row.deliver_msg_id;
+                    changed = true;
+                }
+            }
+        }
+        changed
+    }
+
     /// Returns `true` when the peer's read cursor reaches our message in `thread`.
     #[must_use]
     pub fn peer_saw<F>(
@@ -594,5 +641,36 @@ mod tests {
         assert_eq!((indices, total), (vec![2], 1));
         update_reaction(&mut map, 1, "peer", "", -1, true);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn apply_member_statuses_updates_group_and_direct_receipts() {
+        let mut sync = ReadSync::default();
+        let rows = vec![
+            zalo_client::MemberMsgStatus {
+                uid: "me".into(),
+                seen_msg_id: 999,
+                deliver_msg_id: 999,
+            },
+            zalo_client::MemberMsgStatus {
+                uid: "u1".into(),
+                seen_msg_id: 500,
+                deliver_msg_id: 510,
+            },
+            zalo_client::MemberMsgStatus {
+                uid: "u2".into(),
+                seen_msg_id: 400,
+                deliver_msg_id: 510,
+            },
+        ];
+        assert!(sync.apply_member_statuses("g_10", true, Some("me"), &rows));
+        // Re-applying same cursors is a no-op.
+        assert!(!sync.apply_member_statuses("g_10", true, Some("me"), &rows));
+
+        let (seen, delivered) = sync.member_lists("g_10", Some(450));
+        assert_eq!(seen, vec!["u1".to_owned()]);
+        assert_eq!(delivered, vec!["u2".to_owned()]);
+        assert!(sync.peer_saw("g_10", Some(500), 0, |_| None));
+        assert!(sync.peer_got("g_10", Some(510), 0, |_| None));
     }
 }

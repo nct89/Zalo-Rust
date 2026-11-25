@@ -151,6 +151,8 @@ impl ChatLayoutMetrics {
 
 /// Outgoing receipt under the last bubble we sent.
 struct OutgoingStatus {
+    /// Owning conversation id (for on-demand `getStatusMsg` / WS 575/576 refresh).
+    conv_id: u64,
     /// "Sent", "Received", or "Seen".
     label: &'static str,
     /// Members who saw it (`uid`, display name).
@@ -159,6 +161,10 @@ struct OutgoingStatus {
     delivered: Vec<(String, String)>,
     /// Every other member has seen it (`count + 1 == total`).
     all_seen: bool,
+    /// True when clicking the pill can inspect/refresh per-member status detail.
+    can_inspect: bool,
+    /// True while a live status query is currently in flight for this thread.
+    loading: bool,
 }
 
 impl ShellView {
@@ -2200,7 +2206,7 @@ enum HeaderAction {
 }
 
 #[derive(Clone)]
-enum MsgRowItem {
+pub(crate) enum MsgRowItem {
     LoadOlder(usize),
     LoadOlderCloud,
     DateChip(String),
@@ -2216,7 +2222,7 @@ enum MsgRowItem {
 }
 
 impl ShellView {
-    fn build_msg_rows(&self, row: &ChatConv) -> (usize, Vec<MsgRowItem>) {
+    pub(crate) fn build_msg_rows(&self, row: &ChatConv) -> (usize, Vec<MsgRowItem>) {
         let all = self.messages_of(row.id);
         let hidden = all.len().saturating_sub(self.msg_window);
         let msgs: &[ChatMsg] = &all[hidden..];
@@ -2280,7 +2286,7 @@ impl ShellView {
         (hidden, items)
     }
 
-    fn sync_msg_list(&self, conv_id: u64, next_count: usize, hidden: usize) {
+    pub(crate) fn sync_msg_list(&self, conv_id: u64, next_count: usize, hidden: usize) {
         let (prev_conv, old_count, prev_hidden) = self.msg_list_state.get();
         if prev_conv != Some(conv_id) {
             self.msg_list.reset(next_count);
@@ -2427,7 +2433,7 @@ impl ShellView {
                             match crate::chat_select::interactive_span_at(&text, offset, &known) {
                                 Some(crate::chat_select::InlineHit::Url(url)) => {
                                     this.chat_sel.suppress_next_click = true;
-                                    crate::os_util::open_url(&url);
+                                    this.open_url_checked(url, cx);
                                 }
                                 Some(crate::chat_select::InlineHit::Mention(name)) => {
                                     if !name.eq_ignore_ascii_case("all")
@@ -2727,11 +2733,19 @@ impl ShellView {
         let all_seen = self
             .members_known(&row.thread_id)
             .is_some_and(|n| n > 1 && seen.len() as u32 + 1 == n);
+        let can_inspect = !hide
+            && (!seen.is_empty()
+                || !delivered.is_empty()
+                || (row.live && msg.global_msg_id.is_some_and(|id| id > 0)));
+        let loading = self.status_fetch_busy.contains(&row.thread_id);
         OutgoingStatus {
+            conv_id: row.id,
             label,
             seen,
             delivered,
             all_seen,
+            can_inspect,
+            loading,
         }
     }
 
@@ -2753,7 +2767,8 @@ impl ShellView {
         } else {
             pill.seen.len().saturating_sub(faces.len())
         };
-        let has_people = !pill.seen.is_empty() || !pill.delivered.is_empty();
+        let clickable = pill.can_inspect;
+        let conv_id = pill.conv_id;
         let open = self.receipt_open == Some(msg_id);
         let hover = if pill.all_seen {
             "Đã xem: Tất cả".to_owned()
@@ -2766,7 +2781,7 @@ impl ShellView {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        } else {
+        } else if !pill.delivered.is_empty() {
             format!(
                 "Đã nhận: {}",
                 pill.delivered
@@ -2775,6 +2790,8 @@ impl ShellView {
                     .collect::<Vec<_>>()
                     .join(", ")
             )
+        } else {
+            "Nhấn để xem chi tiết trạng thái".to_owned()
         };
         let pill_bg = timestamp_pill_bg();
         div()
@@ -2795,16 +2812,16 @@ impl ShellView {
                     .text_size(px(11.))
                     .line_height(px(20.))
                     .text_color(rgb(0xffffff))
-                    .when(has_people, |el| {
+                    .when(clickable, |el| {
                         el.cursor_pointer()
-                            .tooltip(move |_, cx| tip(hover.clone(), cx))
+                            .when(!open, |el| el.tooltip(move |_, cx| tip(hover.clone(), cx)))
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                 if event.standard_click() {
-                                    this.receipt_open = if this.receipt_open == Some(msg_id) {
-                                        None
-                                    } else {
-                                        Some(msg_id)
-                                    };
+                                    let opening = this.receipt_open != Some(msg_id);
+                                    this.receipt_open = opening.then_some(msg_id);
+                                    if opening {
+                                        this.fetch_message_status(conv_id, true, cx);
+                                    }
                                     cx.stop_propagation();
                                     cx.notify();
                                 }
@@ -2818,9 +2835,9 @@ impl ShellView {
                     .children(faces.iter().map(|(uid, name)| self.receipt_face(uid, name)))
                     .when(extra > 0, |el| el.child(format!("+{extra}"))),
             )
-            .when(open && has_people, |el| {
+            .when(open && clickable, |el| {
                 let m = ChatLayoutMetrics::for_chat_width(self.chat_pane_w, false);
-                el.child(receipt_panel(&pill, m.compact_card_w))
+                el.child(self.receipt_panel(&pill, m.compact_card_w))
             })
     }
 
@@ -3220,7 +3237,7 @@ impl ShellView {
                         .mt(px(if has_reacts { 14. } else if card_clock { 10. } else { 8. }))
                         .flex()
                         .flex_row()
-                        .items_center()
+                        .items_start()
                         .gap(px(6.))
                         .when(show_clock, |row| {
                             row.child(
@@ -3633,7 +3650,7 @@ impl ShellView {
                 .bg(box_bg)
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.jump_to_quote(&jump_msg);
+                    this.jump_to_quote(&jump_msg, cx);
                     cx.notify();
                 }))
                 .child(
@@ -3672,13 +3689,19 @@ impl ShellView {
         )
     }
 
-    pub(crate) fn jump_to_quote(&mut self, msg: &ChatMsg) {
+    pub(crate) fn jump_to_quote(&mut self, msg: &ChatMsg, cx: &mut Context<Self>) {
         let Some((new_window, child_idx)) = quote_scroll_index(
             self.messages_of(msg.conv),
             self.msg_window,
             msg.quote_global_id,
             msg.quote_cli_id,
         ) else {
+            if let Some(q_gmi) = msg.quote_global_id.filter(|&id| id > 0) {
+                if self.conv(msg.conv).is_some_and(|c| c.is_group && c.live) {
+                    self.load_group_cloud_quote(msg.conv, q_gmi, msg.quote_cli_id, cx);
+                    return;
+                }
+            }
             self.set_note("Không tìm thấy tin nhắn gốc trong lịch sử đã tải");
             return;
         };
@@ -5678,12 +5701,12 @@ impl ShellView {
                 div()
                     .id(("link-card", msg.id))
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, _cx| {
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         if this.chat_sel.drag_moved || this.chat_sel.take_suppress_click() {
                             return;
                         }
                         if event.standard_click() && href.starts_with("http") {
-                            crate::os_util::open_url(&href);
+                            this.open_url_checked(href.clone(), cx);
                         }
                     }))
                     .map(|el| match preview {
@@ -6187,7 +6210,7 @@ impl ShellView {
                             return;
                         }
                         if event.standard_click() && click_href.starts_with("http") {
-                            crate::os_util::open_url(&click_href);
+                            this.open_url_checked(click_href.clone(), cx);
                         }
                     }))
                     .child(self.selectable_bubble_text(
@@ -6210,7 +6233,7 @@ impl ShellView {
                                 return;
                             }
                             if event.standard_click() && href.starts_with("http") {
-                                cx.open_url(&href);
+                                this.open_url_checked(href.clone(), cx);
                             }
                         }))
                         .child(
@@ -6611,9 +6634,9 @@ fn place_card(
         .gap(px(4.))
         .when(open, |el| {
             el.cursor_pointer()
-                .on_click(cx.listener(move |_, event: &ClickEvent, _, _| {
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                     if event.standard_click() {
-                        crate::os_util::open_url(&href);
+                        this.open_url_checked(href.clone(), cx);
                     }
                 }))
         })
@@ -7134,41 +7157,73 @@ fn same_block(a: &ChatMsg, b: &ChatMsg) -> bool {
         && (a.at_ms == 0 || b.at_ms == 0 || data::vn_day(a.at_ms) == data::vn_day(b.at_ms))
 }
 
-/// Names under "Seen (n)" and "Received (n)", the same split as Zalo PC's popup.
-fn receipt_panel(pill: &OutgoingStatus, max_w: f32) -> gpui::AnyElement {
-    let ink = token_rgb("--text-primary", "#081b3a");
-    let muted = token_rgb("--text-secondary", "#5a6981");
-    let mut col = div()
-        .mt(px(4.))
-        .p(px(8.))
-        .w(px(220.0_f32.min(max_w)))
-        .rounded(px(6.))
-        .bg(rgb(token_rgb("--layer-background", "#ffffff")))
-        .shadow_sm()
-        .flex()
-        .flex_col()
-        .gap(px(2.));
-    if !pill.seen.is_empty() {
-        let title = if pill.all_seen {
-            format!("Đã xem ({}) · Tất cả", pill.seen.len())
-        } else {
-            format!("Đã xem ({})", pill.seen.len())
-        };
-        col = col.child(receipt_heading(&title, muted));
-        for (_, name) in &pill.seen {
-            col = col.child(receipt_name(name, ink));
+impl ShellView {
+    /// Names + avatars under "Đã xem (n)" and "Đã nhận (n)", matching Zalo PC's status popup.
+    fn receipt_panel(&self, pill: &OutgoingStatus, max_w: f32) -> gpui::AnyElement {
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let mut col = div()
+            .mt(px(4.))
+            .p(px(10.))
+            .w(px(220.0_f32.min(max_w)))
+            .rounded(px(6.))
+            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
+            .border_1()
+            .border_color(crate::color::border_subtle())
+            .shadow_sm()
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+        if !pill.seen.is_empty() {
+            let title = if pill.all_seen {
+                format!("Đã xem ({}) · Tất cả", pill.seen.len())
+            } else {
+                format!("Đã xem ({})", pill.seen.len())
+            };
+            col = col.child(receipt_heading(&title, muted));
+            for (uid, name) in &pill.seen {
+                col = col.child(self.receipt_person_row(uid, name, ink));
+            }
         }
-    }
-    if !pill.delivered.is_empty() {
-        col = col.child(receipt_heading(
-            &format!("Đã nhận ({})", pill.delivered.len()),
-            muted,
-        ));
-        for (_, name) in &pill.delivered {
-            col = col.child(receipt_name(name, ink));
+        if !pill.delivered.is_empty() {
+            col = col.child(receipt_heading(
+                &format!("Đã nhận ({})", pill.delivered.len()),
+                muted,
+            ));
+            for (uid, name) in &pill.delivered {
+                col = col.child(self.receipt_person_row(uid, name, ink));
+            }
         }
+        if pill.seen.is_empty() && pill.delivered.is_empty() {
+            let note = if pill.loading {
+                "Đang tải trạng thái…"
+            } else {
+                pill.label
+            };
+            col = col.child(receipt_heading(note, muted));
+        }
+        col.into_any_element()
     }
-    col.into_any_element()
+
+    fn receipt_person_row(&self, uid: &str, name: &str, color: u32) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .child(self.receipt_face(uid, name))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .text_color(rgb(color))
+                    .truncate()
+                    .child(name.to_owned()),
+            )
+            .into_any_element()
+    }
 }
 
 fn receipt_heading(text: &str, color: u32) -> gpui::AnyElement {
@@ -7176,16 +7231,6 @@ fn receipt_heading(text: &str, color: u32) -> gpui::AnyElement {
         .text_size(px(12.))
         .line_height(px(16.))
         .text_color(rgb(color))
-        .child(text.to_owned())
-        .into_any_element()
-}
-
-fn receipt_name(text: &str, color: u32) -> gpui::AnyElement {
-    div()
-        .text_size(px(13.))
-        .line_height(px(18.))
-        .text_color(rgb(color))
-        .truncate()
         .child(text.to_owned())
         .into_any_element()
 }
