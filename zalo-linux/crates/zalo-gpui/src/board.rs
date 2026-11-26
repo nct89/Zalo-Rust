@@ -137,6 +137,10 @@ pub struct BoardDlg {
     pub(crate) editing_start: i64,
     /// Pin state of the item being edited. Reminder edits do not show the pin box.
     pub(crate) editing_pinned: bool,
+    /// Server-synced pinned topics (`/api/board/pin/list` for group, `/api/friendboard/list` for 1-1).
+    pub(crate) pin_topics: Vec<zalo_client::PinTopicEntry>,
+    /// Server pin board version used for reorder & multi_unpin.
+    pub(crate) pin_version: i64,
 }
 
 fn s(v: &Value, key: &str) -> String {
@@ -473,6 +477,8 @@ impl ShellView {
             editing_type: 0,
             editing_start: 0,
             editing_pinned: false,
+            pin_topics: Vec::new(),
+            pin_version: 0,
         };
         self.dialog = Some(crate::dialogs::Dialog::Board(dlg));
         self.info_open = true;
@@ -526,7 +532,30 @@ impl ShellView {
                                 .await
                                 .map_err(|e| e.to_string())?
                         };
-                        Ok(board_items_from(&raw, is_group))
+                        let mut items = board_items_from(&raw, is_group);
+                        if is_group {
+                            if let Ok(rem_val) = api.list_group_reminders(&tid, 0, 50, 0, 0).await {
+                                for r in board_items_from(&rem_val, true) {
+                                    if !r.id.is_empty() && !items.iter().any(|x| x.id == r.id) {
+                                        items.push(r);
+                                    }
+                                }
+                            }
+                        }
+                        let (pin_topics, pin_version) = if is_group {
+                            api.list_pin_topics(&tid, 0)
+                                .await
+                                .ok()
+                                .map(|v| zalo_client::parse_pin_topics(&v))
+                                .unwrap_or_default()
+                        } else {
+                            api.list_friend_board_pins(&tid, 0)
+                                .await
+                                .ok()
+                                .map(|v| zalo_client::parse_pin_topics(&v))
+                                .unwrap_or_default()
+                        };
+                        Ok((items, pin_topics, pin_version))
                     })
                 })
                 .await;
@@ -535,7 +564,11 @@ impl ShellView {
                     if d.thread_id == thread_id {
                         d.loading = false;
                         match result {
-                            Ok(items) => d.items = items,
+                            Ok((items, pins, ver)) => {
+                                d.items = items;
+                                d.pin_topics = pins;
+                                d.pin_version = ver;
+                            }
                             Err(e) => {
                                 // Code 114 / empty board on fresh groups: show clean empty state
                                 // instead of raw API error text.
@@ -558,13 +591,17 @@ impl ShellView {
     }
 
     pub(crate) fn submit_board_form(&mut self, cx: &mut Context<Self>) {
+        let me_uid = self
+            .self_uid()
+            .or(self.uin.as_deref())
+            .unwrap_or_default()
+            .to_owned();
         let Some(crate::dialogs::Dialog::Board(d)) = &mut self.dialog else {
             return;
         };
         let tab = d.tab;
         let thread_id = d.thread_id.clone();
         let is_group = d.is_group;
-        let me_uid = self.uin.clone().unwrap_or_default();
         let now_s = crate::data::now_ms() / 1000;
         let title = d.title_input.read(cx).text().trim().to_owned();
         let delay = d.delay_mins;
@@ -731,6 +768,25 @@ impl ShellView {
                                         .map(|_| ())
                                         .map_err(|e| e.to_string())
                                     }
+                                } else if let Some(rem_id) = editing_id.clone() {
+                                    let start_ms = if delay < 0 && editing_start > 0 {
+                                        editing_start
+                                    } else {
+                                        start_s * 1000
+                                    };
+                                    let obj = serde_json::json!({
+                                        "id": rem_id,
+                                        "reminderId": rem_id,
+                                        "toUid": thread_id,
+                                        "title": title,
+                                        "startTime": start_ms,
+                                        "repeat": repeat,
+                                        "creatorUid": me_uid,
+                                    });
+                                    api.update_oneone_reminder(&obj)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(|e| e.to_string())
                                 } else {
                                     api.create_oneone_reminder(
                                         &thread_id,
@@ -1082,6 +1138,140 @@ impl ShellView {
                         }
                         Err(err) => d.error = Some(err),
                     }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Shares a group poll back into the conversation (`/api/poll/share`).
+    pub(crate) fn share_poll_now(&mut self, poll_id: i64, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.has_session || poll_id <= 0 {
+            self.set_note("Chưa đăng nhập — không chia sẻ được bình chọn");
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.share_poll(poll_id).await.map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => view.set_note("Đã chia sẻ bình chọn vào hội thoại"),
+                    Err(e) => view.set_note(format!("Không chia sẻ được bình chọn: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Unpins all server-synced pinned topics (`/api/board/multi_unpin` or `/api/friendboard/multi_unpin`).
+    pub(crate) fn multi_unpin_all_board(&mut self, cx: &mut Context<Self>) {
+        let Some((tid, is_group, topics, version)) = self.dialog.as_ref().and_then(|dlg| match dlg {
+            crate::dialogs::Dialog::Board(d) if !d.pin_topics.is_empty() => Some((
+                d.thread_id.clone(),
+                d.is_group,
+                d.pin_topics.iter().map(|p| p.raw.clone()).collect::<Vec<_>>(),
+                d.pin_version,
+            )),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session && !cfg!(test)) else {
+            return;
+        };
+        let lang = if crate::i18n::is_english() { "en" } else { "vi" }.to_owned();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if is_group {
+                            api.multi_unpin_board_topics(&tid, &topics, version)
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            api.multi_unpin_friend_board(&tid, &topics, version, &lang)
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => {
+                        if let Some(crate::dialogs::Dialog::Board(d)) = view.dialog.as_mut() {
+                            d.pin_topics.clear();
+                        }
+                        view.set_note("Đã bỏ ghim tất cả tin nhắn");
+                        view.refresh_board_dialog(cx);
+                    }
+                    Err(e) => view.set_note(format!("Không bỏ ghim được: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Moves one server-synced pin up or down (`/api/board/pin/update` or `/api/friendboard/reorder`).
+    pub(crate) fn reorder_board_pin(&mut self, idx: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some((tid, is_group, topics, version)) =
+            self.dialog.as_mut().and_then(|dlg| match dlg {
+                crate::dialogs::Dialog::Board(d) => {
+                    let target = idx as isize + delta;
+                    if target < 0 || (target as usize) >= d.pin_topics.len() {
+                        return None;
+                    }
+                    d.pin_topics.swap(idx, target as usize);
+                    Some((
+                        d.thread_id.clone(),
+                        d.is_group,
+                        d.pin_topics.iter().map(|p| p.raw.clone()).collect::<Vec<_>>(),
+                        d.pin_version,
+                    ))
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session && !cfg!(test)) else {
+            return;
+        };
+        let lang = if crate::i18n::is_english() { "en" } else { "vi" }.to_owned();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if is_group {
+                            api.reorder_pin_topics(&tid, &topics, version)
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            api.reorder_friend_board_pins(&tid, &topics, version, &lang)
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => view.set_note("Đã cập nhật thứ tự ghim"),
+                    Err(e) => view.set_note(format!("Không đổi được thứ tự ghim: {e}")),
                 }
                 cx.notify();
             });
@@ -1500,7 +1690,107 @@ impl ShellView {
                     .when(d.loading, |el| {
                         el.child(div().text_size(px(13.5)).text_color(rgb(muted)).child("Đang tải bảng tin…"))
                     })
-                    .when(!d.loading && filtered.is_empty(), |el| {
+                    .when(!d.loading && !d.pin_topics.is_empty() && matches!(d.tab, BoardTab::All | BoardTab::Notes), |el| {
+                        let pin_count = d.pin_topics.len();
+                        el.child(
+                            div()
+                                .p(px(10.))
+                                .rounded(px(8.))
+                                .border_1()
+                                .border_color(border_subtle())
+                                .bg(rgb(subtle))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_size(px(12.5))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(ink))
+                                                .child(format!("Tin đã ghim ({pin_count})")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("board-multi-unpin")
+                                                .px(px(8.))
+                                                .py(px(2.))
+                                                .rounded(px(4.))
+                                                .bg(rgb(paper))
+                                                .hover(|s| s.bg(rgb(hover)))
+                                                .cursor_pointer()
+                                                .text_size(px(11.5))
+                                                .text_color(rgb(red))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.multi_unpin_all_board(cx);
+                                                    cx.notify();
+                                                }))
+                                                .child("Bỏ ghim tất cả"),
+                                        ),
+                                )
+                                .children(d.pin_topics.iter().enumerate().map(|(pi, pt)| {
+                                    let can_up = pi > 0;
+                                    let can_down = pi + 1 < pin_count;
+                                    let title = if pt.title.is_empty() {
+                                        format!("Tin ghim #{}", pi + 1)
+                                    } else {
+                                        pt.title.clone()
+                                    };
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(12.5))
+                                                .text_color(rgb(ink))
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("pin-up", pi as u64))
+                                                .px(px(4.))
+                                                .text_size(px(11.))
+                                                .text_color(rgb(if can_up { ink } else { muted }))
+                                                .when(can_up, |b| {
+                                                    b.cursor_pointer().on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.reorder_board_pin(pi, -1, cx);
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                })
+                                                .child("▲"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("pin-down", pi as u64))
+                                                .px(px(4.))
+                                                .text_size(px(11.))
+                                                .text_color(rgb(if can_down { ink } else { muted }))
+                                                .when(can_down, |b| {
+                                                    b.cursor_pointer().on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.reorder_board_pin(pi, 1, cx);
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                })
+                                                .child("▼"),
+                                        )
+                                })),
+                        )
+                    })
+                    .when(!d.loading && filtered.is_empty() && d.pin_topics.is_empty(), |el| {
                         el.child(
                             div()
                                 .py(px(28.))
@@ -1521,8 +1811,9 @@ impl ShellView {
                         let edit_item = item.clone();
                         let rsvp_id = item.id.clone();
                         let my_resp = item.my_resp;
-                        let can_edit = is_group
-                            && matches!(item.kind, BoardKind::Note | BoardKind::Reminder)
+                        let can_edit = ((is_group
+                            && matches!(item.kind, BoardKind::Note | BoardKind::Reminder))
+                            || (!is_group && item.kind == BoardKind::Reminder))
                             && !pin_id.is_empty();
                         let can_rsvp = is_group && item.kind == BoardKind::Reminder && !pin_id.is_empty();
                         div()
@@ -1720,30 +2011,56 @@ impl ShellView {
                                     let poll_id = pid.unwrap_or(0);
                                     el.child(
                                         div()
-                                            .id(("poll-add-open", i as u64))
                                             .mt(px(2.))
-                                            .px(px(10.))
-                                            .py(px(5.))
-                                            .rounded(px(6.))
-                                            .bg(rgb(paper))
-                                            .hover(|s| s.bg(rgb(hover)))
-                                            .border_1()
-                                            .border_color(border_subtle())
-                                            .cursor_pointer()
-                                            .text_size(px(12.5))
-                                            .text_color(rgb(crate::color::link_fg()))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                if let Some(crate::dialogs::Dialog::Board(b)) =
-                                                    &mut this.dialog
-                                                {
-                                                    b.adding_poll_id = Some(poll_id);
-                                                    b.add_poll_opt_input
-                                                        .update(cx, |inp, cx| inp.clear(cx));
-                                                    b.error = None;
-                                                }
-                                                cx.notify();
-                                            }))
-                                            .child("+ Thêm phương án"),
+                                            .flex()
+                                            .flex_row()
+                                            .gap(px(6.))
+                                            .child(
+                                                div()
+                                                    .id(("poll-add-open", i as u64))
+                                                    .flex_1()
+                                                    .px(px(10.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(paper))
+                                                    .hover(|s| s.bg(rgb(hover)))
+                                                    .border_1()
+                                                    .border_color(border_subtle())
+                                                    .cursor_pointer()
+                                                    .text_size(px(12.5))
+                                                    .text_color(rgb(crate::color::link_fg()))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        if let Some(crate::dialogs::Dialog::Board(b)) =
+                                                            &mut this.dialog
+                                                        {
+                                                            b.adding_poll_id = Some(poll_id);
+                                                            b.add_poll_opt_input
+                                                                .update(cx, |inp, cx| inp.clear(cx));
+                                                            b.error = None;
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+ Thêm phương án"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("poll-share-btn", i as u64))
+                                                    .px(px(10.))
+                                                    .py(px(5.))
+                                                    .rounded(px(6.))
+                                                    .bg(rgb(paper))
+                                                    .hover(|s| s.bg(rgb(hover)))
+                                                    .border_1()
+                                                    .border_color(border_subtle())
+                                                    .cursor_pointer()
+                                                    .text_size(px(12.5))
+                                                    .text_color(rgb(ink))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.share_poll_now(poll_id, cx);
+                                                        cx.notify();
+                                                    }))
+                                                    .child("Chia sẻ"),
+                                            ),
                                     )
                                 })
                                 .when(is_adding, |el| {

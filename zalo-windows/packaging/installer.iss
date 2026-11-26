@@ -2,7 +2,7 @@
 ; Invoked automatically by build-windows.ps1 when `iscc` is on PATH.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.2"
+  #define MyAppVersion "0.3.4"
 #endif
 #ifndef MyArch
   #define MyArch "x86_64"

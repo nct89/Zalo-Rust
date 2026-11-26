@@ -58,6 +58,18 @@ pub struct GroupSettingsPatch {
     pub lock_create_poll: Option<i64>,
     /// Restrict creating notes/reminders (`0`/`1`).
     pub lock_create_post: Option<i64>,
+    /// Restrict pinning messages/topics (`0`/`1`).
+    pub set_topic_only: Option<i64>,
+    /// Allow new members to view recent message history (`0`/`1`).
+    pub enable_msg_history: Option<i64>,
+    /// Only admins can add members (`0`/`1`).
+    pub add_member_only: Option<i64>,
+    /// Anti-spam ban feature flag (`0`/`1`).
+    pub bann_feature: Option<i64>,
+    /// Dirty-media filter flag (`0`/`1`).
+    pub dirty_media: Option<i64>,
+    /// Ban duration parameter.
+    pub ban_duration: Option<i64>,
 }
 
 /// Builds encrypted payload JSON for `/api/conv/addUnreadMark`.
@@ -146,6 +158,12 @@ pub fn group_settings_payload(grid: &str, patch: &GroupSettingsPatch, imei: &str
         ("lockViewMember", patch.lock_view_member),
         ("lockCreatePoll", patch.lock_create_poll),
         ("lockCreatePost", patch.lock_create_post),
+        ("setTopicOnly", patch.set_topic_only),
+        ("enableMsgHistory", patch.enable_msg_history),
+        ("addMemberOnly", patch.add_member_only),
+        ("bannFeature", patch.bann_feature),
+        ("dirtyMedia", patch.dirty_media),
+        ("banDuration", patch.ban_duration),
     ] {
         if let Some(v) = val {
             map.insert(key.to_owned(), Value::from(v));

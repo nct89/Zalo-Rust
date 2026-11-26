@@ -348,11 +348,42 @@ impl ChatSelectionRegistry {
         }
     }
 
-    /// Hit-test a point that must fall strictly inside a visible text block's bounds.
+    /// Hit-test a point strictly inside a visible text block's bounds.
     #[must_use]
     pub(crate) fn hit_test_exact(&self, pos: Point<Pixels>) -> Option<TextAnchor> {
         for block in self.blocks.iter().rev() {
             if block.bounds.contains(&pos) {
+                return Some(TextAnchor {
+                    key: block.key,
+                    order: block.order,
+                    offset: block.hit_test(pos),
+                });
+            }
+        }
+        None
+    }
+
+    /// Hit-test a point inside or within `(pad_x, pad_y)` of a visible text block.
+    /// Used on `mouse_down` so sweeping across short `@mention` / phone bubbles
+    /// from the surrounding bubble padding initiates drag-selection cleanly.
+    #[must_use]
+    pub(crate) fn hit_test_near(
+        &self,
+        pos: Point<Pixels>,
+        pad_x: f32,
+        pad_y: f32,
+    ) -> Option<TextAnchor> {
+        if let Some(exact) = self.hit_test_exact(pos) {
+            return Some(exact);
+        }
+        let px_x = px(pad_x);
+        let px_y = px(pad_y);
+        for block in self.blocks.iter().rev() {
+            let expanded = Bounds::from_corners(
+                point(block.bounds.left() - px_x, block.bounds.top() - px_y),
+                point(block.bounds.right() + px_x, block.bounds.bottom() + px_y),
+            );
+            if expanded.contains(&pos) {
                 return Some(TextAnchor {
                     key: block.key,
                     order: block.order,
@@ -515,11 +546,12 @@ pub(crate) struct SelectableTextElement {
     registry: SharedSelectionRegistry,
 }
 
-/// Interactive inline span hit inside a chat bubble (`http(s)://...` or `@mention`).
+/// Interactive inline span hit inside a chat bubble (`http(s)://...`, `@mention`, or VN phone).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum InlineHit {
     Url(String),
     Mention(String),
+    Phone(String),
 }
 
 /// Find UTF-8 byte ranges of all `http://` and `https://` URLs inside `text`.
@@ -577,6 +609,9 @@ pub(crate) fn interactive_span_at(
                 return Some(InlineHit::Mention(name.to_owned()));
             }
         }
+    }
+    if let Some(phone) = media::vn_phone_line(text.trim()) {
+        return Some(InlineHit::Phone(phone));
     }
     None
 }

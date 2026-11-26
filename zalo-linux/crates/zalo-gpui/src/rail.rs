@@ -483,12 +483,13 @@ impl ShellView {
         // margin 4, padding 16 8 0, radius 4, icon 32 `#005ae0`, label 14/21.
         let ink = token_rgb("--text-primary", "#081b3a");
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
-        let tiles: [(char, &'static str, Option<ToolTile>); 5] = [
+        let tiles: [(char, &'static str, Option<ToolTile>); 6] = [
             ('\u{ECEB}', "Tin nhắn nhanh", Some(ToolTile::Quick)),
             ('\u{EA52}', "Danh mục sản phẩm", Some(ToolTile::Catalog)),
             ('\u{EA24}', "Trả lời\ntự động", Some(ToolTile::AutoReply)),
             ('\u{ED73}', "Tin\nđánh dấu", Some(ToolTile::Starred)),
             ('\u{EA3A}', "Tin\nđồng thời", Some(ToolTile::Broadcast)),
+            ('\u{EDB8}', "Giao việc\n(To-Do)", Some(ToolTile::Todo)),
         ];
         let info_blue = token_rgb("--text-information", "#005ae0");
         let disabled_c = token_rgb("--text-disabled", "#8b96a7");
@@ -552,6 +553,9 @@ impl ShellView {
                                         }
                                         ToolTile::Broadcast => {
                                             this.open_broadcast(cx);
+                                        }
+                                        ToolTile::Todo => {
+                                            this.open_todo(cx);
                                         }
                                     }
                                     cx.notify();
@@ -813,6 +817,7 @@ impl ShellView {
                                     .hover(move |st| st.bg(rgb(hover)))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.jump_to_msg_id(conv_id, msg_id);
+                                        this.flash_msg(msg_id, cx);
                                         cx.notify();
                                     }))
                                     .child(
@@ -938,6 +943,7 @@ enum ToolTile {
     Quick,
     AutoReply,
     Broadcast,
+    Todo,
 }
 
 impl ShellView {

@@ -123,6 +123,40 @@ impl CompactLevel {
     }
 }
 
+/// Active conversation's unread anchor (official Zalo PC `unreadMsgHandler` +
+/// `unread-separator-container` + top-right `unread-floating-btn-container`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConvUnreadAnchor {
+    /// Conversation element id (`ChatConv.id`).
+    pub conv_id: u64,
+    /// First unread message's local `ChatMsg.id` (divider renders directly above it).
+    pub first_unread_msg_id: u64,
+    /// Unread incoming message `ChatMsg.id`s (oldest -> newest) still above the viewport.
+    pub remaining_ids: Vec<u64>,
+    /// Original unread count when opened (shown on the unread separator divider).
+    pub initial_count: u32,
+}
+
+/// Returns true when `text` mentions `@All`, `@Tất cả`, or `@<self_name>`.
+pub(crate) fn message_mentions_me(text: &str, self_name: Option<&str>) -> bool {
+    if !text.contains('@') {
+        return false;
+    }
+    let known: Vec<String> = self_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| vec![s.to_owned()])
+        .unwrap_or_default();
+    let me_lower = self_name.map(|s| s.trim().to_lowercase());
+    for span in crate::chat_select::find_mention_spans(text, &known) {
+        let token = text[span].trim_start_matches('@').trim().to_lowercase();
+        if token == "all" || token == "tất cả" || me_lower.as_deref() == Some(token.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Root view of the main shell.
 pub struct ShellView {
     pub(crate) rail: Rail,
@@ -282,6 +316,7 @@ pub struct ShellView {
     pub(crate) forward_of: Option<ChatMsg>,
     pub(crate) display_name: Option<String>,
     pub(crate) uin: Option<String>,
+    pub(crate) user_id: Option<String>,
     pub(crate) send2me_id: Option<String>,
     pub(crate) session_dir: Option<PathBuf>,
     pub(crate) has_session: bool,
@@ -344,6 +379,28 @@ pub struct ShellView {
     pub(crate) chat_scrolled_up: bool,
     /// Live incoming messages received in the active chat while scrolled up.
     pub(crate) chat_unread_below: u32,
+    /// Ordered local `ChatMsg.id`s of incoming messages below the viewport while scrolled up.
+    pub(crate) new_below_ids: Vec<u64>,
+    /// Subset of `new_below_ids` that `@mention` us or `@All` (drives the floating `@` jump button).
+    pub(crate) new_mention_below_ids: Vec<u64>,
+    /// Active conversation's unread divider + unread-above jump tracker.
+    pub(crate) unread_anchor: Option<ConvUnreadAnchor>,
+    /// Latest `(row_ix, msg_id)` mapping produced by `build_msg_rows` for the open chat.
+    pub(crate) msg_row_ids: std::cell::RefCell<Vec<(usize, u64)>>,
+    /// Row index of `MsgRowItem::UnreadDivider` in `msg_list`, if rendered.
+    pub(crate) unread_divider_row: std::cell::Cell<Option<usize>>,
+    /// Latest visible item range `(start, end)` reported by `msg_list`'s scroll handler.
+    pub(crate) last_visible_range: std::cell::Cell<(usize, usize)>,
+    /// Target message briefly highlighted after jumping via quote/search/pin/star/unread/mention.
+    pub(crate) highlight_msg: Option<(u64, std::time::Instant)>,
+    /// Debounce timestamp for auto-loading older messages when scrolling near top.
+    pub(crate) last_auto_load_top: Option<std::time::Instant>,
+    /// True when the multi-pin dropdown in the chat header is expanded.
+    pub(crate) pinned_expanded: bool,
+    /// Reaction detail modal `(msg_id, preset_filter)` (`None` = "Tất cả" tab).
+    pub(crate) react_detail: Option<(u64, Option<usize>)>,
+    /// Floating partial-quote / copy pill shown after selecting text inside a bubble.
+    pub(crate) partial_quote_fab: Option<(u64, String, gpui::Point<gpui::Pixels>)>,
     /// Highlighted row in the floating vertical `@mention` popup.
     pub(crate) mention_idx: usize,
     /// Server-known pinned `thread_id`s preserved even before their conversation is loaded.
@@ -360,6 +417,7 @@ pub struct ShellView {
     /// Profile keys whose avatar URL did not decode. Left out of the next
     /// chunk so one bad photo does not keep the visible rows as letters.
     avatar_miss: HashSet<String>,
+    avatar_miss_retried: bool,
     pub(crate) profiles_refresh: bool,
     pub(crate) avatars_queued: bool,
     /// One `getprofiles/v2` pass for senders that still have no photo.
@@ -446,6 +504,10 @@ pub struct ShellView {
     pub(crate) react_hold_opened: bool,
     /// Generation counter cancelling stale press-and-hold timers.
     pub(crate) react_hold_gen: u64,
+    /// Active press-and-hold on the quick-like composer button (`(started_at, press_pos)`).
+    pub(crate) like_hold: Option<(std::time::Instant, gpui::Point<gpui::Pixels>)>,
+    /// Sent big-like scale tier (`2` = medium 54 px, `3` = large 74 px) keyed by `ChatMsg.id`.
+    pub(crate) big_like_sizes: HashMap<u64, u8>,
     /// Cached last window title pushed via `window.set_window_title` (avoids per-frame X11 IPC).
     last_window_title: String,
     /// Cache key for `warm_links`/`warm_polls`/`warm_info_media` so scroll frames skip rescanning messages.
@@ -470,6 +532,14 @@ pub struct ShellView {
     pub(crate) status_fetch_busy: HashSet<String>,
     /// Threads whose message status has been fetched at least once this session.
     pub(crate) status_fetched: HashSet<String>,
+    /// Threads with Block Sharing enabled (`/api/conv/blocksharing/getConvers`).
+    pub(crate) block_sharing: HashSet<String>,
+    /// Threads currently toggling Block Sharing.
+    pub(crate) block_sharing_busy: HashSet<String>,
+    /// Server-synced 1-on-1 pinned topics (`/api/friendboard/list`): `thread_id -> (pins, version)`.
+    pub(crate) friend_pins: HashMap<String, (Vec<zalo_client::PinTopicEntry>, i64)>,
+    /// 1-on-1 threads whose server pins have been loaded this session.
+    pub(crate) friend_pins_fetched: HashSet<String>,
 }
 
 /// Newest messages built per open conversation (see `msg_window`).
@@ -704,6 +774,7 @@ impl ShellView {
             },
         )
         .detach();
+        cx.observe(&composer, |_, _, cx| cx.notify()).detach();
         let ShellStartupData {
             snap,
             profiles,
@@ -811,6 +882,7 @@ impl ShellView {
             forward_of: None,
             display_name: snap.display_name,
             uin: snap.uin,
+            user_id: snap.user_id,
             send2me_id: snap.send2me_id,
             session_dir: snap.session_dir,
             has_session: snap.has_session,
@@ -848,6 +920,17 @@ impl ShellView {
             msg_list_state: std::cell::Cell::new((None, 0, 0)),
             chat_scrolled_up: false,
             chat_unread_below: 0,
+            new_below_ids: Vec::new(),
+            new_mention_below_ids: Vec::new(),
+            unread_anchor: None,
+            msg_row_ids: std::cell::RefCell::new(Vec::new()),
+            unread_divider_row: std::cell::Cell::new(None),
+            last_visible_range: std::cell::Cell::new((0, 0)),
+            highlight_msg: None,
+            last_auto_load_top: None,
+            pinned_expanded: false,
+            react_detail: None,
+            partial_quote_fab: None,
             mention_idx: 0,
             server_pinned_threads: HashSet::new(),
             server_archived_threads: HashSet::new(),
@@ -855,6 +938,7 @@ impl ShellView {
             profiles,
             avatars: HashMap::new(),
             avatar_miss: HashSet::new(),
+            avatar_miss_retried: false,
             profiles_refresh: false,
             avatars_queued: true,
             profile_gaps_started: false,
@@ -900,6 +984,8 @@ impl ShellView {
             react_hold_msg: None,
             react_hold_opened: false,
             react_hold_gen: 0,
+            like_hold: None,
+            big_like_sizes: HashMap::new(),
             last_window_title: String::new(),
             last_warm_key: None,
             presence: crate::presence::Presence::default(),
@@ -912,6 +998,10 @@ impl ShellView {
             scan_url_cache: HashMap::new(),
             status_fetch_busy: HashSet::new(),
             status_fetched: HashSet::new(),
+            block_sharing: HashSet::new(),
+            block_sharing_busy: HashSet::new(),
+            friend_pins: HashMap::new(),
+            friend_pins_fetched: HashSet::new(),
         };
         if let Some(saved) = this.prefs.json("receipts") {
             this.read_sync.load_cursors(&saved);
@@ -968,14 +1058,14 @@ impl ShellView {
         {
             let weak_scroll = cx.weak_entity();
             this.msg_list.set_scroll_handler(move |ev, _window, cx| {
-                let scrolled_up = ev.count > 2 && ev.visible_range.end < ev.count;
+                let visible = ev.visible_range.clone();
+                let count = ev.count;
                 let _ = weak_scroll.update(cx, |view, cx| {
-                    let changed = view.chat_scrolled_up != scrolled_up;
-                    view.chat_scrolled_up = scrolled_up;
-                    if !scrolled_up && view.chat_unread_below > 0 {
-                        view.chat_unread_below = 0;
-                        cx.notify();
-                    } else if changed {
+                    let mut dirty = view.handle_msg_scroll(visible.clone(), count);
+                    if view.maybe_auto_load_top(visible.start, count, cx) {
+                        dirty = true;
+                    }
+                    if dirty {
                         cx.notify();
                     }
                 });
@@ -2312,6 +2402,11 @@ impl ShellView {
         match event {
             RtEvent::Online => {
                 self.rt_status = None;
+                if !self.avatar_miss.is_empty() {
+                    self.avatar_miss.clear();
+                    self.avatar_miss_retried = false;
+                    self.avatars_queued = true;
+                }
                 if self.has_session {
                     if let Some(dir) = self.session_dir.clone() {
                         crate::bridge::flush_outbox(dir);
@@ -2375,6 +2470,60 @@ impl ShellView {
                     self.apply_incoming(m, live, active);
                 }
                 self.flush_notice(window, cx);
+            }
+            RtEvent::Undo(undos) => {
+                for u in undos {
+                    self.apply_incoming_undo(&u);
+                }
+            }
+        }
+    }
+
+    /// Applies an incoming `chat.undo` recall from another user or another device,
+    /// collapsing the targeted message into `"Tin nhắn đã thu hồi"` and clearing
+    /// its media/quote fields so it never lingers beside a resent message.
+    pub(crate) fn apply_incoming_undo(&mut self, u: &crate::realtime::UndoEvent) {
+        let Some(conv_id) = self
+            .convs
+            .iter()
+            .find(|c| c.thread_id == u.thread_id)
+            .map(|c| c.id)
+        else {
+            return;
+        };
+        let recalled = str_vi("STR_UNDO_MESSAGE", "Tin nhắn đã thu hồi").to_owned();
+        let mut updated_last = false;
+        if let Some(list) = self.messages.get_mut(&conv_id) {
+            let last_idx = list.len().saturating_sub(1);
+            for (idx, row) in list.iter_mut().enumerate().rev() {
+                let matched = u
+                    .target_global_id
+                    .filter(|&g| g > 0)
+                    .is_some_and(|g| row.global_msg_id == Some(g))
+                    || u.target_cli_id
+                        .filter(|&c| c > 0)
+                        .is_some_and(|c| row.cli_msg_id == Some(c));
+                if matched {
+                    row.recalled = true;
+                    row.text = recalled.clone();
+                    row.kind = crate::media::MsgKind::Text;
+                    row.media_url.clear();
+                    row.media_path = None;
+                    row.href.clear();
+                    row.file_name.clear();
+                    row.quote_sender.clear();
+                    row.quote_text.clear();
+                    row.group_layout_id = 0;
+                    if idx == last_idx {
+                        updated_last = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if updated_last {
+            if let Some(c) = self.convs.iter_mut().find(|c| c.id == conv_id) {
+                c.preview = recalled;
             }
         }
     }
@@ -2464,7 +2613,7 @@ impl ShellView {
                 self.read_sync.note_incoming(&m.thread_id, m.at_ms, rec);
                 self.send_delivered_if_due(&m.thread_id);
             }
-            if viewing {
+            if viewing && !self.chat_scrolled_up {
                 self.send_seen_if_due(&m.thread_id);
             }
         }
@@ -2480,6 +2629,8 @@ impl ShellView {
                         &m.sender_uid,
                         m.kind,
                         &m.text,
+                        &m.media_url,
+                        &m.href,
                         m.at_ms,
                     )
                 })?;
@@ -2722,6 +2873,8 @@ impl ShellView {
             msg.poll_closed = m.poll_closed;
             msg.poll_options = m.poll_options.clone();
         }
+        let inserted_msg_id = msg.id;
+        let inserted_text = msg.text.clone();
         let list = self.messages.entry(conv_id).or_default();
         let pos = list
             .iter()
@@ -2731,15 +2884,33 @@ impl ShellView {
         let newest = pos + 1 == list.len();
         let viewing =
             self.selected == Some(conv_id) && active && !self.locked && self.rail == Rail::Chats;
+        let mentions_me = live
+            && !m.from_me
+            && message_mentions_me(&inserted_text, self.display_name.as_deref());
         if let Some(i) = self.convs.iter().position(|c| c.id == conv_id) {
             let mut conv = self.convs.remove(i);
             if live && !m.from_me {
                 if viewing {
-                    conv.unread = 0;
-                    self.marked_read.insert(conv_id);
-                    self.mark_thread_read_pref(&m.thread_id, m.at_ms);
                     if self.chat_scrolled_up {
-                        self.chat_unread_below = self.chat_unread_below.saturating_add(1);
+                        if !self.new_below_ids.contains(&inserted_msg_id) {
+                            self.new_below_ids.push(inserted_msg_id);
+                        }
+                        if mentions_me && !self.new_mention_below_ids.contains(&inserted_msg_id) {
+                            self.new_mention_below_ids.push(inserted_msg_id);
+                        }
+                        self.chat_unread_below = self.new_below_ids.len() as u32;
+                        let above = self.unread_above_count(conv_id);
+                        conv.unread = above.saturating_add(self.chat_unread_below);
+                        self.marked_read.remove(&conv_id);
+                    } else {
+                        let above = self.unread_above_count(conv_id);
+                        if above > 0 {
+                            conv.unread = above;
+                        } else {
+                            conv.unread = 0;
+                            self.marked_read.insert(conv_id);
+                            self.mark_thread_read_pref(&m.thread_id, m.at_ms);
+                        }
                     }
                 } else {
                     conv.unread += 1;
@@ -2817,7 +2988,10 @@ impl ShellView {
         }
         if self.selected == Some(conv_id) {
             self.warm_media(conv_id);
-            if live || newest {
+            if (live || newest) && (!self.chat_scrolled_up || m.from_me) {
+                if m.from_me {
+                    self.clear_open_unread_and_mark_read(conv_id);
+                }
                 self.scroll_msgs_to_bottom();
             }
         }
@@ -3145,18 +3319,23 @@ impl ShellView {
                     crate::bridge::block_api(&dir, |api| async move {
                         let muted_val = api.get_mute_conversations().await.ok();
                         let unread_val = api.get_unread_marks().await.ok();
+                        let block_share_val = api.get_block_sharing_convers().await.ok();
                         let last_seen_val = if !group_ids.is_empty() || !direct_ids.is_empty() {
                             api.get_last_seen(&group_ids, &direct_ids).await.ok()
                         } else {
                             None
                         };
-                        Ok((muted_val, unread_val, last_seen_val))
+                        Ok((muted_val, unread_val, last_seen_val, block_share_val))
                     })
                 })
                 .await;
-            if let Ok((muted_val, unread_val, last_seen_val)) = res {
+            if let Ok((muted_val, unread_val, last_seen_val, block_share_val)) = res {
                 let _ = this.update(cx, |view, cx| {
                     let mut changed = false;
+                    if let Some(val) = block_share_val.as_ref() {
+                        view.block_sharing = zalo_client::block_sharing_ids(val);
+                        changed = true;
+                    }
                     if let Some(val) = muted_val.as_ref() {
                         let muted_threads = muted_threads_from(val);
                         if !muted_threads.is_empty() {
@@ -3367,10 +3546,14 @@ impl ShellView {
     }
 
     /// Scans an external chat link via `/api/message/scanurl` before opening it in the browser,
-    /// matching Zalo PC `scanUrl` (`compact4490.js`). Fails open on timeout/network error,
-    /// and blocks with [`Dialog::UnsafeUrl`] when Zalo flags `isSafe == false`.
+    /// matching Zalo PC `scanUrl` (`compact4490.js`). Intercepts `zalo.me/g/...` group invite
+    /// links to show the native in-app preview & join dialog (`/api/group/link/ginfo|join`).
     pub(crate) fn open_url_checked(&mut self, url: String, cx: &mut Context<Self>) {
         let trimmed = url.trim().to_owned();
+        if crate::dialogs::is_zalo_group_link(&trimmed) {
+            self.open_group_link_preview(trimmed, cx);
+            return;
+        }
         if !crate::media::is_http_url(&trimmed) {
             crate::os_util::open_url(&trimmed);
             return;
@@ -3527,6 +3710,201 @@ impl ShellView {
         .detach();
     }
 
+    /// Toggles Block Sharing for a conversation (`/api/conv/blocksharing/updateConvers`).
+    pub(crate) fn toggle_block_sharing(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+        let Some(conv) = self.conv(conv_id).cloned() else {
+            return;
+        };
+        let tid = conv.thread_id.clone();
+        if self.block_sharing_busy.contains(&tid) {
+            return;
+        }
+        let next = !self.block_sharing.contains(&tid);
+        if next {
+            self.block_sharing.insert(tid.clone());
+        } else {
+            self.block_sharing.remove(&tid);
+        }
+        if !conv.live || !self.has_session || cfg!(test) {
+            self.set_note(if next {
+                "Đã bật Chặn chia sẻ"
+            } else {
+                "Đã tắt Chặn chia sẻ"
+            });
+            cx.notify();
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let is_group = conv.is_group;
+        let lang = if crate::i18n::is_english() { "en" } else { "vi" }.to_owned();
+        let tid_req = tid.clone();
+        self.block_sharing_busy.insert(tid.clone());
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.update_block_sharing_conver(&tid_req, is_group, next, &lang)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.block_sharing_busy.remove(&tid);
+                match res {
+                    Ok(_) => view.set_note(if next {
+                        "Đã bật Chặn chia sẻ cho hội thoại này"
+                    } else {
+                        "Đã tắt Chặn chia sẻ cho hội thoại này"
+                    }),
+                    Err(err) => {
+                        if next {
+                            view.block_sharing.remove(&tid);
+                        } else {
+                            view.block_sharing.insert(tid);
+                        }
+                        view.set_note(format!("Không cập nhật được Chặn chia sẻ: {err}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Fetches server-synced 1-on-1 pinned messages (`/api/friendboard/list`) once per thread
+    /// and reflects matching local messages in [`Self::pinned_msgs`].
+    pub(crate) fn fetch_friend_board_pins(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+        if cfg!(test) || !self.has_session {
+            return;
+        }
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| !c.is_group && c.live) else {
+            return;
+        };
+        let tid = conv.thread_id.clone();
+        if !self.friend_pins_fetched.insert(tid.clone()) {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let tid_req = tid.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.list_friend_board_pins(&tid_req, 0)
+                            .await
+                            .map(|v| zalo_client::parse_pin_topics(&v))
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            if let Ok((pins, ver)) = res {
+                let _ = this.update(cx, |view, cx| {
+                    let gmis: HashSet<i64> = pins.iter().filter_map(|p| p.global_msg_id).collect();
+                    if !gmis.is_empty() {
+                        for m in view.messages_of(conv_id).to_vec() {
+                            if m.global_msg_id.is_some_and(|g| gmis.contains(&g)) {
+                                view.pinned_msgs.insert(m.id);
+                            }
+                        }
+                    }
+                    view.friend_pins.insert(tid, (pins, ver));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Syncs a 1-on-1 message pin/unpin to Zalo's `/api/friendboard/create` or
+    /// `/api/friendboard/multi_unpin`.
+    pub(crate) fn sync_friend_pin(
+        &mut self,
+        conv_id: u64,
+        msg: &ChatMsg,
+        pin: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if cfg!(test) || !self.has_session {
+            return;
+        }
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| !c.is_group && c.live) else {
+            return;
+        };
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let tid = conv.thread_id.clone();
+        let (existing_pins, version) = self
+            .friend_pins
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| (Vec::new(), 0));
+        let lang = if crate::i18n::is_english() { "en" } else { "vi" }.to_owned();
+        let gmi = msg.global_msg_id.unwrap_or(0);
+        let cli = msg.cli_msg_id.unwrap_or(0);
+        let snippet: String = msg.text.trim().chars().take(120).collect();
+        let topic = if !pin {
+            existing_pins
+                .iter()
+                .find(|p| p.global_msg_id == Some(gmi) && gmi > 0)
+                .map(|p| p.raw.clone())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "global_msg_id": gmi.to_string(),
+                        "cli_msg_id": cli.to_string(),
+                    })
+                })
+        } else {
+            serde_json::json!({
+                "type": 1,
+                "params": serde_json::json!({
+                    "global_msg_id": gmi.to_string(),
+                    "cli_msg_id": cli.to_string(),
+                    "title": snippet,
+                }).to_string(),
+            })
+        };
+        let tid_req = tid.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if pin {
+                            api.create_friend_board_pin(&tid_req, &topic, version, &lang)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            api.multi_unpin_friend_board(&tid_req, &[topic], version, &lang)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        let after = api
+                            .list_friend_board_pins(&tid_req, 0)
+                            .await
+                            .ok()
+                            .map(|v| zalo_client::parse_pin_topics(&v));
+                        Ok(after)
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Ok(Some((pins, ver))) = res {
+                    view.friend_pins.insert(tid, (pins, ver));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn sync_live_set(convs: &[ChatConv], set: &mut HashSet<u64>, raw_ids: &[String]) {
         let threads: HashSet<String> = raw_ids
             .iter()
@@ -3582,6 +3960,9 @@ impl ShellView {
         let Some(conv) = self.selected_conv() else {
             return;
         };
+        if self.chat_scrolled_up || self.unread_above_count(conv.id) > 0 {
+            return;
+        }
         if conv.live {
             self.send_seen_if_due(&conv.thread_id);
         }
@@ -3799,6 +4180,9 @@ impl ShellView {
             .map(|id| self.messages_of(id).len())
             .unwrap_or(0);
         let was_at_bottom = self.is_msgs_at_bottom();
+        if snap.user_id.as_deref().is_some_and(|s| !s.is_empty()) {
+            self.user_id = snap.user_id;
+        }
         if snap.send2me_id.as_deref().is_some_and(|s| !s.is_empty()) {
             self.send2me_id = snap.send2me_id;
         }
@@ -4158,6 +4542,15 @@ impl ShellView {
                     view.avatar_miss.len()
                 );
                 if more {
+                    view.avatars_queued = true;
+                } else if got > 0
+                    && !view.avatar_miss.is_empty()
+                    && !view.avatar_miss_retried
+                {
+                    // Early chunks may have failed during a brief startup network blip
+                    // while later chunks succeeded; retry the missed keys once.
+                    view.avatar_miss_retried = true;
+                    view.avatar_miss.clear();
                     view.avatars_queued = true;
                 }
                 view.refresh_notice_avatar(cx);
@@ -4781,13 +5174,19 @@ impl ShellView {
             .or_else(|| (!self.has_session).then(preview::cloud_of_mine_id))
     }
 
-    /// Numeric Zalo user id (`uidMe`) of the logged-in account (`send2me_id`),
-    /// distinct from `uin` which holds `getLoginInfo`'s 32-char `dkey`.
+    /// Numeric Zalo user id (`uidMe`) of the logged-in account (`session.user_id`,
+    /// falling back to `send2me_id`), distinct from `uin` which holds the 32-char `dkey`.
     pub(crate) fn self_uid(&self) -> Option<&str> {
-        self.send2me_id
+        self.user_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.send2me_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
     }
 
     pub(crate) fn conv(&self, id: u64) -> Option<&ChatConv> {
@@ -4913,8 +5312,25 @@ impl ShellView {
         if self.dialog.take().is_some() {
             return true;
         }
+        if self.react_detail.take().is_some() {
+            return true;
+        }
         if self.react_picker.is_some() {
             self.close_react_picker();
+            return true;
+        }
+        if self.pinned_expanded {
+            self.pinned_expanded = false;
+            return true;
+        }
+        if self.partial_quote_fab.take().is_some() {
+            self.chat_sel.clear();
+            return true;
+        }
+        if self.like_hold.take().is_some() {
+            return true;
+        }
+        if self.dismiss_floating_panels() {
             return true;
         }
         if self.forward_of.take().is_some() || self.rail_popup.take().is_some() {
@@ -4968,28 +5384,405 @@ impl ShellView {
         }
     }
 
-    pub(crate) fn select_conv(&mut self, id: u64) {
-        if self.selected != Some(id) {
-            self.msg_window = MSG_WINDOW;
-            self.chat_scrolled_up = false;
-            self.chat_unread_below = 0;
-            self.mention_idx = 0;
-            self.select_msgs = None;
-            self.chat_sel.clear();
-            self.members_view = None;
-            self.msg_search_open = false;
-            self.msg_search_q.clear();
-            self.msg_search_hits.clear();
-            self.msg_search_idx = 0;
-            self.msg_search_sender = None;
-            self.msg_search_sender_label.clear();
-            self.msg_search_date_from = None;
-            self.msg_search_date_to = None;
-            self.msg_search_popup = None;
-            self.msg_search_draft_from = None;
-            self.msg_search_draft_to = None;
-            self.msg_search_presets_open = false;
+    /// True while `msg_id` is actively flashing its 2.5s post-jump highlight ring.
+    #[must_use]
+    pub(crate) fn is_msg_highlighted(&self, msg_id: u64) -> bool {
+        self.highlight_msg.is_some_and(|(id, at)| {
+            id == msg_id && at.elapsed() < std::time::Duration::from_millis(2600)
+        })
+    }
+
+    /// Briefly highlights `msg_id` (2.5 s) after a jump from Quote / Search / Pin /
+    /// Star / Unread / Mention and schedules an automatic repaint when it fades.
+    pub(crate) fn flash_msg(&mut self, msg_id: u64, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        self.highlight_msg = Some((msg_id, now));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(2650))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.highlight_msg == Some((msg_id, now)) {
+                    view.highlight_msg = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Auto-loads older local messages (or older cloud group messages when local
+    /// history is exhausted) as the user scrolls near the top of `#message-view`.
+    pub(crate) fn maybe_auto_load_top(
+        &mut self,
+        visible_start: usize,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.chat_scrolled_up || count <= 4 || visible_start > 2 {
+            return false;
         }
+        if self
+            .last_auto_load_top
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(350))
+        {
+            return false;
+        }
+        let Some(conv_id) = self.selected else {
+            return false;
+        };
+        let total = self.messages_of(conv_id).len();
+        if total > self.msg_window {
+            self.last_auto_load_top = Some(std::time::Instant::now());
+            self.msg_window = (self.msg_window + MSG_WINDOW).min(total);
+            self.warm_media(conv_id);
+            return true;
+        }
+        if let Some(conv) = self.conv(conv_id).cloned() {
+            if conv.is_group
+                && conv.live
+                && self.has_session
+                && !self.cloud_history_busy.contains(&conv.thread_id)
+                && !self.cloud_history_exhausted.contains(&conv.thread_id)
+            {
+                self.last_auto_load_top = Some(std::time::Instant::now());
+                self.load_older_group_cloud(conv_id, cx);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of unread messages still scrolled ABOVE the viewport in `conv_id`.
+    #[must_use]
+    pub(crate) fn unread_above_count(&self, conv_id: u64) -> u32 {
+        self.unread_anchor
+            .as_ref()
+            .filter(|a| a.conv_id == conv_id)
+            .map(|a| a.remaining_ids.len() as u32)
+            .unwrap_or(0)
+    }
+
+    /// Row index in `msg_list` for a given `ChatMsg.id`, if currently inside the loaded window.
+    fn row_ix_of_msg(&self, msg_id: u64) -> Option<usize> {
+        self.msg_row_ids
+            .borrow()
+            .iter()
+            .find_map(|&(ix, id)| (id == msg_id).then_some(ix))
+    }
+
+    /// Marks `conv_id` fully read locally and schedules `/seenv2` when live.
+    pub(crate) fn clear_open_unread_and_mark_read(&mut self, conv_id: u64) {
+        if let Some(anchor) = self.unread_anchor.as_mut() {
+            if anchor.conv_id == conv_id {
+                anchor.remaining_ids.clear();
+            }
+        }
+        self.new_below_ids.clear();
+        self.new_mention_below_ids.clear();
+        self.chat_unread_below = 0;
+        self.marked_read.insert(conv_id);
+        let last_at = self
+            .messages
+            .get(&conv_id)
+            .and_then(|l| l.last())
+            .map(|m| m.at_ms)
+            .unwrap_or(0)
+            .max(data::now_ms());
+        let mut live_thread = None;
+        if let Some(conv) = self.convs.iter_mut().find(|c| c.id == conv_id) {
+            conv.unread = 0;
+            if conv.live {
+                live_thread = Some(conv.thread_id.clone());
+            }
+        }
+        if let Some(thread) = live_thread {
+            self.mark_thread_read_pref(&thread, last_at);
+            self.send_seen_if_due(&thread);
+        }
+    }
+
+    /// Processes `#message-view` scroll events (matching official Zalo PC
+    /// `processMessageInViewForUnread` + `processMessageInViewForNewMessages`):
+    /// - Updates `chat_scrolled_up` (ignoring the trailing `BottomSpacer` row).
+    /// - Gradually counts down unread messages above as the user scrolls up,
+    ///   clearing the unread badge and sending `seen` once the first unread
+    ///   message enters view.
+    /// - Gradually counts down new incoming messages below as the user scrolls
+    ///   back down to the bottom.
+    ///
+    /// Returns `true` when visible UI state changed and requires `cx.notify()`.
+    pub(crate) fn handle_msg_scroll(
+        &mut self,
+        visible: std::ops::Range<usize>,
+        count: usize,
+    ) -> bool {
+        if visible.is_empty() || count == 0 {
+            return false;
+        }
+        let prev_vis = self.last_visible_range.get();
+        self.last_visible_range.set((visible.start, visible.end));
+        let mut changed = false;
+        if prev_vis != (visible.start, visible.end) && self.partial_quote_fab.take().is_some() {
+            changed = true;
+        }
+        // BottomSpacer occupies index `count - 1`; treat the user as at-bottom
+        // whenever the last real bubble (`count - 2`) is visible.
+        let scrolled_up = count > 2 && visible.end < count.saturating_sub(1);
+        changed |= self.chat_scrolled_up != scrolled_up;
+        self.chat_scrolled_up = scrolled_up;
+
+        let Some(conv_id) = self.selected else {
+            return changed;
+        };
+
+        // 1. Track unread messages ABOVE the viewport (`unread_anchor`).
+        let mut cleared_above = false;
+        if let Some(anchor) = self.unread_anchor.as_mut() {
+            if anchor.conv_id == conv_id && !anchor.remaining_ids.is_empty() {
+                let first_id = anchor.first_unread_msg_id;
+                let first_row = self.unread_divider_row.get().or_else(|| {
+                    self.msg_row_ids
+                        .borrow()
+                        .iter()
+                        .find_map(|&(ix, id)| (id == first_id).then_some(ix))
+                });
+                let before_len = anchor.remaining_ids.len();
+                if first_row.is_some_and(|r| visible.start <= r) {
+                    anchor.remaining_ids.clear();
+                    cleared_above = true;
+                } else {
+                    let row_map = self.msg_row_ids.borrow();
+                    anchor.remaining_ids.retain(|&mid| {
+                        row_map
+                            .iter()
+                            .find_map(|&(ix, id)| (id == mid).then_some(ix))
+                            .is_none_or(|ix| ix < visible.start)
+                    });
+                    if anchor.remaining_ids.is_empty() {
+                        cleared_above = true;
+                    }
+                }
+                if anchor.remaining_ids.len() != before_len {
+                    changed = true;
+                }
+            }
+        }
+
+        // 2. Track new messages BELOW the viewport (`new_below_ids` & mentions).
+        if !scrolled_up {
+            if !self.new_below_ids.is_empty()
+                || !self.new_mention_below_ids.is_empty()
+                || self.chat_unread_below > 0
+            {
+                self.new_below_ids.clear();
+                self.new_mention_below_ids.clear();
+                self.chat_unread_below = 0;
+                changed = true;
+            }
+        } else if !self.new_below_ids.is_empty() {
+            let before_len = self.new_below_ids.len();
+            let row_map = self.msg_row_ids.borrow();
+            self.new_below_ids.retain(|&mid| {
+                row_map
+                    .iter()
+                    .find_map(|&(ix, id)| (id == mid).then_some(ix))
+                    .is_none_or(|ix| ix >= visible.end)
+            });
+            self.new_mention_below_ids
+                .retain(|id| self.new_below_ids.contains(id));
+            self.chat_unread_below = self.new_below_ids.len() as u32;
+            if self.new_below_ids.len() != before_len {
+                changed = true;
+            }
+        }
+
+        // 3. Synchronize sidebar unread badge + `/seenv2` read receipt.
+        let above = self.unread_above_count(conv_id);
+        let below = self.new_below_ids.len() as u32;
+        let total_unseen = above.saturating_add(below);
+        if total_unseen == 0 {
+            if cleared_above || !self.marked_read.contains(&conv_id) {
+                self.clear_open_unread_and_mark_read(conv_id);
+                changed = true;
+            }
+        } else if let Some(conv) = self.convs.iter_mut().find(|c| c.id == conv_id) {
+            if conv.unread != total_unseen {
+                conv.unread = total_unseen;
+                changed = true;
+            }
+            self.marked_read.remove(&conv_id);
+        }
+        changed
+    }
+
+    /// Scrolls up to the `--- Tin nhắn chưa đọc ---` separator / first unread
+    /// message (triggered by the top-right `↑↑` button OR re-clicking the active
+    /// conversation in the left sidebar) and marks the unread batch as read.
+    pub(crate) fn jump_to_first_unread(&mut self) {
+        let Some(conv_id) = self.selected else {
+            return;
+        };
+        let Some(first_id) = self
+            .unread_anchor
+            .as_ref()
+            .filter(|a| a.conv_id == conv_id)
+            .map(|a| a.first_unread_msg_id)
+        else {
+            return;
+        };
+        let all = self.messages_of(conv_id);
+        if let Some(pos) = all.iter().position(|m| m.id == first_id) {
+            let needed = all.len().saturating_sub(pos) + 12;
+            if needed > self.msg_window {
+                self.msg_window = needed;
+                self.warm_media(conv_id);
+            }
+        }
+        if let Some(conv) = self.conv(conv_id).cloned() {
+            let (hidden, items) = self.build_msg_rows(&conv);
+            self.sync_msg_list(conv.id, items.len(), hidden);
+        }
+        let target_row = self
+            .unread_divider_row
+            .get()
+            .or_else(|| self.row_ix_of_msg(first_id));
+        if let Some(row_ix) = target_row {
+            self.msg_list.scroll_to_reveal_item(row_ix);
+        }
+        if let Some(anchor) = self.unread_anchor.as_mut() {
+            if anchor.conv_id == conv_id {
+                anchor.remaining_ids.clear();
+            }
+        }
+        if self.new_below_ids.is_empty() {
+            self.clear_open_unread_and_mark_read(conv_id);
+        } else if let Some(conv) = self.convs.iter_mut().find(|c| c.id == conv_id) {
+            conv.unread = self.new_below_ids.len() as u32;
+        }
+    }
+
+    /// Scrolls to the newest message at the bottom and clears any pending
+    /// below-viewport unread / mention counters.
+    pub(crate) fn jump_to_bottom_and_read(&mut self) {
+        self.chat_scrolled_up = false;
+        self.new_below_ids.clear();
+        self.new_mention_below_ids.clear();
+        self.chat_unread_below = 0;
+        if let Some(conv_id) = self.selected {
+            let above = self.unread_above_count(conv_id);
+            if above == 0 {
+                self.clear_open_unread_and_mark_read(conv_id);
+            } else if let Some(conv) = self.convs.iter_mut().find(|c| c.id == conv_id) {
+                conv.unread = above;
+            }
+        }
+        self.scroll_msgs_to_bottom();
+    }
+
+    /// Jumps to the oldest unseen `@mention` message below the viewport.
+    pub(crate) fn jump_to_next_mention_below(&mut self) {
+        let Some(conv_id) = self.selected else {
+            return;
+        };
+        if self.new_mention_below_ids.is_empty() {
+            return;
+        }
+        let target_id = self.new_mention_below_ids.remove(0);
+        if let Some(conv) = self.conv(conv_id).cloned() {
+            let (hidden, items) = self.build_msg_rows(&conv);
+            self.sync_msg_list(conv.id, items.len(), hidden);
+        }
+        if let Some(row_ix) = self.row_ix_of_msg(target_id) {
+            self.msg_list.scroll_to_reveal_item(row_ix);
+        }
+    }
+
+    pub(crate) fn select_conv(&mut self, id: u64) {
+        let same_conv = self.selected == Some(id);
+        // Official Zalo PC behavior: clicking the ALREADY-SELECTED conversation
+        // in the left sidebar jumps UP to unread messages (if any remain above),
+        // or back DOWN to the latest message if scrolled up.
+        if same_conv {
+            self.starred_open = false;
+            self.compact_show_chat = true;
+            self.rail = Rail::Chats;
+            self.note = None;
+            self.menu = None;
+            if self.unread_above_count(id) > 0 {
+                self.jump_to_first_unread();
+            } else if self.chat_scrolled_up || !self.new_below_ids.is_empty() {
+                self.jump_to_bottom_and_read();
+            } else if let Some(anchor) = self.unread_anchor.as_ref().filter(|a| a.conv_id == id) {
+                // Even if already marked read on initial open, re-clicking lets the user
+                // jump back to the unread divider when it sits above the viewport.
+                let (vis_start, _vis_end) = self.last_visible_range.get();
+                let target_row = self
+                    .unread_divider_row
+                    .get()
+                    .or_else(|| self.row_ix_of_msg(anchor.first_unread_msg_id));
+                if target_row.is_some_and(|r| r < vis_start) {
+                    self.jump_to_first_unread();
+                } else {
+                    self.scroll_msgs_to_bottom();
+                }
+            } else {
+                self.scroll_msgs_to_bottom();
+            }
+            return;
+        }
+
+        // Preserve any unread count that wasn't scrolled up to on the previous conversation.
+        if let Some(prev_id) = self.selected {
+            let prev_unseen = self
+                .unread_above_count(prev_id)
+                .saturating_add(self.new_below_ids.len() as u32);
+            if prev_unseen > 0 {
+                if let Some(prev_conv) = self.convs.iter_mut().find(|c| c.id == prev_id) {
+                    prev_conv.unread = prev_unseen;
+                }
+                self.marked_read.remove(&prev_id);
+            }
+        }
+
+        let unread_before = self
+            .convs
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| self.unread_of(c))
+            .unwrap_or(0);
+
+        self.msg_window = MSG_WINDOW;
+        self.chat_scrolled_up = false;
+        self.chat_unread_below = 0;
+        self.new_below_ids.clear();
+        self.new_mention_below_ids.clear();
+        self.unread_anchor = None;
+        self.unread_divider_row.set(None);
+        self.msg_row_ids.borrow_mut().clear();
+        self.last_visible_range.set((0, 0));
+        self.highlight_msg = None;
+        self.last_auto_load_top = None;
+        self.pinned_expanded = false;
+        self.react_detail = None;
+        self.partial_quote_fab = None;
+        self.mention_idx = 0;
+        self.select_msgs = None;
+        self.chat_sel.clear();
+        self.members_view = None;
+        self.msg_search_open = false;
+        self.msg_search_q.clear();
+        self.msg_search_hits.clear();
+        self.msg_search_idx = 0;
+        self.msg_search_sender = None;
+        self.msg_search_sender_label.clear();
+        self.msg_search_date_from = None;
+        self.msg_search_date_to = None;
+        self.msg_search_popup = None;
+        self.msg_search_draft_from = None;
+        self.msg_search_draft_to = None;
+        self.msg_search_presets_open = false;
+
         self.selected = Some(id);
         self.starred_open = false;
         self.compact_show_chat = true;
@@ -5003,24 +5796,44 @@ impl ShellView {
         self.close_react_picker();
         self.reply_to = None;
         self.forward_of = None;
-        self.marked_read.insert(id);
-        let last_at = self
-            .messages
-            .get(&id)
-            .and_then(|l| l.last())
-            .map(|m| m.at_ms)
-            .unwrap_or(0)
-            .max(data::now_ms());
-        let mut live_thread = None;
-        if let Some(conv) = self.convs.iter_mut().find(|c| c.id == id) {
-            conv.unread = 0;
-            if conv.live {
-                live_thread = Some(conv.thread_id.clone());
+
+        // Build unread anchor when opening a conversation with unread messages.
+        let mut anchored_unread = false;
+        if unread_before > 0 {
+            let all = self.messages_of(id);
+            let mut unread_ids: Vec<u64> = all
+                .iter()
+                .rev()
+                .filter(|m| !m.from_me)
+                .take(unread_before as usize)
+                .map(|m| m.id)
+                .collect();
+            if unread_ids.is_empty() {
+                unread_ids = all
+                    .iter()
+                    .rev()
+                    .take(unread_before as usize)
+                    .map(|m| m.id)
+                    .collect();
+            }
+            unread_ids.reverse();
+            if let Some(&first_id) = unread_ids.first() {
+                if let Some(pos) = all.iter().position(|m| m.id == first_id) {
+                    let needed = all.len().saturating_sub(pos) + 12;
+                    self.msg_window = self.msg_window.max(needed);
+                }
+                self.unread_anchor = Some(ConvUnreadAnchor {
+                    conv_id: id,
+                    first_unread_msg_id: first_id,
+                    remaining_ids: unread_ids,
+                    initial_count: unread_before,
+                });
+                anchored_unread = true;
             }
         }
-        if let Some(thread) = live_thread {
-            self.mark_thread_read_pref(&thread, last_at);
-            self.send_seen_if_due(&thread);
+
+        if !anchored_unread {
+            self.clear_open_unread_and_mark_read(id);
         }
         self.warm_media(id);
         self.scroll_msgs_to_bottom();
@@ -5193,6 +6006,105 @@ impl ShellView {
         }
     }
 
+    /// Maps press-and-hold duration on the quick-like button to `(tier, preview_px)`:
+    /// - `< 220 ms`: tier 1 (normal 36 px bubble)
+    /// - `220..650 ms`: tier 2 (medium 54 px bubble)
+    /// - `>= 650 ms`: tier 3 (large 74 px bubble)
+    #[must_use]
+    pub(crate) fn like_hold_preview_px(elapsed_ms: u128) -> (u8, f32) {
+        if elapsed_ms < 220 {
+            let t = elapsed_ms as f32 / 220.0;
+            (1, 28.0 + t * 10.0)
+        } else if elapsed_ms < 650 {
+            let t = (elapsed_ms - 220) as f32 / 430.0;
+            (2, 38.0 + t * 20.0)
+        } else {
+            let t = ((elapsed_ms - 650).min(450)) as f32 / 450.0;
+            (3, (58.0 + t * 22.0).min(80.0))
+        }
+    }
+
+    /// Begins a press-and-hold gesture on the composer's quick-like button,
+    /// repainting smoothly at ~30 FPS so the growing yellow 👍 preview scales live.
+    pub(crate) fn start_like_hold(
+        &mut self,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.like_hold = Some((std::time::Instant::now(), pos));
+        cx.spawn(async move |this, cx| {
+            for _ in 0..90 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(30))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if this.like_hold.is_some() {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Finishes a press-and-hold on the quick-like button and sends `"/-strong"`
+    /// at the chosen size tier (`1` normal, `2` medium, `3` large).
+    pub(crate) fn finish_like_hold(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((started, pos)) = self.like_hold.take() else {
+            return;
+        };
+        let (scale, _) = Self::like_hold_preview_px(started.elapsed().as_millis());
+        if scale > 1 && self.selected_conv().is_some() && self.pending_photos.is_empty() {
+            self.big_like_sizes.insert(self.next_msg_id, scale);
+        }
+        self.send_draft("/-strong", cx);
+        self.spawn_react_burst(pos, 0, window, cx);
+    }
+
+    /// Dismisses any open non-modal floating popover/panel when clicking outside it.
+    /// Returns `true` if at least one floating panel was open and closed.
+    pub(crate) fn dismiss_floating_panels(&mut self) -> bool {
+        let mut changed = false;
+        if self.sticker_open {
+            self.sticker_open = false;
+            changed = true;
+        }
+        if self.quick_menu {
+            self.quick_menu = false;
+            changed = true;
+        }
+        if self.format_open {
+            self.format_open = false;
+            changed = true;
+        }
+        if self.pinned_expanded {
+            self.pinned_expanded = false;
+            changed = true;
+        }
+        if self.receipt_open.take().is_some() {
+            changed = true;
+        }
+        if self.msg_search_popup.take().is_some() {
+            changed = true;
+        }
+        if self.msg_search_presets_open {
+            self.msg_search_presets_open = false;
+            changed = true;
+        }
+        if self.partial_quote_fab.take().is_some() {
+            changed = true;
+        }
+        changed
+    }
+
     /// Collects `(uid, display_name)` pairs for members of a group so `@mention` metadata
     /// carries real Zalo UIDs.
     pub(crate) fn group_member_uid_names(&self, conv: &ChatConv) -> Vec<(String, String)> {
@@ -5249,16 +6161,31 @@ impl ShellView {
         let Some(conv) = self.conv(conv_id).cloned() else {
             return;
         };
+        let recalled_text = str_vi("STR_UNDO_MESSAGE", "Tin nhắn đã thu hồi").to_owned();
         let recall_ids: HashSet<u64> = recallable.iter().map(|m| m.id).collect();
         if let Some(list) = self.messages.get_mut(&conv_id) {
             for m in list.iter_mut() {
                 if recall_ids.contains(&m.id) {
                     m.recalled = true;
+                    m.text = recalled_text.clone();
+                    m.kind = crate::media::MsgKind::Text;
+                    m.media_url.clear();
+                    m.media_path = None;
+                    m.href.clear();
+                    m.group_layout_id = 0;
+                    if conv.live {
+                        data::persist_recall_message(
+                            &conv.thread_id,
+                            m.global_msg_id,
+                            m.cli_msg_id,
+                            &recalled_text,
+                        );
+                    }
                 }
             }
         }
         if let Some(c) = self.convs.iter_mut().find(|c| c.id == conv_id) {
-            c.preview = str_vi("STR_UNDO_MESSAGE", "Tin nhắn đã thu hồi").to_owned();
+            c.preview = recalled_text;
         }
         if conv.live {
             let base = (data::now_ms().max(1) as u64).saturating_mul(10);
@@ -5312,8 +6239,13 @@ impl ShellView {
     }
 
     pub(crate) fn push_message(&mut self, msg: ChatMsg) {
-        if let Some(conv) = self.convs.iter_mut().find(|row| row.id == msg.conv) {
-            conv.preview = msg.text.clone();
+        let conv_id = msg.conv;
+        if let Some(conv) = self.convs.iter_mut().find(|row| row.id == conv_id) {
+            conv.preview = if msg.text.trim() == "/-strong" {
+                "👍".to_owned()
+            } else {
+                msg.text.clone()
+            };
             conv.time = if msg.at_ms > 0 {
                 data::vn_hm(msg.at_ms)
             } else {
@@ -5321,7 +6253,11 @@ impl ShellView {
             };
             conv.unread = 0;
         }
-        self.messages.entry(msg.conv).or_default().push(msg);
+        self.messages.entry(conv_id).or_default().push(msg);
+        if self.selected == Some(conv_id) {
+            self.chat_scrolled_up = false;
+            self.clear_open_unread_and_mark_read(conv_id);
+        }
         self.scroll_msgs_to_bottom();
     }
 
@@ -5862,6 +6798,66 @@ impl ShellView {
             Err(err) => self.set_note(err),
         }
     }
+
+    /// Handles external files/images dropped onto the chat pane (`drag-media-overlay`):
+    /// stages images into the pending photo tray and sends dropped videos/documents.
+    pub(crate) fn handle_dropped_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.selected.is_none() || paths.is_empty() {
+            return;
+        }
+        let (images, videos, files, skipped_dirs) = classify_dropped_paths(paths);
+        let mut handled = 0usize;
+        if !images.is_empty() {
+            handled += images.len();
+            self.add_pending_photos(images);
+        }
+        for v in videos {
+            handled += 1;
+            self.send_video_now(v);
+        }
+        for f in files {
+            handled += 1;
+            self.send_file_now(f);
+        }
+        if handled == 0 && skipped_dirs > 0 {
+            self.set_note("Chưa hỗ trợ kéo thả thư mục — hãy chọn tập tin hoặc hình ảnh");
+        }
+    }
+}
+
+/// Splits dropped OS paths into `(images, videos, other_files, skipped_dirs)`.
+pub(crate) fn classify_dropped_paths(
+    paths: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, usize) {
+    let mut images = Vec::new();
+    let mut videos = Vec::new();
+    let mut files = Vec::new();
+    let mut skipped_dirs = 0usize;
+    for p in paths {
+        if p.is_dir() {
+            skipped_dirs += 1;
+            continue;
+        }
+        if !p.is_file() {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "jxl" | "avif" | "heic" | "heif"
+        ) {
+            images.push(p);
+        } else if crate::video::is_video_path(&p) {
+            videos.push(p);
+        } else {
+            files.push(p);
+        }
+    }
+    (images, videos, files, skipped_dirs)
 }
 
 impl ShellView {
@@ -6061,6 +7057,7 @@ impl Render for ShellView {
         }
         if let Some(id) = self.selected {
             self.fetch_message_status(id, false, cx);
+            self.fetch_friend_board_pins(id, cx);
         }
         self.drain_media_queue(cx);
         self.drain_sticker_thumbs(cx);
@@ -6085,8 +7082,11 @@ impl Render for ShellView {
             Some(row) => format!("Nhập @, tin nhắn tới {}", row.name),
             None => str_vi("STR_SEND_MESSAGE", "Nhập tin nhắn").to_owned(),
         };
-        self.composer
-            .update(cx, |input, _| input.set_placeholder(hint));
+        let mention_names = self.mention_known_names();
+        self.composer.update(cx, |input, _| {
+            input.set_placeholder(hint);
+            input.set_mention_names(mention_names);
+        });
         let contacts_hint = if self.contact_tab == crate::sidebar::ContactTab::Groups {
             str_vi("STR_SEARCH_GROUP", "Tìm nhóm theo tên").to_owned()
         } else {
@@ -6131,6 +7131,22 @@ impl Render for ShellView {
                             .id("shell")
                             .track_focus(&self.root_focus)
                             .on_key_down(cx.listener(ShellView::on_shell_key))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.dismiss_floating_panels() {
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .on_mouse_down(
+                                gpui::MouseButton::Right,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.dismiss_floating_panels() {
+                                        cx.notify();
+                                    }
+                                }),
+                            )
                             .relative()
                             .flex()
                             .flex_col()
@@ -6198,6 +7214,15 @@ impl Render for ShellView {
                     .when(self.react_picker.is_some(), |el| {
                         el.child(self.react_picker_overlay(cx))
                     })
+                    .when(self.react_detail.is_some(), |el| {
+                        el.child(self.react_detail_overlay(cx))
+                    })
+                    .when(self.partial_quote_fab.is_some(), |el| {
+                        el.child(self.partial_quote_fab_overlay(window, cx))
+                    })
+                    .when(self.like_hold.is_some(), |el| {
+                        el.child(self.like_hold_overlay(window))
+                    })
                     .when(!self.react_bursts.is_empty(), |el| {
                         el.child(self.react_burst_overlay())
                     })
@@ -6214,6 +7239,22 @@ impl Render for ShellView {
                         .id("shell")
                         .track_focus(&self.root_focus)
                         .on_key_down(cx.listener(ShellView::on_shell_key))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if this.dismiss_floating_panels() {
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_mouse_down(
+                            gpui::MouseButton::Right,
+                            cx.listener(|this, _, _, cx| {
+                                if this.dismiss_floating_panels() {
+                                    cx.notify();
+                                }
+                            }),
+                        )
                         .relative()
                         .flex()
                         .flex_row()
@@ -6348,6 +7389,15 @@ impl Render for ShellView {
                 .when(menu, |el| el.child(self.context_menu_overlay(cx)))
                 .when(self.react_picker.is_some(), |el| {
                     el.child(self.react_picker_overlay(cx))
+                })
+                .when(self.react_detail.is_some(), |el| {
+                    el.child(self.react_detail_overlay(cx))
+                })
+                .when(self.partial_quote_fab.is_some(), |el| {
+                    el.child(self.partial_quote_fab_overlay(window, cx))
+                })
+                .when(self.like_hold.is_some(), |el| {
+                    el.child(self.like_hold_overlay(window))
                 })
                 .when(!self.react_bursts.is_empty(), |el| {
                     el.child(self.react_burst_overlay())

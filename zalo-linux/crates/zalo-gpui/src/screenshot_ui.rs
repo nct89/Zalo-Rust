@@ -548,7 +548,7 @@ impl Render for ShotOverlayView {
             .size_full()
             .overflow_hidden()
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
-                let ctrl = e.keystroke.modifiers.control;
+                let ctrl = e.keystroke.modifiers.control || e.keystroke.modifiers.platform;
                 match e.keystroke.key.as_str() {
                     "escape" => this.finish(ShotOutcome::Cancelled, window, cx),
                     "enter" => this.commit_send(window, cx),

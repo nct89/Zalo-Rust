@@ -10,7 +10,7 @@ Requirements: macOS 11+, Rust 1.85+, Xcode command-line tools, CMake, NASM.
 brew install cmake nasm pkg-config ffmpeg
 cargo test -p zalo-shell-mac -p zcall-audio-mac -p zcall-engine-mac
 cargo build --release -p zalo-gpui
-VERSION=0.1.0 bash zalo-macos/packaging/build-app.sh
+VERSION=0.3.4 bash zalo-macos/packaging/build-app.sh
 open dist/Zalo.app
 ```
 

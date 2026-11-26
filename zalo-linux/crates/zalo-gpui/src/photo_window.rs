@@ -313,7 +313,7 @@ impl PhotoView {
         let ly = (cy_pos - (TITLEBAR_H + SUBHEADER_H + img_top)).clamp(0.0, dh);
         if (lx - sx).abs() + (ly - sy).abs() <= 4.0 {
             if let Some(hit) = crate::viewer::ocr_box_at(&self.ocr_boxes, lx, ly, dw, dh) {
-                if modifiers.control || modifiers.shift {
+                if modifiers.control || modifiers.platform || modifiers.shift {
                     if !self.ocr_selected.remove(&hit) {
                         self.ocr_selected.insert(hit);
                     }

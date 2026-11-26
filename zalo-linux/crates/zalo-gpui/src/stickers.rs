@@ -950,6 +950,8 @@ impl ShellView {
             .shadow_sm()
             .overflow_hidden()
             .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .child(self.sticker_tabs(cx))
             .child(match tab {
                 StickerTab::Emoji => self.emoji_grid(cx).into_any_element(),

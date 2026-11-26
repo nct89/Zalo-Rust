@@ -713,10 +713,13 @@ impl ShellView {
         open_call_window(cx, peer, video, shared, action_tx, audio);
     }
 
-    /// Ids that are this account. `uin` is the login dkey, not a Zalo user id,
-    /// so the signed-in member is also the profile whose name matches «me».
+    /// Ids that are this account (`user_id`, `uin`, `send2me_id`, and any cached
+    /// profile whose name matches «me»).
     pub(crate) fn self_member_ids(&self) -> std::collections::HashSet<String> {
         let mut ids = std::collections::HashSet::new();
+        if let Some(uid) = self.user_id.as_ref().filter(|id| !id.is_empty()) {
+            ids.insert(uid.clone());
+        }
         if let Some(uin) = self.uin.as_ref().filter(|id| !id.is_empty()) {
             ids.insert(uin.clone());
         }

@@ -170,10 +170,23 @@ impl ChatMsg {
     }
 }
 
-/// Returns true when two messages represent the same logical bubble (same server
-/// `global_msg_id`, same non-zero `cli_msg_id`, or duplicate text echo with
-/// identical timestamp / missing server id within 5 s).
+/// Returns true when a stored message body represents a recalled message.
 #[must_use]
+pub(crate) fn is_recalled_body(body: &str) -> bool {
+    matches!(
+        body.trim(),
+        "Tin nhắn đã thu hồi"
+            | "Tin nhắn đã được thu hồi"
+            | "Message has been recalled"
+            | "Message recalled"
+    )
+}
+
+/// Returns true when two messages represent the same logical bubble (same server
+/// `global_msg_id`, same non-zero `cli_msg_id`, or duplicate text/media echo
+/// with identical timestamp / missing server id within 5 s).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn is_duplicate_msg(
     existing: &ChatMsg,
     global_msg_id: Option<i64>,
@@ -182,6 +195,8 @@ pub(crate) fn is_duplicate_msg(
     sender_uid: &str,
     kind: MsgKind,
     text: &str,
+    media_url: &str,
+    href: &str,
     at_ms: i64,
 ) -> bool {
     if let (Some(a), Some(b)) = (existing.global_msg_id, global_msg_id) {
@@ -196,7 +211,6 @@ pub(crate) fn is_duplicate_msg(
     }
     if existing.from_me == from_me
         && existing.kind == kind
-        && kind == MsgKind::Text
         && existing.at_ms > 0
         && at_ms > 0
     {
@@ -204,15 +218,27 @@ pub(crate) fn is_duplicate_msg(
             || existing.sender_uid == sender_uid
             || existing.sender_uid.is_empty()
             || sender_uid.is_empty();
-        let a_txt = existing.text.trim();
-        let b_txt = text.trim();
-        if same_sender && !a_txt.is_empty() && a_txt == b_txt {
-            let gap = (existing.at_ms - at_ms).abs();
-            // Exact same timestamp (e.g. ZDB backup + realtime/sync2 overlap) OR
-            // at least one copy lacks a server id within 5 seconds.
-            let missing_gid =
-                existing.global_msg_id.unwrap_or(0) <= 0 || global_msg_id.unwrap_or(0) <= 0;
-            if gap == 0 || (missing_gid && gap <= 5_000) || gap <= 1_000 {
+        if !same_sender {
+            return false;
+        }
+        let gap = (existing.at_ms - at_ms).abs();
+        let missing_gid =
+            existing.global_msg_id.unwrap_or(0) <= 0 || global_msg_id.unwrap_or(0) <= 0;
+        if kind == MsgKind::Text {
+            let a_txt = existing.text.trim();
+            let b_txt = text.trim();
+            if !a_txt.is_empty()
+                && a_txt == b_txt
+                && (gap == 0 || (missing_gid && gap <= 5_000) || gap <= 1_000)
+            {
+                return true;
+            }
+        } else if gap == 0 || (missing_gid && gap <= 5_000) {
+            let same_url = (!media_url.is_empty()
+                && !existing.media_url.is_empty()
+                && existing.media_url == media_url)
+                || (!href.is_empty() && !existing.href.is_empty() && existing.href == href);
+            if same_url {
                 return true;
             }
         }
@@ -320,6 +346,8 @@ pub(crate) fn dedupe_messages(msgs: &mut Vec<ChatMsg>) {
                     &msg.sender_uid,
                     msg.kind,
                     &msg.text,
+                    &msg.media_url,
+                    &msg.href,
                     msg.at_ms,
                 ) {
                     dup_pos = Some(idx);
@@ -427,6 +455,8 @@ pub struct Snapshot {
     pub display_name: Option<String>,
     /// Account uin, when present.
     pub uin: Option<String>,
+    /// Numeric Zalo user id (`session.user_id`), used for group roles & ownership.
+    pub user_id: Option<String>,
     /// "My Cloud" conversation id.
     pub send2me_id: Option<String>,
     /// XDG `zalo-rust` directory when it exists.
@@ -799,6 +829,7 @@ pub(crate) fn snapshot_from_store(dir: &std::path::Path) -> Option<Snapshot> {
         if let Some(s) = session {
             snap.display_name = s.display_name;
             snap.uin = s.uin;
+            snap.user_id = s.user_id;
             snap.send2me_id = s.send2me_id;
         }
         snap.session_dir = Some(dir.to_path_buf());
@@ -862,6 +893,7 @@ fn snapshot_from_session(dir: &std::path::Path, session: &StoredSession) -> Snap
         groups: Vec::new(),
         display_name: session.display_name.clone(),
         uin: session.uin.clone(),
+        user_id: session.user_id.clone(),
         send2me_id: session.send2me_id.clone(),
         session_dir: Some(dir.to_path_buf()),
         has_session: session.zpw_sek().is_some(),
@@ -901,6 +933,7 @@ pub fn preview_snapshot() -> Snapshot {
         groups,
         display_name: None,
         uin: None,
+        user_id: None,
         send2me_id: None,
         session_dir: None,
         has_session: false,
@@ -971,6 +1004,7 @@ fn load_from_dir(dir: &std::path::Path) -> Option<Snapshot> {
     }
     snap.display_name = session.display_name.clone();
     snap.uin = session.uin.clone();
+    snap.user_id = session.user_id.clone();
     snap.send2me_id = session.send2me_id.clone();
     snap.has_session = true;
     snap.session_dir = Some(dir.to_path_buf());
@@ -1061,7 +1095,10 @@ fn record_to_chat_msg(
         let name = users.get(&sender_uid).map(String::as_str).unwrap_or("");
         crate::media::sender_label(&sender_uid, name)
     };
-    let attach = attachments.get(&rec.message_id).map(String::as_str);
+    let recalled = is_recalled_body(&rec.body);
+    let attach = (!recalled)
+        .then(|| attachments.get(&rec.message_id).map(String::as_str))
+        .flatten();
     let meta = crate::media::classify(&rec.body, attach);
     ChatMsg {
         id: mid,
@@ -1075,9 +1112,9 @@ fn record_to_chat_msg(
         at_ms: rec.sent_at,
         cli_msg_id: rec.cli_msg_id,
         global_msg_id: rec.global_msg_id,
-        recalled: false,
+        recalled,
         liked: false,
-        kind: meta.kind,
+        kind: if recalled { MsgKind::Text } else { meta.kind },
         media_path: meta.path,
         media_w: meta.width,
         media_h: meta.height,
@@ -1270,6 +1307,7 @@ fn map_store(store: &LocalStore, self_uids: &HashSet<String>) -> Snapshot {
         groups,
         display_name: None,
         uin: None,
+        user_id: None,
         send2me_id: None,
         session_dir: None,
         has_session: false,
@@ -1371,6 +1409,29 @@ pub fn persist_delete_message(message_id: i64) {
         return;
     };
     let _ = store.delete_message(message_id);
+}
+
+/// Best-effort local recall persistence by `(thread_id, global_msg_id / cli_msg_id)`.
+pub fn persist_recall_message(
+    thread_id: &str,
+    global_msg_id: Option<i64>,
+    cli_msg_id: Option<i64>,
+    body: &str,
+) {
+    if cfg!(test) || thread_id.is_empty() {
+        return;
+    }
+    let Some(dir) = active_data_dir() else {
+        return;
+    };
+    let path = dir.join("store.db");
+    if !path.is_file() {
+        return;
+    }
+    let Ok(store) = LocalStore::open(&path) else {
+        return;
+    };
+    let _ = store.mark_recalled(thread_id, global_msg_id, cli_msg_id, body);
 }
 
 #[cfg(test)]
@@ -1630,5 +1691,44 @@ mod tests {
         assert_eq!(list.len(), 3, "duplicate collapsed, distinct sends kept");
         assert_eq!(list[0].global_msg_id, Some(888_888));
         assert_eq!(list[0].quote_text, "quote");
+    }
+
+    #[test]
+    fn dedupe_messages_collapses_duplicate_media_missing_global_id_and_detects_recalled() {
+        assert!(is_recalled_body("Tin nhắn đã thu hồi"));
+        assert!(is_recalled_body("Tin nhắn đã được thu hồi"));
+        assert!(!is_recalled_body("Chào bạn"));
+
+        let mut p1 = ChatMsg::text_msg(
+            1,
+            10,
+            "g_1".into(),
+            false,
+            "Thảo".into(),
+            "u_1".into(),
+            "[Hình ảnh]".into(),
+            "08:03".into(),
+            1_795_654_996_512,
+            None,
+            None,
+        );
+        p1.kind = MsgKind::Photo;
+        p1.media_url = "https://photo.zdn.vn/same.jpg".into();
+
+        let mut p2 = p1.clone();
+        p2.id = 2;
+        p2.at_ms = 1_795_654_998_000;
+        p2.global_msg_id = Some(8_529_709_392_579);
+
+        let mut p3 = p2.clone();
+        p3.id = 3;
+        p3.at_ms = 1_795_655_074_653; // 78 s later, distinct server id -> distinct send kept
+        p3.global_msg_id = Some(8_529_713_276_803);
+
+        let mut list = vec![p1, p2, p3];
+        dedupe_messages(&mut list);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].global_msg_id, Some(8_529_709_392_579));
+        assert_eq!(list[1].global_msg_id, Some(8_529_713_276_803));
     }
 }

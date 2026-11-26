@@ -531,6 +531,68 @@ impl LocalStore {
             .is_some())
     }
 
+    /// Finds the local `message_id` for `(thread_id, cli_msg_id)` if already stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the query fails.
+    pub fn find_by_cli_id(
+        &self,
+        thread_id: &str,
+        cli_msg_id: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT message_id FROM messages WHERE thread_id = ?1 AND cli_msg_id = ?2 LIMIT 1",
+                params![thread_id, cli_msg_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// Marks matching message(s) in `thread_id` as recalled by replacing `body`
+    /// and removing any stored attachment rows so recalled photos/videos/files
+    /// never render again after restart. Matches `global_msg_id` first, then
+    /// falls back to `cli_msg_id`. Returns updated local `message_id`s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when SQLite rejects the statements.
+    pub fn mark_recalled(
+        &self,
+        thread_id: &str,
+        global_msg_id: Option<i64>,
+        cli_msg_id: Option<i64>,
+        body: &str,
+    ) -> Result<Vec<i64>, StorageError> {
+        let mut ids = Vec::new();
+        if let Some(gid) = global_msg_id.filter(|&g| g > 0) {
+            ids = self.replace_body_by_global_id(thread_id, gid, body)?;
+        }
+        if ids.is_empty() {
+            if let Some(cid) = cli_msg_id.filter(|&c| c > 0) {
+                let mut stmt = self.conn.prepare(
+                    "SELECT message_id FROM messages WHERE thread_id = ?1 AND cli_msg_id = ?2",
+                )?;
+                ids = stmt
+                    .query_map(params![thread_id, cid], |row| row.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.conn.execute(
+                    "UPDATE messages SET body = ?3 WHERE thread_id = ?1 AND cli_msg_id = ?2",
+                    params![thread_id, cid, body],
+                )?;
+            }
+        }
+        for id in &ids {
+            self.conn.execute(
+                "DELETE FROM attachments WHERE message_id = ?1",
+                params![id],
+            )?;
+        }
+        Ok(ids)
+    }
+
     /// Deletes one message by `message_id`.
     ///
     /// # Errors

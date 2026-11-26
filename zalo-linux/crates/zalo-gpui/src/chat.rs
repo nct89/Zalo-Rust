@@ -393,95 +393,280 @@ impl ShellView {
         if self.pinned_msgs.is_empty() {
             return div().into_any_element();
         }
-        let Some(msg) = self
+        let pinned_list: Vec<ChatMsg> = self
             .messages_of(conv.id)
             .iter()
             .rev()
-            .find(|m| self.pinned_msgs.contains(&m.id))
+            .filter(|m| self.pinned_msgs.contains(&m.id))
             .cloned()
-        else {
+            .collect();
+        let Some(msg) = pinned_list.first().cloned() else {
             return div().into_any_element();
         };
+        let total_pins = pinned_list.len();
+        let expanded = self.pinned_expanded && total_pins > 1;
+        let dark = crate::color::is_dark();
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
+        let subtle_bg = token_rgb("--layer-background-subtle", "#f3f5f8");
         let ink = token_rgb("--text-primary", "#081b3a");
-        let who = if msg.from_me {
-            "Bạn".to_owned()
-        } else {
-            msg.sender.clone()
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let line = crate::color::border_subtle();
+        let pin_icon_col = if dark { ink } else { crate::color::link_fg() };
+        let preview_of = |m: &ChatMsg| -> (String, String) {
+            let who = if m.from_me {
+                "Bạn".to_owned()
+            } else {
+                m.sender.clone()
+            };
+            let body = match m.kind {
+                MsgKind::Photo => "[Hình ảnh]".to_owned(),
+                MsgKind::Video => "[Video]".to_owned(),
+                MsgKind::Voice => "[Tin nhắn thoại]".to_owned(),
+                MsgKind::Doodle => "[Vẽ hình]".to_owned(),
+                MsgKind::Location => "[Vị trí]".to_owned(),
+                MsgKind::Ecard => "[Thiệp]".to_owned(),
+                MsgKind::Poll => format!("[Bình chọn] {}", m.file_name),
+                MsgKind::File => format!("[File] {}", m.file_name),
+                _ => m.text.replace('\n', " "),
+            };
+            (who, body)
         };
-        let body = match msg.kind {
-            MsgKind::Photo => "[Hình ảnh]".to_owned(),
-            MsgKind::Doodle => "[Vẽ hình]".to_owned(),
-            MsgKind::Location => "[Vị trí]".to_owned(),
-            MsgKind::Ecard => "[Thiệp]".to_owned(),
-            MsgKind::File => format!("[File] {}", msg.file_name),
-            _ => msg.text.replace('\n', " "),
-        };
+        let (who, body) = preview_of(&msg);
         let unpin = msg.id;
-        let jump = msg.clone();
-        div()
-            .id("pinned-bar")
+        let jump_conv = conv.id;
+        let jump_id = msg.id;
+        let mut wrap = div()
+            .id("pinned-bar-wrap")
+            .when(self.pinned_expanded, |el| {
+                el.occlude()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            })
             .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(12.))
+            .flex_col()
+            .flex_none()
             .mx(px(8.))
             .mt(px(8.))
-            .px(px(16.))
-            .h(px(52.))
             .rounded(px(6.))
-            .bg(rgb(token_rgb("--layer-background", "#ffffff")))
+            .bg(rgb(paper))
+            .border_1()
+            .border_color(line)
             .shadow_sm()
-            .cursor_pointer()
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                if jump.kind == MsgKind::Photo {
-                    this.open_viewer(jump.clone(), window, cx);
-                }
-                cx.notify();
-            }))
             .child(
                 div()
-                    .text_color(rgb(crate::color::link_fg()))
-                    .child(fonts::icon_el('\u{EC5B}', "💬", 20.)),
-            )
-            .child(
-                div()
+                    .id("pinned-bar")
                     .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(px(0.))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(14.))
+                    .h(px(52.))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.pinned_expanded = false;
+                        this.jump_to_msg_id(jump_conv, jump_id);
+                        this.flash_msg(jump_id, cx);
+                        cx.notify();
+                    }))
                     .child(
                         div()
-                            .text_size(px(14.))
-                            .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(ink))
-                            .child("Tin nhắn"),
+                            .flex_none()
+                            .text_color(rgb(pin_icon_col))
+                            .child(fonts::icon_el(ic::PIN, "📌", 18.)),
                     )
                     .child(
                         div()
-                            .text_size(px(14.))
-                            .text_color(rgb(ink))
-                            .truncate()
-                            .child(format!("{who}: {body}")),
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .child(if total_pins > 1 {
+                                        format!("Tin nhắn ghim ({total_pins})")
+                                    } else {
+                                        "Tin nhắn ghim".to_owned()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(muted))
+                                    .truncate()
+                                    .child(format!("{who}: {body}")),
+                            ),
+                    )
+                    .when(total_pins > 1, |el| {
+                        let extra = total_pins - 1;
+                        el.child(
+                            div()
+                                .id("pinned-toggle-more")
+                                .flex_none()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.))
+                                .h(px(28.))
+                                .px(px(10.))
+                                .rounded(px(4.))
+                                .bg(rgb(subtle_bg))
+                                .hover(|st| st.bg(rgb(hover_bg)))
+                                .text_size(px(12.))
+                                .font_family(FAMILY_SEMIBOLD)
+                                .text_color(rgb(ink))
+                                .cursor_pointer()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.pinned_expanded = !this.pinned_expanded;
+                                    cx.notify();
+                                }))
+                                .child(if expanded {
+                                    "Thu gọn ▴".to_owned()
+                                } else {
+                                    format!("+{extra} ghim ▾")
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("pinned-unpin")
+                            .flex_none()
+                            .px(px(8.))
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .text_size(px(12.5))
+                            .text_color(rgb(muted))
+                            .hover(|st| st.bg(rgb(hover_bg)).text_color(rgb(ink)))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.pinned_msgs.remove(&unpin);
+                                let found = this
+                                    .messages
+                                    .values()
+                                    .find_map(|list| list.iter().find(|m| m.id == unpin).cloned());
+                                if let Some(m) = found {
+                                    if let Some(conv) = this.conv(m.conv).cloned() {
+                                        if conv.is_group {
+                                            if let Some(gmi) = m.global_msg_id {
+                                                this.maybe_live(
+                                                    crate::bridge::LiveAction::UnpinBoard {
+                                                        thread_id: conv.thread_id,
+                                                        topic_id: gmi.to_string(),
+                                                        board_version: 0,
+                                                    },
+                                                );
+                                            }
+                                        } else {
+                                            this.sync_friend_pin(conv.id, &m, false, cx);
+                                        }
+                                    }
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .child("Bỏ ghim"),
                     ),
-            )
-            .child(
-                div()
-                    .id("pinned-unpin")
-                    .px(px(8.))
-                    .h(px(28.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(4.))
-                    .text_size(px(13.))
-                    .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.pinned_msgs.remove(&unpin);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))
-                    .child("Bỏ ghim"),
-            )
-            .into_any_element()
+            );
+        if expanded {
+            let mut list_box = div()
+                .id("pinned-expanded-list")
+                .flex()
+                .flex_col()
+                .border_t_1()
+                .border_color(line)
+                .max_h(px(210.))
+                .overflow_y_scroll();
+            for item in pinned_list.into_iter().skip(1) {
+                let (i_who, i_body) = preview_of(&item);
+                let i_id = item.id;
+                let i_conv = conv.id;
+                list_box = list_box.child(
+                    div()
+                        .id(("pinned-row", i_id))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(14.))
+                        .h(px(42.))
+                        .border_b_1()
+                        .border_color(line)
+                        .cursor_pointer()
+                        .hover(|st| st.bg(rgb(hover_bg)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.pinned_expanded = false;
+                            this.jump_to_msg_id(i_conv, i_id);
+                            this.flash_msg(i_id, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_color(rgb(muted))
+                                .child(fonts::icon_el(ic::PIN, "📌", 15.)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(px(13.))
+                                .text_color(rgb(ink))
+                                .truncate()
+                                .child(format!("{i_who}: {i_body}")),
+                        )
+                        .child(
+                            div()
+                                .id(("pinned-row-unpin", i_id))
+                                .flex_none()
+                                .px(px(8.))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .rounded(px(4.))
+                                .text_size(px(12.))
+                                .text_color(rgb(muted))
+                                .hover(|st| st.bg(rgb(subtle_bg)).text_color(rgb(ink)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.pinned_msgs.remove(&i_id);
+                                    if let Some(m) = this
+                                        .messages
+                                        .get(&i_conv)
+                                        .and_then(|l| l.iter().find(|m| m.id == i_id).cloned())
+                                    {
+                                        if let Some(conv) = this.conv(i_conv).cloned() {
+                                            if conv.is_group {
+                                                if let Some(gmi) = m.global_msg_id {
+                                                    this.maybe_live(
+                                                        crate::bridge::LiveAction::UnpinBoard {
+                                                            thread_id: conv.thread_id,
+                                                            topic_id: gmi.to_string(),
+                                                            board_version: 0,
+                                                        },
+                                                    );
+                                                }
+                                            } else {
+                                                this.sync_friend_pin(conv.id, &m, false, cx);
+                                            }
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("Bỏ ghim"),
+                        ),
+                );
+            }
+            wrap = wrap.child(list_box);
+        }
+        wrap.into_any_element()
     }
 
     fn header(&self, conv: Option<&ChatConv>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1004,14 +1189,14 @@ impl ShellView {
                 let input_h = if vis_lines <= 1 {
                     COMPOSER_INPUT_H
                 } else {
-                    (vis_lines as f32 * 22.5 + 20.0).max(COMPOSER_INPUT_H)
+                    (vis_lines as f32 * 22.5 + 22.0).max(COMPOSER_INPUT_H)
                 };
                 div()
                     .id("chatInput")
                     .flex()
                     .flex_row()
                     .when(vis_lines <= 1, |el| el.items_center())
-                    .when(vis_lines > 1, |el| el.items_end().py(px(8.)))
+                    .when(vis_lines > 1, |el| el.items_end().py(px(10.)))
                     .flex_none()
                     .h(px(input_h))
                     .px(px(12.))
@@ -1103,12 +1288,12 @@ impl ShellView {
                                 )
                                 .into_any_element()
                             } else {
-                                like_el(20.)
+                                like_el(if self.like_hold.is_some() { 24. } else { 20. })
                             },
                             if draft_ready {
                                 str_vi("STR_SEND", "Gửi")
                             } else {
-                                "Gửi nhanh biểu tượng cảm xúc"
+                                "Nhấn gửi nhanh · Giữ lâu để phóng to"
                             },
                             cx,
                             if draft_ready {
@@ -1521,7 +1706,7 @@ impl ShellView {
         side: ComposerSide,
     ) -> gpui::Stateful<gpui::Div> {
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
-        div()
+        let base = div()
             .id(id)
             .flex()
             .flex_none()
@@ -1532,29 +1717,53 @@ impl ShellView {
             .text_color(rgb(token_rgb("--icon-primary", "#081b3a")))
             .cursor_pointer()
             .hover(|st| st.bg(rgb(hover)))
-            .tooltip(move |_, cx| tip(label, cx))
-            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                match side {
-                    ComposerSide::Like => {
-                        this.send_draft("👍", cx);
-                        this.spawn_react_burst(e.position(), 0, window, cx);
-                    }
-                    ComposerSide::Send => {
-                        let text = this.composer.read(cx).text();
-                        this.send_draft(&text, cx);
-                        this.composer.update(cx, |input, cx| input.clear(cx));
-                    }
-                    ComposerSide::Emoji => {
-                        this.sticker_open = !this.sticker_open;
-                        this.sticker_tab = crate::stickers::StickerTab::Emoji;
-                        if this.sticker_open {
-                            this.ensure_sticker_data(cx);
-                        }
-                    }
-                }
+            .tooltip(move |_, cx| tip(label, cx));
+        let base = match side {
+            ComposerSide::Like => base
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, e: &gpui::MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.dismiss_floating_panels();
+                        this.start_like_hold(e.position, cx);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.finish_like_hold(window, cx);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.finish_like_hold(window, cx);
+                        cx.notify();
+                    }),
+                ),
+            ComposerSide::Send => base.on_click(cx.listener(|this, _, _, cx| {
+                let text = this.composer.read(cx).text();
+                this.send_draft(&text, cx);
+                this.composer.update(cx, |input, cx| input.clear(cx));
                 cx.notify();
-            }))
-            .child(content)
+            })),
+            ComposerSide::Emoji => base
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let opening = !this.sticker_open;
+                    this.quick_menu = false;
+                    this.format_open = false;
+                    this.sticker_open = opening;
+                    this.sticker_tab = crate::stickers::StickerTab::Emoji;
+                    if opening {
+                        this.ensure_sticker_data(cx);
+                    }
+                    cx.notify();
+                })),
+        };
+        base.child(content)
     }
 
     fn tool_btn(
@@ -1582,6 +1791,13 @@ impl ShellView {
             .cursor_pointer()
             .hover(|style| style.bg(rgb(hover)))
             .tooltip(move |_, cx| tip(tip_label.clone(), cx))
+            .when(
+                matches!(
+                    action,
+                    ToolAction::Sticker | ToolAction::QuickReply | ToolAction::Format
+                ),
+                |el| el.on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+            )
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 match action {
                     ToolAction::Sticker => {
@@ -1804,6 +2020,8 @@ impl ShellView {
         Some(
             div()
                 .id("format-strip")
+                .occlude()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2210,6 +2428,7 @@ pub(crate) enum MsgRowItem {
     LoadOlder(usize),
     LoadOlderCloud,
     DateChip(String),
+    UnreadDivider(u32),
     Bubble {
         msg_idx: usize,
         album_start: usize,
@@ -2226,7 +2445,14 @@ impl ShellView {
         let all = self.messages_of(row.id);
         let hidden = all.len().saturating_sub(self.msg_window);
         let msgs: &[ChatMsg] = &all[hidden..];
-        let mut items: Vec<MsgRowItem> = Vec::with_capacity(msgs.len() + 8);
+        let mut items: Vec<MsgRowItem> = Vec::with_capacity(msgs.len() + 10);
+        let mut row_ids: Vec<(usize, u64)> = Vec::with_capacity(msgs.len());
+        let mut divider_row: Option<usize> = None;
+        let unread_marker = self
+            .unread_anchor
+            .as_ref()
+            .filter(|a| a.conv_id == row.id)
+            .map(|a| (a.first_unread_msg_id, a.initial_count));
         if hidden > 0 {
             items.push(MsgRowItem::LoadOlder(hidden));
         } else if row.is_group
@@ -2259,17 +2485,29 @@ impl ShellView {
             }
             let album_end = data::photo_album_end(msgs, i);
             let span = if album_end > i + 1 { album_end } else { i + 1 };
+            let mut starts_unread = false;
+            if let Some((first_unread_id, unread_total)) = unread_marker {
+                if divider_row.is_none() && msgs[i..span].iter().any(|m| m.id == first_unread_id) {
+                    divider_row = Some(items.len());
+                    items.push(MsgRowItem::UnreadDivider(unread_total));
+                    starts_unread = true;
+                }
+            }
             let head = &msgs[i];
             let tail = &msgs[span - 1];
-            let prev = if new_day {
+            let prev = if new_day || starts_unread {
                 None
             } else {
                 i.checked_sub(1).and_then(|j| msgs.get(j))
             };
             let next = msgs.get(span);
-            let first = prev.is_none_or(|p| !same_block(p, head)) || i == 0;
+            let first = prev.is_none_or(|p| !same_block(p, head)) || i == 0 || starts_unread;
             let last = next.is_none_or(|n| !same_block(tail, n));
             let has_status_pill = row.live && tail.from_me && Some(tail.id) == last_own_id;
+            let bubble_row_ix = items.len();
+            for m in &msgs[i..span] {
+                row_ids.push((bubble_row_ix, m.id));
+            }
             items.push(MsgRowItem::Bubble {
                 msg_idx: hidden + span - 1,
                 album_start: hidden + i,
@@ -2282,6 +2520,10 @@ impl ShellView {
         }
         if !msgs.is_empty() {
             items.push(MsgRowItem::BottomSpacer);
+        }
+        if self.selected == Some(row.id) {
+            *self.msg_row_ids.borrow_mut() = row_ids;
+            self.unread_divider_row.set(divider_row);
         }
         (hidden, items)
     }
@@ -2334,6 +2576,16 @@ impl ShellView {
             &self.prefs.str("chatWallpaperPath", ""),
         )
         .and_then(|path| self.wallpaper_image(path));
+        let drop_border = if crate::color::is_dark() {
+            rgb(0x888888)
+        } else {
+            rgb(token_rgb("--B55", "#0068ff"))
+        };
+        let drop_veil = if crate::color::is_dark() {
+            gpui::rgba(0xFFFFFF10)
+        } else {
+            gpui::rgba(0x0068FF10)
+        };
         div()
             .id("message-view")
             .relative()
@@ -2344,39 +2596,68 @@ impl ShellView {
             .min_w(px(0.))
             .min_h(px(0.))
             .overflow_hidden()
+            .drag_over::<gpui::ExternalPaths>(move |st, _, _, _| {
+                st.border_2().border_color(drop_border).bg(drop_veil)
+            })
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                this.handle_dropped_paths(paths.paths().to_vec());
+                cx.notify();
+            }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    if this.dismiss_floating_panels() {
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
                     if this.select_msgs.is_some() {
                         return;
                     }
-                    let hit = this.chat_sel_reg.borrow().hit_test_exact(e.position);
+                    let hit = this
+                        .chat_sel_reg
+                        .borrow()
+                        .hit_test_near(e.position, 12.0, 6.0);
                     if let Some(hit) = hit {
                         if e.click_count >= 3 {
-                            if let Some(len) = this
+                            if let Some(full) = this
                                 .chat_sel_reg
                                 .borrow()
                                 .block_text(hit.key)
-                                .map(str::len)
+                                .map(str::to_owned)
                             {
+                                let len = full.len();
                                 this.chat_sel
                                     .select_range(conv_id, hit.key, hit.order, 0..len);
                                 this.chat_sel.suppress_next_click = true;
+                                let trimmed = full.trim().to_owned();
+                                if !trimmed.is_empty() {
+                                    this.partial_quote_fab =
+                                        Some((hit.key.msg_id, trimmed, e.position));
+                                    cx.stop_propagation();
+                                }
                                 window.focus(&this.root_focus);
                                 cx.notify();
                             }
                         } else if e.click_count == 2 {
                             // Double-clicking text always selects the word instead of
                             // triggering double-click reply.
-                            let range = this
-                                .chat_sel_reg
-                                .borrow()
-                                .block_text(hit.key)
-                                .map(|text| crate::chat_select::word_bounds_at(text, hit.offset));
-                            if let Some(range) = range {
+                            let picked = this.chat_sel_reg.borrow().block_text(hit.key).map(
+                                |text| {
+                                    let r = crate::chat_select::word_bounds_at(text, hit.offset);
+                                    let snip = text[r.clone()].trim().to_owned();
+                                    (r, snip)
+                                },
+                            );
+                            if let Some((range, snip)) = picked {
                                 this.chat_sel
                                     .select_range(conv_id, hit.key, hit.order, range);
                                 this.chat_sel.suppress_next_click = true;
+                                if !snip.is_empty() {
+                                    this.partial_quote_fab =
+                                        Some((hit.key.msg_id, snip, e.position));
+                                    cx.stop_propagation();
+                                }
                                 window.focus(&this.root_focus);
                                 cx.notify();
                             }
@@ -2416,7 +2697,7 @@ impl ShellView {
             }))
             .on_mouse_up(
                 gpui::MouseButton::Left,
-                cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                cx.listener(move |this, e: &gpui::MouseUpEvent, window, cx| {
                     let was_drag = this.chat_sel.drag_moved;
                     let had_press = this.chat_sel.dragging;
                     let changed = this.chat_sel.finish_drag();
@@ -2444,11 +2725,29 @@ impl ShellView {
                                         cx.notify();
                                     }
                                 }
+                                Some(crate::chat_select::InlineHit::Phone(phone)) => {
+                                    this.chat_sel.suppress_next_click = true;
+                                    this.open_menu(MenuKind::Phone { phone }, e.position, window);
+                                    cx.notify();
+                                }
                                 None => {}
                             }
                         }
                     }
-                    if changed {
+                    if this.select_msgs.is_none() && this.chat_sel.has_selection() {
+                        if let (Some((start, _)), Some(snippet)) =
+                            (this.chat_sel.ordered(), this.selected_chat_text())
+                        {
+                            let trimmed = snippet.trim().to_owned();
+                            if !trimmed.is_empty() {
+                                this.partial_quote_fab =
+                                    Some((start.key.msg_id, trimmed, e.position));
+                            }
+                        }
+                    } else {
+                        this.partial_quote_fab = None;
+                    }
+                    if changed || this.partial_quote_fab.is_some() {
                         cx.notify();
                     }
                 }),
@@ -2556,6 +2855,9 @@ impl ShellView {
                                     .into_any_element()
                             }
                             MsgRowItem::DateChip(chip) => date_chip(chip).into_any_element(),
+                            MsgRowItem::UnreadDivider(count) => {
+                                unread_separator_row(*count).into_any_element()
+                            }
                             MsgRowItem::Bubble {
                                 msg_idx,
                                 album_start,
@@ -2591,11 +2893,26 @@ impl ShellView {
                                 div().h(px(48.)).w_full().flex_none().into_any_element()
                             }
                         };
+                        let row_hl = matches!(item, MsgRowItem::Bubble { msg_idx, .. } if {
+                            this.messages_of(conv_id)
+                                .get(*msg_idx)
+                                .is_some_and(|m| this.is_msg_highlighted(m.id))
+                        });
+                        let hl_bg = if crate::color::is_dark() {
+                            gpui::rgba(0xFFFFFF18)
+                        } else {
+                            gpui::rgba(0x0068FF14)
+                        };
                         div()
                             .w_full()
-                            .px(px(16.))
                             .when(ix == 0, |el| el.pt(px(12.)))
-                            .child(inner)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px(px(16.))
+                                    .when(row_hl, |el| el.bg(hl_bg))
+                                    .child(inner),
+                            )
                             .into_any_element()
                     }),
                 )
@@ -2603,72 +2920,260 @@ impl ShellView {
                 .w_full()
                 .min_h(px(0.)),
             )
-            .when(self.chat_scrolled_up, |el| {
+            .when(self.unread_above_count(conv_id) > 0, |el| {
+                let unread_above = self.unread_above_count(conv_id);
+                let dark = crate::color::is_dark();
                 let paper = token_rgb("--layer-background", "#ffffff");
                 let hover = token_rgb("--layer-background-hover", "#f1f2f4");
                 let icon_col = token_rgb("--icon-secondary", "#5a6981");
-                let blue = token_rgb("--B55", "#0068ff");
+                let icon_hover = if dark {
+                    0xff_ffff
+                } else {
+                    token_rgb("--B55", "#0068ff")
+                };
+                let badge_bg = if dark {
+                    token_rgb("--R55", "#c31818")
+                } else {
+                    token_rgb("--B55", "#0068ff")
+                };
                 let line = crate::color::border_subtle();
-                let badge = self.chat_unread_below;
+                let label = format_nav_counter(unread_above);
+                let tip_txt = format!("Đi tới {unread_above} tin nhắn chưa đọc");
                 el.child(
                     div()
-                        .id("chat-scroll-bottom-wrap")
+                        .id("chat-jump-unread-wrap")
                         .absolute()
+                        .top(px(14.))
                         .right(px(16.))
-                        .bottom(px(14.))
+                        .pb(px(8.))
                         .child(
                             div()
-                                .id("chat-scroll-bottom")
+                                .id("chat-jump-unread")
                                 .relative()
-                                .size(px(36.))
-                                .rounded(px(18.))
-                                .bg(rgb(paper))
-                                .border_1()
-                                .border_color(line)
-                                .shadow_sm()
                                 .flex()
                                 .flex_col()
                                 .items_center()
-                                .justify_center()
+                                .occlude()
                                 .cursor_pointer()
-                                .text_color(rgb(icon_col))
-                                .hover(|st| st.bg(rgb(hover)).text_color(rgb(blue)))
-                                .tooltip(|_, cx| tip("Cuộn xuống tin nhắn mới nhất", cx))
+                                .tooltip(move |_, cx| tip(&tip_txt, cx))
+                                .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.chat_scrolled_up = false;
-                                    this.chat_unread_below = 0;
-                                    this.scroll_msgs_to_bottom();
+                                    cx.stop_propagation();
+                                    let target = this
+                                        .unread_anchor
+                                        .as_ref()
+                                        .filter(|a| Some(a.conv_id) == this.selected)
+                                        .map(|a| a.first_unread_msg_id);
+                                    this.jump_to_first_unread();
+                                    if let Some(mid) = target {
+                                        this.flash_msg(mid, cx);
+                                    }
                                     cx.notify();
                                 }))
-                                .child(fonts::icon_el(ic::CHEVRON_DOUBLE_DOWN, "⌄", 19.))
-                                .when(badge > 0, |btn| {
-                                    let label = if badge > 99 {
-                                        "99+".to_owned()
-                                    } else {
-                                        badge.to_string()
-                                    };
-                                    btn.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(-7.))
-                                            .right(px(-2.))
-                                            .min_w(px(18.))
-                                            .h(px(18.))
-                                            .px(px(4.))
-                                            .rounded(px(9.))
-                                            .bg(rgb(blue))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .text_size(px(11.))
-                                            .font_family(FAMILY_SEMIBOLD)
-                                            .text_color(rgb(0xff_ffff))
-                                            .child(label),
-                                    )
-                                }),
+                                .child(
+                                    div()
+                                        .size(px(40.))
+                                        .rounded(px(20.))
+                                        .bg(rgb(paper))
+                                        .border_1()
+                                        .border_color(line)
+                                        .shadow_md()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .pb(px(2.))
+                                        .text_color(rgb(icon_col))
+                                        .hover(|st| st.bg(rgb(hover)).text_color(rgb(icon_hover)))
+                                        .child(fonts::icon_el(ic::CHEVRON_DOUBLE_UP, "⌃", 22.)),
+                                )
+                                .child(
+                                    div()
+                                        .mt(px(-10.))
+                                        .min_w(px(20.))
+                                        .h(px(18.))
+                                        .px(px(6.))
+                                        .rounded(px(9.))
+                                        .bg(rgb(badge_bg))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(11.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(0xff_ffff))
+                                        .child(label),
+                                ),
                         ),
                 )
             })
+            .when(
+                self.chat_scrolled_up
+                    || !self.new_below_ids.is_empty()
+                    || !self.new_mention_below_ids.is_empty(),
+                |el| {
+                    let dark = crate::color::is_dark();
+                    let paper = token_rgb("--layer-background", "#ffffff");
+                    let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+                    let icon_col = token_rgb("--icon-secondary", "#5a6981");
+                    let icon_hover = if dark {
+                        0xff_ffff
+                    } else {
+                        token_rgb("--B55", "#0068ff")
+                    };
+                    let badge_bg = if dark {
+                        token_rgb("--R55", "#c31818")
+                    } else {
+                        token_rgb("--B55", "#0068ff")
+                    };
+                    let line = crate::color::border_subtle();
+                    let badge = (self.new_below_ids.len() as u32).max(self.chat_unread_below);
+                    let mention_badge = self.new_mention_below_ids.len() as u32;
+                    let tip_bottom = if badge > 0 {
+                        format!("{badge} tin nhắn mới chưa đọc — Cuộn xuống mới nhất")
+                    } else {
+                        "Cuộn xuống tin nhắn mới nhất".to_owned()
+                    };
+                    el.child(
+                        div()
+                            .id("chat-scroll-bottom-wrap")
+                            .absolute()
+                            .right(px(16.))
+                            .bottom(px(16.))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(12.))
+                            .when(mention_badge > 0, |stack| {
+                                let m_label = format_nav_counter(mention_badge);
+                                let m_tip = format!("Có {mention_badge} tin nhắn nhắc đến bạn");
+                                stack.child(
+                                    div()
+                                        .id("chat-jump-mention")
+                                        .relative()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .pt(px(8.))
+                                        .occlude()
+                                        .cursor_pointer()
+                                        .tooltip(move |_, cx| tip(&m_tip, cx))
+                                        .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            let target = this.new_mention_below_ids.first().copied();
+                                            this.jump_to_next_mention_below();
+                                            if let Some(mid) = target {
+                                                this.flash_msg(mid, cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            div()
+                                                .size(px(40.))
+                                                .rounded(px(20.))
+                                                .bg(rgb(paper))
+                                                .border_1()
+                                                .border_color(line)
+                                                .shadow_md()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_color(rgb(icon_col))
+                                                .hover(|st| {
+                                                    st.bg(rgb(hover)).text_color(rgb(icon_hover))
+                                                })
+                                                .child(fonts::icon_el(ic::MENTION_24, "@", 20.)),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(0.))
+                                                .min_w(px(20.))
+                                                .h(px(18.))
+                                                .px(px(6.))
+                                                .rounded(px(9.))
+                                                .bg(rgb(badge_bg))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(0xff_ffff))
+                                                .child(m_label),
+                                        ),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("chat-scroll-bottom")
+                                    .relative()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .when(badge > 0, |d| d.pt(px(8.)))
+                                    .occlude()
+                                    .cursor_pointer()
+                                    .tooltip(move |_, cx| tip(&tip_bottom, cx))
+                                    .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.jump_to_bottom_and_read();
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .size(px(40.))
+                                            .rounded(px(20.))
+                                            .bg(rgb(paper))
+                                            .border_1()
+                                            .border_color(line)
+                                            .shadow_md()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .pt(px(2.))
+                                            .text_color(rgb(icon_col))
+                                            .hover(|st| {
+                                                st.bg(rgb(hover)).text_color(rgb(icon_hover))
+                                            })
+                                            .child(fonts::icon_el(
+                                                ic::CHEVRON_DOUBLE_DOWN,
+                                                "⌄",
+                                                22.,
+                                            )),
+                                    )
+                                    .when(badge > 0, |btn| {
+                                        let label = format_nav_counter(badge);
+                                        btn.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(0.))
+                                                .min_w(px(20.))
+                                                .h(px(18.))
+                                                .px(px(6.))
+                                                .rounded(px(9.))
+                                                .bg(rgb(badge_bg))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(11.))
+                                                .font_family(FAMILY_SEMIBOLD)
+                                                .text_color(rgb(0xff_ffff))
+                                                .child(label),
+                                        )
+                                    }),
+                            ),
+                    )
+                },
+            )
             .when_some(self.mention_popup(cx), |el, pop| el.child(pop))
             .into_any_element()
     }
@@ -2815,6 +3320,9 @@ impl ShellView {
                     .when(clickable, |el| {
                         el.cursor_pointer()
                             .when(!open, |el| el.tooltip(move |_, cx| tip(hover.clone(), cx)))
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                 if event.standard_click() {
                                     let opening = this.receipt_open != Some(msg_id);
@@ -2941,11 +3449,23 @@ impl ShellView {
             && self.msg_search_hits.contains(&row_id);
         let search_focused =
             search_active && self.msg_search_hits.get(self.msg_search_idx) == Some(&row_id);
-        let border_c: gpui::Hsla = if phone.is_some() || search_focused {
-            rgb(token_rgb("--B55", "#0068ff")).into()
-        } else if search_active {
-            if crate::color::is_dark() {
+        let highlighted = self.is_msg_highlighted(row_id);
+        let dark = crate::color::is_dark();
+        let border_c: gpui::Hsla = if phone.is_some() {
+            if dark {
+                crate::color::border_subtle()
+            } else {
+                rgb(token_rgb("--B55", "#0068ff")).into()
+            }
+        } else if search_focused && !highlighted {
+            if dark {
                 hsla(0., 0., 1., 0.35)
+            } else {
+                rgb(token_rgb("--B55", "#0068ff")).into()
+            }
+        } else if search_active && !highlighted {
+            if dark {
+                hsla(0., 0., 1., 0.25)
             } else {
                 rgb(0x66a6ff).into()
             }
@@ -2972,9 +3492,6 @@ impl ShellView {
                 .border_1()
                 .border_color(border_c)
                 .max_w(px(metrics.content_max_w))
-                .when(phone.is_some(), |el| {
-                    el.min_w(px(240.0_f32.min(metrics.content_max_w)))
-                })
                 .when(urgency > 0 && !media, |el| {
                     let (label, bg_c, fg_c) = if urgency >= 2 {
                         if crate::color::is_dark() {
@@ -3084,7 +3601,6 @@ impl ShellView {
         let react_bg = crate::color::token_rgb("--reaction-background", "#ffffff");
         let react_border = crate::color::border_subtle();
         let react_hover_msg = msg.clone();
-        let summary_click_msg = msg.clone();
         let summary_pill = react_summary.map(|(indices, total)| {
             div()
                 .id(("react-summary", row_id))
@@ -3100,11 +3616,13 @@ impl ShellView {
                 .items_center()
                 .gap(px(2.))
                 .cursor_pointer()
+                .tooltip(|_, cx| tip("Xem ai đã bày tỏ cảm xúc", cx))
                 .on_mouse_down(
                     gpui::MouseButton::Left,
-                    cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                    cx.listener(move |this, _: &gpui::MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        this.open_react_picker(summary_click_msg.clone(), e.position, window, false);
+                        this.close_react_picker();
+                        this.react_detail = Some((row_id, None));
                         cx.notify();
                     }),
                 )
@@ -3272,8 +3790,14 @@ impl ShellView {
             .flex_row()
             .flex_none()
             .w_full()
-            .pt(px(if first { 12. } else { 4. }))
-            .pb(px(if has_reacts { 14. } else { 12. }))
+            .when(!highlighted, |el| {
+                el.pt(px(if first { 12. } else { 4. }))
+                    .pb(px(if has_reacts { 14. } else { 12. }))
+            })
+            .when(highlighted, |el| {
+                let pad = if has_reacts { 14. } else { 10. };
+                el.pt(px(pad)).pb(px(pad))
+            })
             .when(selecting.is_some(), |el| el.pl(px(40.)))
             .when(msg.from_me, |el| el.justify_end())
             .when(!msg.from_me, |el| {
@@ -3705,6 +4229,19 @@ impl ShellView {
             self.set_note("Không tìm thấy tin nhắn gốc trong lịch sử đã tải");
             return;
         };
+        let target_id = self
+            .messages_of(msg.conv)
+            .iter()
+            .find(|m| {
+                msg.quote_global_id
+                    .filter(|&g| g > 0)
+                    .is_some_and(|g| m.global_msg_id == Some(g))
+                    || msg
+                        .quote_cli_id
+                        .filter(|&c| c > 0)
+                        .is_some_and(|c| m.cli_msg_id == Some(c))
+            })
+            .map(|m| m.id);
         if new_window > self.msg_window {
             self.msg_window = new_window;
             self.warm_media(msg.conv);
@@ -3713,12 +4250,25 @@ impl ShellView {
             let (hidden, items) = self.build_msg_rows(&conv);
             self.sync_msg_list(conv.id, items.len(), hidden);
         }
-        self.msg_list.scroll_to_reveal_item(child_idx);
+        let reveal_ix = target_id
+            .and_then(|tid| {
+                self.msg_row_ids
+                    .borrow()
+                    .iter()
+                    .find_map(|&(ix, id)| (id == tid).then_some(ix))
+            })
+            .unwrap_or(child_idx);
+        self.msg_list.scroll_to_reveal_item(reveal_ix);
+        if let Some(tid) = target_id {
+            self.flash_msg(tid, cx);
+        }
     }
 
-    /// Select `conv_id` and scroll the chat list to `msg_id` (used by Starred Messages).
+    /// Select `conv_id` and scroll the chat list to `msg_id` (used by Starred Messages & Pinned bar).
     pub(crate) fn jump_to_msg_id(&mut self, conv_id: u64, msg_id: u64) {
-        self.select_conv(conv_id);
+        if self.selected != Some(conv_id) {
+            self.select_conv(conv_id);
+        }
         let Some((new_window, child_idx)) =
             id_scroll_index(self.messages_of(conv_id), self.msg_window, msg_id)
         else {
@@ -3732,7 +4282,13 @@ impl ShellView {
             let (hidden, items) = self.build_msg_rows(&conv);
             self.sync_msg_list(conv.id, items.len(), hidden);
         }
-        self.msg_list.scroll_to_reveal_item(child_idx);
+        let reveal_ix = self
+            .msg_row_ids
+            .borrow()
+            .iter()
+            .find_map(|&(ix, id)| (id == msg_id).then_some(ix))
+            .unwrap_or(child_idx);
+        self.msg_list.scroll_to_reveal_item(reveal_ix);
     }
 
     pub(crate) fn msg_search_has_filter(&self) -> bool {
@@ -3841,7 +4397,7 @@ impl ShellView {
             .collect();
         if !self.msg_search_hits.is_empty() {
             self.msg_search_idx = self.msg_search_hits.len() - 1;
-            self.scroll_to_search_hit();
+            self.scroll_to_search_hit(cx);
         }
         cx.notify();
     }
@@ -3853,19 +4409,19 @@ impl ShellView {
         }
         let next = (self.msg_search_idx as isize + delta).rem_euclid(len as isize) as usize;
         self.msg_search_idx = next;
-        self.scroll_to_search_hit();
+        self.scroll_to_search_hit(cx);
         cx.notify();
     }
 
     fn jump_to_search_hit_id(&mut self, msg_id: u64, cx: &mut Context<Self>) {
         if let Some(pos) = self.msg_search_hits.iter().position(|&id| id == msg_id) {
             self.msg_search_idx = pos;
-            self.scroll_to_search_hit();
+            self.scroll_to_search_hit(cx);
             cx.notify();
         }
     }
 
-    fn scroll_to_search_hit(&mut self) {
+    fn scroll_to_search_hit(&mut self, cx: &mut Context<Self>) {
         let Some(conv_id) = self.selected else {
             return;
         };
@@ -3885,7 +4441,470 @@ impl ShellView {
             let (hidden, items) = self.build_msg_rows(&conv);
             self.sync_msg_list(conv.id, items.len(), hidden);
         }
-        self.msg_list.scroll_to_reveal_item(child_idx);
+        let reveal_ix = self
+            .msg_row_ids
+            .borrow()
+            .iter()
+            .find_map(|&(ix, id)| (id == hit_id).then_some(ix))
+            .unwrap_or(child_idx);
+        self.msg_list.scroll_to_reveal_item(reveal_ix);
+        self.flash_msg(hit_id, cx);
+    }
+
+    /// Official Zalo PC `reaction-popup-container` detail modal showing everyone
+    /// who reacted to a message, grouped by `"Tất cả"` + per-emoji tabs.
+    /// Uses pure black / neutral gray surfaces on Dark Mode (zero blue background).
+    pub(crate) fn react_detail_overlay(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some((msg_id, filter_tab)) = self.react_detail else {
+            return div().into_any_element();
+        };
+        let dark = crate::color::is_dark();
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let subtle = token_rgb("--layer-background-subtle", "#f3f5f8");
+        let hover_bg = token_rgb("--layer-background-hover", "#ebeff5");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let line = crate::color::border_subtle();
+        let active_bar = if dark {
+            rgb(0xF0F0F0)
+        } else {
+            rgb(token_rgb("--B55", "#0068ff"))
+        };
+
+        let mut entries = self.reactions.get(&msg_id).cloned().unwrap_or_default();
+        if entries.is_empty() {
+            let liked = self
+                .messages
+                .values()
+                .find_map(|list| list.iter().find(|m| m.id == msg_id).map(|m| m.liked))
+                .unwrap_or(false);
+            if liked {
+                entries.push(crate::read_sync::MsgReaction {
+                    sender_uid: "me".to_owned(),
+                    r_icon: "/-strong".to_owned(),
+                    r_type: 3,
+                    count: 1,
+                });
+            }
+        }
+        let mut counts_by_preset: [u32; 6] = [0; 6];
+        let mut total_count: u32 = 0;
+        for r in &entries {
+            let idx = crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type);
+            let c = r.count.max(1);
+            counts_by_preset[idx] = counts_by_preset[idx].saturating_add(c);
+            total_count = total_count.saturating_add(c);
+        }
+
+        let mut tabs = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.))
+            .px(px(14.))
+            .border_b_1()
+            .border_color(line)
+            .child(
+                div()
+                    .id("react-tab-all")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(36.))
+                    .px(px(10.))
+                    .border_b_2()
+                    .border_color(if filter_tab.is_none() {
+                        active_bar
+                    } else {
+                        gpui::rgba(0x00000000)
+                    })
+                    .text_size(px(13.))
+                    .when(filter_tab.is_none(), |el| el.font_family(FAMILY_SEMIBOLD))
+                    .text_color(rgb(if filter_tab.is_none() { ink } else { muted }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.react_detail = Some((msg_id, None));
+                        cx.notify();
+                    }))
+                    .child(format!("Tất cả ({total_count})")),
+            );
+
+        for (idx, &cnt) in counts_by_preset.iter().enumerate() {
+            if cnt == 0 {
+                continue;
+            }
+            let active = filter_tab == Some(idx);
+            let icon_el = match media::reaction_icon_by_index(idx) {
+                Some(image) => img(image)
+                    .size(px(16.))
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element(),
+                None => div()
+                    .text_size(px(13.))
+                    .child(crate::read_sync::REACTION_PRESETS[idx].0)
+                    .into_any_element(),
+            };
+            tabs = tabs.child(
+                div()
+                    .id(("react-tab-preset", idx as u64))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.))
+                    .h(px(36.))
+                    .px(px(8.))
+                    .border_b_2()
+                    .border_color(if active {
+                        active_bar
+                    } else {
+                        gpui::rgba(0x00000000)
+                    })
+                    .text_size(px(13.))
+                    .when(active, |el| el.font_family(FAMILY_SEMIBOLD))
+                    .text_color(rgb(if active { ink } else { muted }))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.react_detail = Some((msg_id, Some(idx)));
+                        cx.notify();
+                    }))
+                    .child(icon_el)
+                    .child(cnt.to_string()),
+            );
+        }
+
+        let filtered: Vec<&crate::read_sync::MsgReaction> = entries
+            .iter()
+            .filter(|r| {
+                filter_tab.is_none_or(|want| {
+                    crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type) == want
+                })
+            })
+            .collect();
+
+        let mut rows = div()
+            .id("react-detail-list")
+            .flex()
+            .flex_col()
+            .max_h(px(320.))
+            .py(px(6.))
+            .overflow_y_scroll();
+
+        if filtered.is_empty() {
+            rows = rows.child(
+                div()
+                    .py(px(24.))
+                    .flex()
+                    .justify_center()
+                    .text_size(px(13.))
+                    .text_color(rgb(muted))
+                    .child("Chưa có biểu cảm"),
+            );
+        } else {
+            for (row_i, r) in filtered.into_iter().enumerate() {
+                let preset = crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type);
+                let is_me = r.sender_uid == "me"
+                    || self.self_uid().is_some_and(|me| me == r.sender_uid)
+                    || self.uin.as_deref().is_some_and(|me| me == r.sender_uid);
+                let name = if is_me {
+                    self.display_name
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "Bạn".to_owned())
+                } else {
+                    self.profiles
+                        .map
+                        .get(&r.sender_uid)
+                        .map(|p| p.name.clone())
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            self.friends
+                                .iter()
+                                .find(|f| f.uid == r.sender_uid)
+                                .map(|f| f.name.clone())
+                        })
+                        .unwrap_or_else(|| media::sender_label(&r.sender_uid, &r.sender_uid))
+                };
+                let photo = if is_me {
+                    self.shown_photo(crate::profiles::ME)
+                        .or_else(|| self.self_uid().and_then(|u| self.shown_photo(u)))
+                } else {
+                    self.shown_photo(&r.sender_uid)
+                };
+                let icon_el = match media::reaction_icon_by_index(preset) {
+                    Some(image) => img(image)
+                        .size(px(18.))
+                        .object_fit(ObjectFit::Contain)
+                        .into_any_element(),
+                    None => div()
+                        .text_size(px(15.))
+                        .child(crate::read_sync::REACTION_PRESETS[preset].0)
+                        .into_any_element(),
+                };
+                let uid_key = if is_me {
+                    crate::profiles::ME
+                } else {
+                    r.sender_uid.as_str()
+                };
+                rows = rows.child(
+                    div()
+                        .id(("react-detail-row", row_i as u64))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.))
+                        .px(px(16.))
+                        .h(px(46.))
+                        .hover(|st| st.bg(rgb(hover_bg)))
+                        .child(small_avatar(&name, uid_key, photo))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .text_size(px(14.))
+                                .text_color(rgb(ink))
+                                .truncate()
+                                .child(if is_me {
+                                    format!("{name} (Bạn)")
+                                } else {
+                                    name
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(icon_el)
+                                .when(r.count > 1, |el| {
+                                    el.child(
+                                        div()
+                                            .px(px(5.))
+                                            .h(px(18.))
+                                            .rounded(px(9.))
+                                            .bg(rgb(subtle))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(11.5))
+                                            .font_family(FAMILY_SEMIBOLD)
+                                            .text_color(rgb(ink))
+                                            .child(format!("x{}", r.count)),
+                                    )
+                                }),
+                        ),
+                );
+            }
+        }
+
+        div()
+            .id("react-detail-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000078))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.react_detail = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("react-detail-card")
+                    .w(px(360.))
+                    .rounded(px(8.))
+                    .bg(rgb(paper))
+                    .border_1()
+                    .border_color(line)
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .h(px(46.))
+                            .px(px(16.))
+                            .border_b_1()
+                            .border_color(line)
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .child("Biểu cảm"),
+                            )
+                            .child(
+                                div()
+                                    .id("react-detail-close")
+                                    .size(px(28.))
+                                    .rounded(px(14.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(rgb(muted))
+                                    .hover(|st| st.bg(rgb(hover_bg)).text_color(rgb(ink)))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.react_detail = None;
+                                        cx.notify();
+                                    }))
+                                    .child(fonts::icon_el(ic::CLOSE_LINE, "×", 16.)),
+                            ),
+                    )
+                    .child(tabs)
+                    .child(rows),
+            )
+            .into_any_element()
+    }
+
+    /// Official Zalo PC Partial-Quote floating pill shown right above a selected
+    /// text span inside a message bubble: `[❝ Trích dẫn | Sao chép]`.
+    pub(crate) fn partial_quote_fab_overlay(
+        &self,
+        window: &gpui::Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let Some((msg_id, snippet, pos)) = self.partial_quote_fab.clone() else {
+            return div().into_any_element();
+        };
+        if !self.chat_sel.has_selection() || snippet.is_empty() {
+            return div().into_any_element();
+        }
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let line = crate::color::border_subtle();
+        let vp = window.viewport_size();
+        let pill_w = 196.0_f32;
+        let x = (f32::from(pos.x) - pill_w * 0.5).clamp(12.0, (f32::from(vp.width) - pill_w - 12.0).max(12.0));
+        let y = (f32::from(pos.y) - 46.0).clamp(56.0, (f32::from(vp.height) - 96.0).max(56.0));
+        let quote_snippet = snippet.clone();
+        let copy_snippet = snippet;
+        div()
+            .id("partial-quote-fab")
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .h(px(34.))
+            .px(px(4.))
+            .rounded(px(17.))
+            .bg(rgb(paper))
+            .border_1()
+            .border_color(line)
+            .shadow_md()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .id("partial-quote-btn")
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(13.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(12.5))
+                    .font_family(FAMILY_SEMIBOLD)
+                    .text_color(rgb(ink))
+                    .hover(|st| st.bg(rgb(hover_bg)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let found = this.selected.and_then(|cid| {
+                            this.messages_of(cid)
+                                .iter()
+                                .find(|m| m.id == msg_id)
+                                .cloned()
+                        });
+                        if let Some(mut m) = found {
+                            m.text = quote_snippet.clone();
+                            this.partial_quote_fab = None;
+                            this.chat_sel.clear();
+                            this.begin_reply(m, window, cx);
+                        } else {
+                            this.partial_quote_fab = None;
+                            this.chat_sel.clear();
+                        }
+                        cx.notify();
+                    }))
+                    .child(fonts::icon_el(ic::MSG_QUOTE, "❝", 14.))
+                    .child("Trích dẫn"),
+            )
+            .child(div().w(px(1.)).h(px(16.)).bg(line))
+            .child(
+                div()
+                    .id("partial-copy-btn")
+                    .h(px(26.))
+                    .px(px(10.))
+                    .rounded(px(13.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .text_size(px(12.5))
+                    .font_family(FAMILY_SEMIBOLD)
+                    .text_color(rgb(ink))
+                    .hover(|st| st.bg(rgb(hover_bg)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        crate::clip::copy_text(cx, copy_snippet.clone());
+                        this.partial_quote_fab = None;
+                        this.chat_sel.clear();
+                        this.set_note("Đã sao chép");
+                        cx.notify();
+                    }))
+                    .child(fonts::icon_el('\u{EAC5}', "⧉", 14.))
+                    .child("Sao chép"),
+            )
+            .into_any_element()
+    }
+
+    /// Floating live-scaling yellow 👍 preview shown while holding down `cmp-like`.
+    pub(crate) fn like_hold_overlay(&self, window: &gpui::Window) -> gpui::AnyElement {
+        let Some((started, pos)) = self.like_hold else {
+            return div().into_any_element();
+        };
+        let elapsed_ms = started.elapsed().as_millis();
+        if elapsed_ms < 110 {
+            return div().into_any_element();
+        }
+        let (_tier, size) = Self::like_hold_preview_px(elapsed_ms);
+        let vp = window.viewport_size();
+        let box_w = size + 16.0;
+        let x = (f32::from(pos.x) - box_w * 0.5)
+            .clamp(8.0, (f32::from(vp.width) - box_w - 8.0).max(8.0));
+        let y = (f32::from(pos.y) - size - 36.0)
+            .clamp(48.0, (f32::from(vp.height) - size - 24.0).max(48.0));
+        div()
+            .id("like-hold-preview")
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(box_w))
+            .h(px(box_w))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(like_el(size))
+            .into_any_element()
     }
 
     /// Right drawer "Search in Conversation" matching Zalo Electron/macOS:
@@ -4269,6 +5288,7 @@ impl ShellView {
                     .flex_col()
                     .gap(px(10.))
                     .occlude()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     // "Suggested time >"
                     .child(
                         div()
@@ -4721,6 +5741,7 @@ impl ShellView {
                     .flex()
                     .flex_col()
                     .occlude()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .children(items)
                     .into_any_element(),
             )
@@ -4887,6 +5908,9 @@ impl ShellView {
                                     .items_center()
                                     .justify_between()
                                     .gap(px(4.))
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.msg_search_popup =
@@ -4942,6 +5966,9 @@ impl ShellView {
                                     .items_center()
                                     .justify_between()
                                     .gap(px(4.))
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
                                         if this.msg_search_popup == Some("date") {
@@ -5092,7 +6119,7 @@ impl ShellView {
 
     /// Known display names in the open conversation for accurate `@mention`
     /// highlighting (group members, conversation title, self display name).
-    fn mention_known_names(&self) -> Vec<String> {
+    pub(crate) fn mention_known_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         if let Some(me) = self.display_name.as_deref().filter(|s| !s.trim().is_empty()) {
             names.push(me.trim().to_owned());
@@ -6129,7 +7156,15 @@ impl ShellView {
                 cx,
             ),
             MsgKind::Text => {
-                if let Some(note) = media::phone_note(&msg.text) {
+                if is_standalone_like(&msg.text) {
+                    let tier = self.big_like_sizes.get(&msg.id).copied().unwrap_or(1);
+                    let size = match tier {
+                        3 => 74.0,
+                        2 => 54.0,
+                        _ => 36.0,
+                    };
+                    div().py(px(2.)).child(like_el(size)).into_any_element()
+                } else if let Some(note) = media::phone_note(&msg.text) {
                     self.phone_link_card(msg, msg_idx, &note, ink, muted, metrics, cx)
                 } else if let Some(segments) = crate::code_detect::parse_message_segments(&msg.text)
                 {
@@ -6294,7 +7329,9 @@ impl ShellView {
     }
 
     /// Linked phone: sender as the title, the number as a blue copy link,
-    /// caption underneath. The clock stays on the canvas, outside the card.
+    /// caption underneath. All parts use `SelectableTextElement` with tight
+    /// shrink-to-fit bounds so drag-selection works across the name, number,
+    /// and caption while single-clicking the number opens `MenuKind::Phone`.
     #[allow(clippy::too_many_arguments)]
     fn phone_link_card(
         &self,
@@ -6304,9 +7341,9 @@ impl ShellView {
         ink: u32,
         muted: u32,
         metrics: ChatLayoutMetrics,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let blue = token_rgb("--link", "#0068ff");
+        let link_blue = crate::color::link_fg();
         let from_profile = self
             .profiles
             .map
@@ -6319,50 +7356,44 @@ impl ShellView {
         } else {
             title
         };
-        let number = note.phone.clone();
-        let shown = number.clone();
-        let tip_text = "Sao chép, gọi Zalo hoặc kết bạn".to_owned();
+        let shown = note.phone.clone();
         let caption = note.caption.clone();
         let phone_w = metrics.compact_card_w;
+        let phone_key = crate::chat_select::TextBlockKey {
+            msg_id: msg.id,
+            part: 1,
+        };
+        let phone_order = msg_idx.saturating_mul(8) + 1;
+        let phone_sel = self
+            .chat_sel
+            .range_for_block(phone_key, phone_order, shown.len());
+        let phone_el = crate::chat_select::SelectableTextElement::plain(
+            phone_key,
+            phone_order,
+            shown.clone(),
+            phone_w,
+            15.,
+            22.,
+            rgb(link_blue).into(),
+            bubble_font(),
+            false,
+            self.select_msgs.is_none(),
+            phone_sel,
+            std::rc::Rc::clone(&self.chat_sel_reg),
+        )
+        .with_interactive_spans(vec![0..shown.len()]);
         div()
             .flex()
             .flex_col()
-            .w(px(phone_w))
+            .max_w(px(phone_w))
             .gap(px(2.))
-            .child(
-                div()
-                    .text_size(px(15.))
-                    .line_height(px(22.))
-                    .font_family(FAMILY_SEMIBOLD)
-                    .text_color(rgb(ink))
-                    .child(title),
-            )
-            .child(
-                div()
-                    .id(("phone-link", msg.id))
-                    .cursor_pointer()
-                    .text_size(px(15.))
-                    .line_height(px(22.))
-                    .whitespace_nowrap()
-                    .text_color(rgb(blue))
-                    .tooltip(move |_, cx| tip(tip_text.clone(), cx))
-                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        if event.standard_click() {
-                            this.open_menu(
-                                MenuKind::Phone {
-                                    phone: number.clone(),
-                                },
-                                event.position(),
-                                window,
-                            );
-                            cx.notify();
-                        }
-                    }))
-                    .child(shown),
-            )
+            .child(self.selectable_text(
+                msg.id, msg_idx, 0, &title, phone_w, 15., 22., ink, true,
+            ))
+            .child(phone_el)
             .when(!caption.is_empty(), |el| {
-                el.child(div().mt(px(2.)).child(self.selectable_text(
-                    msg.id, msg_idx, 1, &caption, phone_w, 14., 20., muted, false,
+                el.child(div().mt(px(2.)).child(self.selectable_bubble_text(
+                    msg.id, msg_idx, 2, &caption, muted, phone_w,
                 )))
             })
             .into_any_element()
@@ -7138,6 +8169,11 @@ fn preview_action(
         .child(fonts::icon_el(glyph, fallback, 14.))
 }
 
+/// True when a message body is solely Zalo's quick-like (`/-strong` or `👍`).
+pub(crate) fn is_standalone_like(text: &str) -> bool {
+    matches!(text.trim(), "/-strong" | "👍" | "👍\u{fe0f}")
+}
+
 /// Zalo's yellow like at `size` px, or a text fallback.
 fn like_el(size: f32) -> gpui::AnyElement {
     match media::like_icon() {
@@ -7163,6 +8199,8 @@ impl ShellView {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let mut col = div()
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .mt(px(4.))
             .p(px(10.))
             .w(px(220.0_f32.min(max_w)))
@@ -7264,6 +8302,67 @@ fn timestamp_pill_bg() -> gpui::Hsla {
     } else {
         hsla(0., 0., 0., 0.2)
     }
+}
+
+fn format_nav_counter(count: u32) -> String {
+    if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
+    }
+}
+
+/// Horizontal `"--- N tin nhắn chưa đọc ---"` separator matching official Zalo PC
+/// `.unread-separator-container`, using strictly neutral gray/white surfaces on Dark Mode.
+fn unread_separator_row(count: u32) -> impl IntoElement {
+    let dark = crate::color::is_dark();
+    let line_col = if dark {
+        crate::color::border_subtle()
+    } else {
+        rgb(0xC2D9FF).into()
+    };
+    let pill_bg = if dark {
+        rgb(token_rgb("--layer-background-subtle", "#262626"))
+    } else {
+        rgb(token_rgb("--layer-background", "#ffffff"))
+    };
+    let text_col = if dark {
+        rgb(token_rgb("--text-primary", "#f0f0f0"))
+    } else {
+        rgb(token_rgb("--B55", "#0068ff"))
+    };
+    let label = if count > 1 {
+        format!("{count} tin nhắn chưa đọc")
+    } else {
+        str_vi("STR_UNREAD_MESSAGE", "Tin nhắn chưa đọc").to_owned()
+    };
+    div()
+        .id("unread-separator")
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(8.))
+        .w_full()
+        .pt(px(14.))
+        .pb(px(6.))
+        .px(px(12.))
+        .child(div().flex_1().h(px(1.)).bg(line_col))
+        .child(
+            div()
+                .flex_none()
+                .px(px(12.))
+                .py(px(3.))
+                .rounded(px(14.))
+                .bg(pill_bg)
+                .border_1()
+                .border_color(line_col)
+                .text_size(px(12.))
+                .font_family(FAMILY_SEMIBOLD)
+                .text_color(text_col)
+                .child(label),
+        )
+        .child(div().flex_1().h(px(1.)).bg(line_col))
 }
 
 fn date_chip(label: &str) -> impl IntoElement {
@@ -7790,5 +8889,75 @@ mod tests {
         assert!(!multi.actions_above);
         assert_eq!(multi.row_inner_w, 480.0);
         assert!(ChatLayoutMetrics::AVATAR_SLOT + multi.content_max_w <= multi.row_inner_w + 0.01);
+    }
+
+    #[test]
+    fn nav_counter_and_mention_detection_match_zalo_pc() {
+        assert_eq!(format_nav_counter(1), "1");
+        assert_eq!(format_nav_counter(99), "99");
+        assert_eq!(format_nav_counter(100), "99+");
+        assert_eq!(format_nav_counter(500), "99+");
+
+        assert!(crate::shell::message_mentions_me("@All họp gấp", Some("Trường")));
+        assert!(crate::shell::message_mentions_me("Nhắn @Tất cả nha", Some("Trường")));
+        assert!(crate::shell::message_mentions_me("Anh @Trường xem giúp", Some("Trường")));
+        assert!(!crate::shell::message_mentions_me("Anh @Minh xem giúp", Some("Trường")));
+        assert!(!crate::shell::message_mentions_me("email test@gmail.com", Some("Trường")));
+
+        let tmp = std::env::temp_dir().join("zalo_gpui_drop_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let img_p = tmp.join("sample.PNG");
+        let vid_p = tmp.join("clip.mp4");
+        let doc_p = tmp.join("bao-gia.pdf");
+        let sub_dir = tmp.join("folder");
+        let _ = std::fs::write(&img_p, b"png");
+        let _ = std::fs::write(&vid_p, b"mp4");
+        let _ = std::fs::write(&doc_p, b"pdf");
+        let _ = std::fs::create_dir_all(&sub_dir);
+        let (imgs, vids, files, dirs) = crate::shell::classify_dropped_paths(vec![
+            img_p.clone(),
+            vid_p.clone(),
+            doc_p.clone(),
+            sub_dir.clone(),
+        ]);
+        assert_eq!(imgs, vec![img_p]);
+        assert_eq!(vids, vec![vid_p]);
+        assert_eq!(files, vec![doc_p]);
+        assert_eq!(dirs, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn quick_like_and_phone_inline_hits_work() {
+        assert!(is_standalone_like("/-strong"));
+        assert!(is_standalone_like(" 👍 "));
+        assert!(is_standalone_like("👍\u{fe0f}"));
+        assert!(!is_standalone_like("ok 👍"));
+
+        let like_parts = crate::emoji::split_pictograms("👍");
+        assert!(
+            like_parts
+                .iter()
+                .any(|p| matches!(p, crate::emoji::PictogramPart::Tile(_))),
+            "👍 must map to Zalo's yellow /-strong pictogram tile"
+        );
+        let heart_parts = crate::emoji::split_pictograms("❤️");
+        assert!(
+            heart_parts
+                .iter()
+                .any(|p| matches!(p, crate::emoji::PictogramPart::Tile(_))),
+            "❤️ must map to Zalo's /-heart pictogram tile"
+        );
+
+        let (t1, p1) = ShellView::like_hold_preview_px(100);
+        let (t2, p2) = ShellView::like_hold_preview_px(400);
+        let (t3, p3) = ShellView::like_hold_preview_px(900);
+        assert_eq!((t1, t2, t3), (1, 2, 3));
+        assert!(p1 < p2 && p2 < p3);
+
+        assert_eq!(
+            crate::chat_select::interactive_span_at("0868656872", 3, &[]),
+            Some(crate::chat_select::InlineHit::Phone("0868656872".to_owned()))
+        );
     }
 }

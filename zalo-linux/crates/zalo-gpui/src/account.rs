@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, rgb, ClickEvent, ClipboardItem, Context, Entity, InteractiveElement,
+    div, img, prelude::*, px, rgb, ClickEvent, Context, Entity, InteractiveElement,
     IntoElement, ObjectFit, ParentElement, RenderImage, StatefulInteractiveElement, Styled,
 };
 use serde_json::Value;
@@ -462,125 +462,138 @@ pub(crate) fn decrypt_zdb4_to_dir(
     Ok((files.len(), written))
 }
 
-/// Active tab inside "Group Management".
+/// Active view inside "Group Management" (1:1 with Zalo PC `compact1360.js`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GroupManageTab {
+    /// Main "Quản lý nhóm" checklist, switches, inline link, and admin entries.
     #[default]
     Permissions,
+    /// Sub-page: "Duyệt thành viên".
     Pending,
-    Link,
+    /// Sub-page: "Chặn khỏi nhóm".
+    Blocked,
+    /// Sub-page: "Trưởng & phó nhóm".
+    Admins,
 }
 
-/// Identifier of each group setting switch in `/api/group/setting/update`.
+/// Identifier of each group setting flag in `/api/group/setting/update`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GroupSettingKey {
     BlockName,
-    SignAdminMsg,
+    SetTopicOnly,
     LockCreatePost,
     LockCreatePoll,
-    JoinAppr,
     LockSendMsg,
+    JoinAppr,
+    SignAdminMsg,
+    EnableMsgHistory,
     LockViewMember,
 }
 
-/// Catalogue keys for the seven `/api/group/setting/update` flags.
-/// `blockName` is one field: the rename sentence is the label and the avatar
-/// sentence is the subtitle. There is no separate pin-message flag in the payload.
-const GROUP_SETTING_ROWS: &[(GroupSettingKey, &str, &str)] = &[
+/// Official Zalo PC section 1 ("Cho phép các thành viên trong nhóm:") checkboxes.
+/// Each checkbox is checked when the underlying lock flag is `false` (`0`).
+pub(crate) const MEMBER_ALLOW_CHECKBOXES: &[(GroupSettingKey, &str, &str)] = &[
     (
         GroupSettingKey::BlockName,
-        "STR_TOAST_ADMIN_RENAME",
-        "STR_ADMIN_CHANGE_AVATAR",
+        "STR_ADMIN_CHANGE_NAME",
+        "Thay đổi tên & ảnh đại diện của nhóm",
     ),
-    (GroupSettingKey::SignAdminMsg, "STR_MARK_ADMIN_MESSAGE", ""),
+    (
+        GroupSettingKey::SetTopicOnly,
+        "STE_ADMIN_UPDATE_TOPIC_2",
+        "Ghim tin nhắn, ghi chú, bình chọn lên đầu hội thoại",
+    ),
     (
         GroupSettingKey::LockCreatePost,
-        "STE_ADMIN_CREATE_TOPIC",
-        "",
+        "STE_ADMIN_CREATE_TOPIC_2",
+        "Tạo mới ghi chú, nhắc hẹn",
     ),
-    (GroupSettingKey::LockCreatePoll, "STE_ADMIN_CREATE_POLL", ""),
     (
-        GroupSettingKey::JoinAppr,
-        "STR_ADMIN_MEMBERSHIP_APPROVAL",
-        "",
+        GroupSettingKey::LockCreatePoll,
+        "STE_ADMIN_CREATE_POLL_2",
+        "Tạo mới bình chọn",
     ),
     (
         GroupSettingKey::LockSendMsg,
-        "STR_LOCK_SEND_MESSAGE_MESSAGE_FULL",
-        "",
-    ),
-    (
-        GroupSettingKey::LockViewMember,
-        "STR_GROUP_PRIVACY_HIDE_MEMBER_NOTE",
-        "",
+        "STR_ADMIN_SEND_MESSAGE",
+        "Gửi tin nhắn",
     ),
 ];
 
-fn setting_copy(key: &'static str, fallback: &'static str) -> String {
+pub(crate) fn setting_copy(key: &'static str, fallback: &'static str) -> String {
     crate::color::str_vi(key, fallback).trim().to_owned()
 }
 
-/// Parsed group permission flags from `gridInfoMap.<grid>.setting`.
+/// Parsed group permission flags from `gridInfoMap.<grid>.setting` (1:1 Zalo PC).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GroupSettingsState {
     pub block_name: bool,
     pub sign_admin_msg: bool,
+    pub add_member_only: bool,
+    pub set_topic_only: bool,
+    pub enable_msg_history: bool,
     pub lock_create_post: bool,
     pub lock_create_poll: bool,
     pub join_appr: bool,
     pub lock_send_msg: bool,
     pub lock_view_member: bool,
+    pub bann_feature: bool,
+    pub dirty_media: bool,
+    pub ban_duration: i64,
 }
 
 impl GroupSettingsState {
-    fn get(&self, key: GroupSettingKey) -> bool {
+    pub(crate) fn get(&self, key: GroupSettingKey) -> bool {
         match key {
             GroupSettingKey::BlockName => self.block_name,
-            GroupSettingKey::SignAdminMsg => self.sign_admin_msg,
+            GroupSettingKey::SetTopicOnly => self.set_topic_only,
             GroupSettingKey::LockCreatePost => self.lock_create_post,
             GroupSettingKey::LockCreatePoll => self.lock_create_poll,
-            GroupSettingKey::JoinAppr => self.join_appr,
             GroupSettingKey::LockSendMsg => self.lock_send_msg,
+            GroupSettingKey::JoinAppr => self.join_appr,
+            GroupSettingKey::SignAdminMsg => self.sign_admin_msg,
+            GroupSettingKey::EnableMsgHistory => self.enable_msg_history,
             GroupSettingKey::LockViewMember => self.lock_view_member,
         }
     }
 
-    /// Applies one flag change locally and returns the matching API patch.
+    /// Converts the complete state into a full `/api/group/setting/update` payload
+    /// matching official Zalo PC (`compact1360.js:608`: `Object.assign({}, this.state)`).
+    #[must_use]
+    pub fn to_full_patch(&self) -> GroupSettingsPatch {
+        GroupSettingsPatch {
+            lock_send_msg: Some(i64::from(self.lock_send_msg)),
+            join_appr: Some(i64::from(self.join_appr)),
+            block_name: Some(i64::from(self.block_name)),
+            sign_admin_msg: Some(i64::from(self.sign_admin_msg)),
+            lock_view_member: Some(i64::from(self.lock_view_member)),
+            lock_create_poll: Some(i64::from(self.lock_create_poll)),
+            lock_create_post: Some(i64::from(self.lock_create_post)),
+            set_topic_only: Some(i64::from(self.set_topic_only)),
+            enable_msg_history: Some(i64::from(self.enable_msg_history)),
+            add_member_only: Some(i64::from(self.add_member_only)),
+            bann_feature: Some(i64::from(self.bann_feature)),
+            dirty_media: Some(i64::from(self.dirty_media)),
+            ban_duration: Some(self.ban_duration),
+        }
+    }
+
+    /// Applies one flag change locally and returns the full API patch (1:1 Zalo PC).
     #[must_use]
     pub fn with_change(&self, key: GroupSettingKey, next: bool) -> (Self, GroupSettingsPatch) {
         let mut updated = self.clone();
-        let bit = Some(i64::from(next));
-        let mut patch = GroupSettingsPatch::default();
         match key {
-            GroupSettingKey::BlockName => {
-                updated.block_name = next;
-                patch.block_name = bit;
-            }
-            GroupSettingKey::SignAdminMsg => {
-                updated.sign_admin_msg = next;
-                patch.sign_admin_msg = bit;
-            }
-            GroupSettingKey::LockCreatePost => {
-                updated.lock_create_post = next;
-                patch.lock_create_post = bit;
-            }
-            GroupSettingKey::LockCreatePoll => {
-                updated.lock_create_poll = next;
-                patch.lock_create_poll = bit;
-            }
-            GroupSettingKey::JoinAppr => {
-                updated.join_appr = next;
-                patch.join_appr = bit;
-            }
-            GroupSettingKey::LockSendMsg => {
-                updated.lock_send_msg = next;
-                patch.lock_send_msg = bit;
-            }
-            GroupSettingKey::LockViewMember => {
-                updated.lock_view_member = next;
-                patch.lock_view_member = bit;
-            }
+            GroupSettingKey::BlockName => updated.block_name = next,
+            GroupSettingKey::SetTopicOnly => updated.set_topic_only = next,
+            GroupSettingKey::LockCreatePost => updated.lock_create_post = next,
+            GroupSettingKey::LockCreatePoll => updated.lock_create_poll = next,
+            GroupSettingKey::LockSendMsg => updated.lock_send_msg = next,
+            GroupSettingKey::JoinAppr => updated.join_appr = next,
+            GroupSettingKey::SignAdminMsg => updated.sign_admin_msg = next,
+            GroupSettingKey::EnableMsgHistory => updated.enable_msg_history = next,
+            GroupSettingKey::LockViewMember => updated.lock_view_member = next,
         }
+        let patch = updated.to_full_patch();
         (updated, patch)
     }
 }
@@ -618,11 +631,17 @@ pub fn group_settings_from(value: &Value) -> GroupSettingsState {
     GroupSettingsState {
         block_name: json_flag(s, "blockName"),
         sign_admin_msg: json_flag(s, "signAdminMsg"),
+        add_member_only: json_flag(s, "addMemberOnly"),
+        set_topic_only: json_flag(s, "setTopicOnly"),
+        enable_msg_history: json_flag(s, "enableMsgHistory"),
         lock_create_post: json_flag(s, "lockCreatePost"),
         lock_create_poll: json_flag(s, "lockCreatePoll"),
         join_appr: json_flag(s, "joinAppr"),
         lock_send_msg: json_flag(s, "lockSendMsg"),
         lock_view_member: json_flag(s, "lockViewMember"),
+        bann_feature: json_flag(s, "bannFeature"),
+        dirty_media: json_flag(s, "dirtyMedia"),
+        ban_duration: field_i64(s, "banDuration").unwrap_or(0),
     }
 }
 
@@ -720,18 +739,47 @@ pub fn group_link_from(value: &Value) -> GroupLinkState {
     GroupLinkState { url, enabled }
 }
 
+/// Human-readable summary of `/api/group/analyse` response when stats are present.
+pub(crate) fn group_analyse_summary(value: &Value) -> Option<String> {
+    let root = value.get("data").filter(|v| v.is_object()).unwrap_or(value);
+    let num = |keys: &[&str]| -> Option<i64> {
+        keys.iter().find_map(|k| {
+            root.get(*k).and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+        })
+    };
+    let mut parts = Vec::new();
+    if let Some(m) = num(&["totalMsg", "msgCount", "totalMessages"]) {
+        parts.push(format!("{m} tin nhắn"));
+    }
+    if let Some(a) = num(&["activeMembers", "activeCount", "totalActive"]) {
+        parts.push(format!("{a} thành viên hoạt động"));
+    }
+    if let Some(n) = num(&["newMembers", "newMemberCount"]) {
+        parts.push(format!("+{n} mới"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("Thống kê: {}", parts.join(" · ")))
+    }
+}
+
 /// "Group Management" modal state.
 pub struct GroupManageDlg {
     pub(crate) conv_id: u64,
     pub(crate) thread_id: String,
-    pub(crate) name: String,
     pub(crate) loading: bool,
     pub(crate) creator: String,
     pub(crate) admins: Vec<String>,
+    /// Loaded `(uid, name)` members from `getgi/v2` for inline Admin/Block pickers.
+    pub(crate) members: Vec<(String, String)>,
     pub(crate) member_count: usize,
-    pub(crate) leave_armed: bool,
-    /// Second click sends `silent: 1` when this is set.
-    pub(crate) leave_silent: bool,
+    pub(crate) adding_admin: bool,
+    pub(crate) adding_block: bool,
+    pub(crate) owner_transfer_armed: Option<String>,
     /// Second click calls `/api/group/disperse`. Owner only. Never fired from tests.
     pub(crate) disperse_armed: bool,
     /// `type` from `getgi/v2`. `None` until the server answers.
@@ -751,6 +799,10 @@ pub struct GroupManageDlg {
     pub(crate) pending: Vec<PendingMember>,
     pub(crate) link_loading: bool,
     pub(crate) link: GroupLinkState,
+    pub(crate) blocked_loading: bool,
+    pub(crate) blocked_members: Vec<zalo_client::BlockedGroupMember>,
+    /// Optional summary parsed from `/api/group/analyse`.
+    pub(crate) analyse_summary: Option<String>,
     /// Failure of the pending or link tab. Kept off the permissions banner.
     pub(crate) tab_note: Option<String>,
     pub(crate) error: Option<String>,
@@ -834,13 +886,14 @@ impl ShellView {
         self.dialog = Some(Dialog::GroupManage(GroupManageDlg {
             conv_id,
             thread_id: conv.thread_id,
-            name: conv.name,
             loading: can_fetch,
             creator: String::new(),
             admins: Vec::new(),
+            members: Vec::new(),
             member_count: cached_count,
-            leave_armed: false,
-            leave_silent: false,
+            adding_admin: false,
+            adding_block: false,
+            owner_transfer_armed: None,
             disperse_armed: false,
             group_type: None,
             total_member: None,
@@ -859,8 +912,11 @@ impl ShellView {
             settings_busy: false,
             pending_loading: false,
             pending: Vec::new(),
-            link_loading: false,
+            link_loading: can_fetch,
             link: GroupLinkState::default(),
+            blocked_loading: false,
+            blocked_members: Vec::new(),
+            analyse_summary: None,
             tab_note: None,
             error: (!can_fetch).then(|| "Chế độ xem trước — chưa nối máy chủ".to_owned()),
         }));
@@ -880,16 +936,19 @@ impl ShellView {
                             .get_group_info_v2(&tid, 1)
                             .await
                             .map_err(|e| e.to_string())?;
+                        let link = api.get_group_link_detail(&tid).await.ok();
                         let ttl = api.get_auto_delete_conversations().await.ok();
                         let quota = api.get_community_quota(Some(&tid), lang).await.ok();
-                        Ok((info, ttl, quota))
+                        let analyse = api.get_group_analyse(&tid).await.ok();
+                        Ok((info, link, ttl, quota, analyse))
                     })
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 let mine = view.self_member_ids();
                 let mut admin = false;
-                if let Ok((_, Some(ref ttl_val), _)) = res {
+                let mut link_url_to_store: Option<String> = None;
+                if let Ok((_, _, Some(ref ttl_val), _, _)) = res {
                     for (k, v) in autodelete_map_from(ttl_val) {
                         view.auto_delete_ttl.insert(k, v);
                     }
@@ -897,17 +956,32 @@ impl ShellView {
                 if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
                     if d.conv_id == conv_id {
                         d.loading = false;
+                        d.link_loading = false;
                         match res {
-                            Ok((val, ttl, quota)) => {
+                            Ok((val, link_val, ttl, quota, analyse)) => {
                                 let (list, creator, admins) = crate::info::members_from(&val);
                                 d.creator = creator;
                                 d.admins = admins;
+                                d.members = list
+                                    .iter()
+                                    .map(|(uid, name, _)| (uid.clone(), name.clone()))
+                                    .collect();
                                 d.settings = group_settings_from(&val);
+                                if let Some(lv) = link_val.as_ref() {
+                                    let parsed = group_link_from(lv);
+                                    link_url_to_store = Some(if parsed.enabled {
+                                        parsed.url.clone()
+                                    } else {
+                                        String::new()
+                                    });
+                                    d.link = parsed;
+                                }
                                 let (kind, total) = group_kind_from(&val);
                                 d.group_type = kind;
                                 d.total_member = total;
                                 d.community_quota =
                                     quota.as_ref().and_then(community_quota_summary);
+                                d.analyse_summary = analyse.as_ref().and_then(group_analyse_summary);
                                 if let Some(value) = ttl.as_ref() {
                                     d.ttl_ms = zalo_client::features::autodelete_ttl_ms(
                                         value,
@@ -917,8 +991,7 @@ impl ShellView {
                                 if !list.is_empty() {
                                     d.member_count = list.len();
                                 }
-                                // Electron `getPendingMember` runs only for owner/admin.
-                                // A regular member gets Zalo 114 "Invalid parameters".
+                                // Electron `getPendingMember` & `blockedmems/list` run for owner/admin.
                                 admin =
                                     group_role_label(&mine, &d.creator, &d.admins) != "Thành viên";
                             }
@@ -926,8 +999,12 @@ impl ShellView {
                         }
                     }
                 }
+                if let Some(url) = link_url_to_store {
+                    view.info_join.insert(conv_id, url);
+                }
                 if admin {
                     view.load_group_pending(conv_id, cx);
+                    view.load_group_blocked_members(conv_id, cx);
                 }
                 cx.notify();
             });
@@ -935,6 +1012,7 @@ impl ShellView {
         .detach();
     }
 
+    /// Renders the 1:1 official Zalo PC "Quản lý nhóm" slide-in panel (`compact1360.js` + `compact1707.js`).
     pub(crate) fn group_manage_el(
         &self,
         d: &GroupManageDlg,
@@ -943,59 +1021,13 @@ impl ShellView {
     ) -> impl IntoElement {
         let paper = token_rgb("--layer-background", "#ffffff");
         let ink = token_rgb("--text-primary", "#081b3a");
-        let muted = token_rgb("--text-secondary", "#5a6981");
-        let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
         let hover = token_rgb("--layer-background-hover", "#f1f2f4");
-        let danger = token_rgb("--R60", "#c31818");
-        let blue = token_rgb("--B55", "#0068ff");
-        let mine = self.self_member_ids();
-        let role = if d.loading {
-            "Đang kiểm tra…".to_owned()
-        } else {
-            group_role_label(&mine, &d.creator, &d.admins).to_owned()
-        };
-        let grid = d
-            .thread_id
-            .strip_prefix("g_")
-            .unwrap_or(&d.thread_id)
-            .to_owned();
-        let add_grid = grid.clone();
-        let add_name = d.name.clone();
-        let conv_id = d.conv_id;
-        let leave_label = if d.leave_armed {
-            "Xác nhận rời nhóm"
-        } else {
-            "Rời nhóm"
-        };
-        let owner = !d.loading && role == "Trưởng nhóm";
-        let community = is_community(d.group_type, d.total_member);
-        let disperse_label = if d.disperse_armed {
-            "Xác nhận giải tán nhóm"
-        } else {
-            "Giải tán nhóm"
-        };
-        let community_label = if d.community_armed {
-            "Xác nhận nâng cấp cộng đồng"
-        } else {
-            "Nâng cấp thành cộng đồng"
-        };
-
-        let action_btn = |id: &'static str, label: &'static str, is_danger: bool| {
-            div()
-                .id(id)
-                .h(px(38.))
-                .px(px(12.))
-                .rounded(px(4.))
-                .bg(rgb(subtle))
-                .hover(move |st| st.bg(rgb(hover)))
-                .flex()
-                .items_center()
-                .justify_between()
-                .cursor_pointer()
-                .text_size(px(14.))
-                .text_color(rgb(if is_danger { danger } else { ink }))
-                .child(label)
-                .child(fonts::icon_el('\u{EA95}', "›", 16.))
+        let is_subpage = d.tab != GroupManageTab::Permissions;
+        let title = match d.tab {
+            GroupManageTab::Permissions => "Quản lý nhóm",
+            GroupManageTab::Pending => "Duyệt thành viên",
+            GroupManageTab::Blocked => "Chặn khỏi nhóm",
+            GroupManageTab::Admins => "Trưởng & phó nhóm",
         };
 
         corners
@@ -1036,8 +1068,18 @@ impl ShellView {
                             .justify_center()
                             .cursor_pointer()
                             .hover(move |st| st.bg(rgb(hover)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.dialog = None;
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if is_subpage {
+                                    if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
+                                        dlg.tab = GroupManageTab::Permissions;
+                                        dlg.adding_admin = false;
+                                        dlg.adding_block = false;
+                                        dlg.owner_transfer_armed = None;
+                                        dlg.tab_note = None;
+                                    }
+                                } else {
+                                    this.dialog = None;
+                                }
                                 cx.notify();
                             }))
                             .child(fonts::icon_el('\u{EA8E}', "‹", 20.)),
@@ -1049,7 +1091,7 @@ impl ShellView {
                             .pr(px(32.))
                             .text_size(px(16.))
                             .font_family(FAMILY_SEMIBOLD)
-                            .child("Quản lý nhóm"),
+                            .child(title),
                     ),
             )
             .child(
@@ -1060,218 +1102,12 @@ impl ShellView {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(px(12.))
-                    .px(px(16.))
-                    .pt(px(14.))
-                    .pb(px(32.))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .p(px(12.))
-                            .rounded(px(6.))
-                            .bg(rgb(subtle))
-                            .child(
-                                div()
-                                    .text_size(px(15.))
-                                    .font_family(FAMILY_SEMIBOLD)
-                                    .truncate()
-                                    .child(d.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(rgb(muted))
-                                    .child(format!(
-                                        "{} · Vai trò: {role}",
-                                        crate::i18n::members(d.member_count)
-                                    )),
-                            )
-                            .when(community, |card| {
-                                card.child(
-                                    div()
-                                        .text_size(px(13.))
-                                        .text_color(rgb(blue))
-                                        .child("Cộng đồng"),
-                                )
-                            })
-                            .when_some(d.ttl_ms, |card, ms| {
-                                let text = if ms <= 0 {
-                                    "Tin nhắn tự xóa: Không bao giờ".to_owned()
-                                } else {
-                                    format!("Tin nhắn tự xóa: sau {}", ttl_caption(ms))
-                                };
-                                card.child(
-                                    div()
-                                        .text_size(px(12.5))
-                                        .text_color(rgb(muted))
-                                        .child(text),
-                                )
-                            }),
-                    )
-                    .when_some(d.error.clone(), |el, err| {
-                        el.child(div().text_size(px(12.5)).text_color(rgb(danger)).child(err))
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.))
-                            .child(action_btn("gm-members", "Thành viên & xóa thành viên", false).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.dialog = None;
-                                    this.info_open = true;
-                                    this.open_members(conv_id, cx);
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(action_btn("gm-add", "Thêm thành viên", false).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.dialog = None;
-                                    this.open_group_picker(Some((add_grid.clone(), add_name.clone())), cx);
-                                    cx.notify();
-                                },
-                            )))
-                            .child(action_btn("gm-rename", "Đổi tên nhóm", false).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.dialog = None;
-                                    this.open_rename(conv_id, cx);
-                                    cx.notify();
-                                },
-                            )))
-                            .child(action_btn("gm-autodelete", "Tin nhắn tự xóa", false).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.open_auto_delete(conv_id, cx);
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(action_btn("gm-leave", leave_label, true).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let armed = matches!(
-                                        this.dialog.as_ref(),
-                                        Some(Dialog::GroupManage(dlg)) if dlg.leave_armed
-                                    );
-                                    let silent = matches!(
-                                        this.dialog.as_ref(),
-                                        Some(Dialog::GroupManage(dlg)) if dlg.leave_silent
-                                    );
-                                    if !armed {
-                                        if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
-                                            dlg.leave_armed = true;
-                                            dlg.leave_silent = false;
-                                            dlg.disperse_armed = false;
-                                            dlg.community_armed = false;
-                                        }
-                                    } else {
-                                        this.dialog = None;
-                                        this.leave_group_now(conv_id, silent, cx);
-                                    }
-                                    cx.notify();
-                                },
-                            )))
-                            .when(owner, |col| {
-                                let caption = setting_copy(
-                                    "STR_CONFIRM_DELETE_GROUP",
-                                    "Mời tất cả mọi người rời nhóm và xóa tin nhắn? Nhóm đã giải tán sẽ KHÔNG THỂ khôi phục.",
-                                );
-                                col.child(
-                                    action_btn("gm-disperse", disperse_label, true).on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            let armed = matches!(
-                                                this.dialog.as_ref(),
-                                                Some(Dialog::GroupManage(dlg)) if dlg.disperse_armed
-                                            );
-                                            if !armed {
-                                                if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
-                                                    dlg.disperse_armed = true;
-                                                    dlg.leave_armed = false;
-                                                    dlg.leave_silent = false;
-                                                    dlg.community_armed = false;
-                                                }
-                                            } else {
-                                                this.dialog = None;
-                                                this.disperse_group_now(conv_id, cx);
-                                            }
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                                .when(d.disperse_armed, |col| {
-                                    col.child(
-                                        div()
-                                            .text_size(px(12.5))
-                                            .text_color(rgb(danger))
-                                            .child(caption),
-                                    )
-                                })
-                                .when(!community, |col| {
-                                    let confirm = "Sau khi nâng cấp thành cộng đồng sẽ không thể hoàn tác. Bấm lần nữa để xác nhận.";
-                                    col.when_some(d.community_quota.clone(), |col, q| {
-                                        col.child(
-                                            div()
-                                                .text_size(px(12.5))
-                                                .text_color(rgb(muted))
-                                                .child(q),
-                                        )
-                                    })
-                                    .child(
-                                        action_btn("gm-community", community_label, false).on_click(cx.listener(
-                                            move |this, _, _, cx| {
-                                                let armed = matches!(
-                                                    this.dialog.as_ref(),
-                                                    Some(Dialog::GroupManage(dlg)) if dlg.community_armed
-                                                );
-                                                if !armed {
-                                                    if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
-                                                        dlg.community_armed = true;
-                                                        dlg.disperse_armed = false;
-                                                        dlg.leave_armed = false;
-                                                        dlg.leave_silent = false;
-                                                    }
-                                                } else {
-                                                    this.dialog = None;
-                                                    this.upgrade_community_now(conv_id, cx);
-                                                }
-                                                cx.notify();
-                                            },
-                                        )),
-                                    )
-                                    .when(d.community_armed, |col| {
-                                        col.child(
-                                            div()
-                                                .text_size(px(12.5))
-                                                .text_color(rgb(muted))
-                                                .child(confirm),
-                                        )
-                                    })
-                                })
-                            })
-                            .when(d.leave_armed, |col| {
-                                let caption = setting_copy(
-                                    "STR_LEAVE_GROUP_SILENTLY_SWITCH_DESC",
-                                    "Chỉ trưởng/phó nhóm biết bạn rời nhóm.",
-                                );
-                                col.child(
-                                    div()
-                                        .id("gm-leave-silent")
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                            if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
-                                                dlg.leave_silent = !dlg.leave_silent;
-                                            }
-                                            cx.notify();
-                                        }))
-                                        .child(crate::info::check_box(d.leave_silent))
-                                        .child(div().flex_1().text_size(px(12.5)).text_color(rgb(muted)).child(caption)),
-                                )
-                            }),
-                    )
-                    .child(self.group_manage_advanced(d, cx)),
+                    .pb(px(28.))
+                    .child(if is_subpage {
+                        self.group_manage_subpage(d, cx).into_any_element()
+                    } else {
+                        self.group_manage_main(d, cx).into_any_element()
+                    }),
             )
     }
 
@@ -2638,6 +2474,40 @@ impl ShellView {
                                 ),
                         )
                     })
+                    .when(!d.uid.is_empty(), |col| {
+                        let mg_uid = d.uid.clone();
+                        let mg_name = display.clone();
+                        col.child(
+                            div()
+                                .px(px(16.))
+                                .pb(px(12.))
+                                .child(
+                                    div()
+                                        .id("ui-multi-group-btn")
+                                        .w_full()
+                                        .h(px(34.))
+                                        .rounded(px(4.))
+                                        .bg(rgb(subtle))
+                                        .hover(|st| st.bg(rgb(hover)))
+                                        .cursor_pointer()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(13.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(ink))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.open_multi_group_action(
+                                                mg_uid.clone(),
+                                                mg_name.clone(),
+                                                cx,
+                                            );
+                                            cx.notify();
+                                        }))
+                                        .child("Mời / Xóa khỏi nhiều nhóm"),
+                                ),
+                        )
+                    })
                     .child(div().h(px(6.)).w_full().bg(rgb(subtle)))
                     .child(
                         div()
@@ -3369,324 +3239,195 @@ impl ShellView {
             ))
     }
 
-    fn group_manage_advanced(
-        &self,
-        d: &GroupManageDlg,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let ink = token_rgb("--text-primary", "#081b3a");
-        let muted = token_rgb("--text-secondary", "#5a6981");
-        let blue = token_rgb("--B55", "#0068ff");
-        let subtle = token_rgb("--layer-background-subtle", "#ebecf0");
-        let card = token_rgb("--layer-background", "#ffffff");
-        let danger = token_rgb("--R60", "#c31818");
-        let mine = self.self_member_ids();
-        let can_manage = group_role_label(&mine, &d.creator, &d.admins) != "Thành viên";
-        let conv_id = d.conv_id;
-        let pending_label = if d.pending.is_empty() {
-            "Duyệt thành viên".to_owned()
-        } else {
-            format!("Duyệt ({})", d.pending.len())
+    pub(crate) fn load_group_blocked_members(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+        let Some(grid) = self.dialog.as_ref().and_then(|dlg| match dlg {
+            Dialog::GroupManage(d) if d.conv_id == conv_id => Some(d.thread_id.clone()),
+            _ => None,
+        }) else {
+            return;
         };
-        let tabs: [(GroupManageTab, String, &'static str); 3] = [
-            (
-                GroupManageTab::Permissions,
-                "Quyền nhóm".to_owned(),
-                "gm-tab-perm",
-            ),
-            (GroupManageTab::Pending, pending_label, "gm-tab-pending"),
-            (
-                GroupManageTab::Link,
-                "Liên kết nhóm".to_owned(),
-                "gm-tab-link",
-            ),
-        ];
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(6.))
-                    .children(tabs.into_iter().map(|(tab, label, id)| {
-                        let active = d.tab == tab;
-                        div()
-                            .id(id)
-                            .px(px(10.))
-                            .py(px(5.))
-                            .rounded(px(4.))
-                            .cursor_pointer()
-                            .bg(rgb(if active { blue } else { subtle }))
-                            .text_size(px(12.))
-                            .font_family(FAMILY_SEMIBOLD)
-                            .text_color(rgb(if active {
-                                crate::color::on_accent_fg()
-                            } else {
-                                ink
-                            }))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if let Some(Dialog::GroupManage(dlg)) = this.dialog.as_mut() {
-                                    dlg.tab = tab;
-                                    dlg.error = None;
-                                    dlg.tab_note = None;
-                                }
-                                if tab == GroupManageTab::Pending {
-                                    this.load_group_pending(conv_id, cx);
-                                } else if tab == GroupManageTab::Link {
-                                    this.load_group_link(conv_id, cx);
-                                }
-                                cx.notify();
-                            }))
-                            .child(label)
-                    })),
-            )
-            .child(
-                div()
-                    .id("gm-tab-scroll")
-                    .p(px(10.))
-                    .rounded(px(6.))
-                    .bg(rgb(subtle))
-                    .border_1()
-                    .border_color(crate::color::border_subtle())
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.))
-                    .child(match d.tab {
-                        GroupManageTab::Permissions => div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .when(!can_manage && !d.loading, |el| {
-                                el.child(
-                                    div()
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(muted))
-                                        .child("Chỉ trưởng hoặc phó nhóm mới có thể thay đổi các quyền này."),
-                                )
-                            })
-                            .children(GROUP_SETTING_ROWS.iter().enumerate().map(|(i, (key, label_key, hint_key))| {
-                                let on = d.settings.get(*key);
-                                let key = *key;
-                                let label = match *label_key {
-                                    "STR_TOAST_ADMIN_RENAME" => setting_copy(*label_key, "Chỉ trưởng/phó nhóm được phép đổi tên nhóm"),
-                                    "STR_MARK_ADMIN_MESSAGE" => setting_copy(*label_key, "Đánh dấu tin nhắn từ trưởng/phó nhóm"),
-                                    "STE_ADMIN_CREATE_TOPIC" => {
-                                        setting_copy(*label_key, "Chỉ trưởng/phó nhóm được phép tạo ghi chú, nhắc hẹn")
-                                    }
-                                    "STE_ADMIN_CREATE_POLL" => setting_copy(*label_key, "Chỉ trưởng/phó nhóm được phép tạo bình chọn"),
-                                    "STR_ADMIN_MEMBERSHIP_APPROVAL" => setting_copy(*label_key, "Chế độ phê duyệt thành viên mới"),
-                                    "STR_LOCK_SEND_MESSAGE_MESSAGE_FULL" => {
-                                        setting_copy(*label_key, "Chỉ trưởng/phó nhóm được gửi tin nhắn vào nhóm này.")
-                                    }
-                                    _ => setting_copy(
-                                        *label_key,
-                                        "Chỉ trưởng/phó nhóm xem được đầy đủ danh sách thành viên.",
-                                    ),
-                                };
-                                let hint = if hint_key.is_empty() {
-                                    String::new()
-                                } else {
-                                    setting_copy(*hint_key, "Chỉ trưởng/phó nhóm được phép thay ảnh đại diện")
-                                };
-                                div()
-                                    .id(("gm-set", i as u64))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.))
-                                    .py(px(4.))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(2.))
-                                            .child(div().text_size(px(13.)).text_color(rgb(ink)).child(label))
-                                            .when(!hint.is_empty(), |el| {
-                                                el.child(div().text_size(px(11.5)).text_color(rgb(muted)).child(hint))
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id(("gm-set-btn", i as u64))
-                                            .flex_none()
-                                            .when(can_manage && !d.settings_busy, |el| {
-                                                el.cursor_pointer().on_click(cx.listener(
-                                                    move |this, _: &ClickEvent, _, cx| {
-                                                        this.toggle_group_setting(conv_id, key, !on, cx);
-                                                    },
-                                                ))
-                                            })
-                                            .child(crate::info::switch_pill(on)),
-                                    )
-                            }))
-                            .into_any_element(),
-                        GroupManageTab::Pending => {
-                            if d.pending_loading {
-                                div().text_size(px(12.)).text_color(rgb(muted)).child("Đang tải yêu cầu tham gia…").into_any_element()
-                            } else if !can_manage {
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(muted))
-                                    .child("Chỉ trưởng hoặc phó nhóm mới xem được yêu cầu tham gia.")
-                                    .into_any_element()
-                            } else if let Some(note) = d.tab_note.clone() {
-                                div().text_size(px(12.)).text_color(rgb(danger)).child(note).into_any_element()
-                            } else if d.pending.is_empty() {
-                                div().text_size(px(12.)).text_color(rgb(muted)).child("Không có yêu cầu chờ duyệt.").into_any_element()
-                            } else {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.))
-                                    .children(d.pending.iter().enumerate().map(|(i, m)| {
-                                        let uid_ok = m.uid.clone();
-                                        let uid_no = m.uid.clone();
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(8.))
-                                            .child(div().text_size(px(12.5)).text_color(rgb(ink)).child(m.name.clone()))
-                                            .when(can_manage, |el| {
-                                                el.child(
-                                                    div()
-                                                        .flex()
-                                                        .flex_row()
-                                                        .gap(px(6.))
-                                                        .child(
-                                                            div()
-                                                                .id(("gm-pend-ok", i as u64))
-                                                                .px(px(8.))
-                                                                .py(px(3.))
-                                                                .rounded(px(4.))
-                                                                .bg(rgb(blue))
-                                                                .text_size(px(11.5))
-                                                                .text_color(rgb(crate::color::on_accent_fg()))
-                                                                .cursor_pointer()
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.review_group_pending(conv_id, uid_ok.clone(), true, cx);
-                                                                }))
-                                                                .child("Duyệt"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id(("gm-pend-no", i as u64))
-                                                                .px(px(8.))
-                                                                .py(px(3.))
-                                                                .rounded(px(4.))
-                                                                .bg(rgb(card))
-                                                                .border_1()
-                                                                .border_color(crate::color::border_subtle())
-                                                                .text_size(px(11.5))
-                                                                .text_color(rgb(danger))
-                                                                .cursor_pointer()
-                                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                                    this.review_group_pending(conv_id, uid_no.clone(), false, cx);
-                                                                }))
-                                                                .child("Từ chối"),
-                                                        ),
-                                                )
-                                            })
-                                    }))
-                                    .into_any_element()
-                            }
+        if cfg!(test) || !self.has_session || !crate::data::live_allowed(&grid) {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        if let Some(Dialog::GroupManage(d)) = self.dialog.as_mut() {
+            d.blocked_loading = true;
+            d.tab_note = None;
+        }
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.get_group_blocked_members(&grid, 1, 50)
+                            .await
+                            .map(|v| zalo_client::parse_blocked_group_members(&v))
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
+                    if d.conv_id == conv_id {
+                        d.blocked_loading = false;
+                        match res {
+                            Ok(list) => d.blocked_members = list,
+                            Err(err) => d.tab_note = Some(err),
                         }
-                        GroupManageTab::Link => {
-                            let url = d.link.url.clone();
-                            let url_copy = url.clone();
-                            let link_note = d.tab_note.clone();
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(8.))
-                                .when_some(link_note, |el, note| {
-                                    el.child(div().text_size(px(12.)).text_color(rgb(danger)).child(note))
-                                })
-                                .child(div().text_size(px(12.)).text_color(rgb(muted)).child(if d.link_loading {
-                                    "Đang tải liên kết tham gia…".to_owned()
-                                } else if d.link.enabled && !url.is_empty() {
-                                    url.clone()
-                                } else {
-                                    "Liên kết tham gia nhóm đang tắt.".to_owned()
-                                }))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .flex_wrap()
-                                        .gap(px(6.))
-                                        .when(!url.is_empty() && d.link.enabled, |el| {
-                                            el.child(
-                                                div()
-                                                    .id("gm-link-copy")
-                                                    .px(px(10.))
-                                                    .py(px(4.))
-                                                    .rounded(px(4.))
-                                                    .bg(rgb(card))
-                                                    .border_1()
-                                                    .border_color(crate::color::border_subtle())
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(ink))
-                                                    .cursor_pointer()
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        cx.write_to_clipboard(ClipboardItem::new_string(url_copy.clone()));
-                                                        this.set_note("Đã sao chép liên kết nhóm");
-                                                        cx.notify();
-                                                    }))
-                                                    .child("Sao chép link"),
-                                            )
-                                        })
-                                        .when(can_manage && !d.link_loading, |el| {
-                                            el.child(
-                                                div()
-                                                    .id("gm-link-renew")
-                                                    .px(px(10.))
-                                                    .py(px(4.))
-                                                    .rounded(px(4.))
-                                                    .bg(rgb(blue))
-                                                    .text_size(px(12.))
-                                                    .text_color(rgb(crate::color::on_accent_fg()))
-                                                    .cursor_pointer()
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.mutate_group_link(conv_id, true, cx);
-                                                    }))
-                                                    .child(if d.link.enabled { "Đặt lại link" } else { "Bật / tạo link mới" }),
-                                            )
-                                            .when(d.link.enabled, |el| {
-                                                el.child(
-                                                    div()
-                                                        .id("gm-link-disable")
-                                                        .px(px(10.))
-                                                        .py(px(4.))
-                                                        .rounded(px(4.))
-                                                        .bg(rgb(card))
-                                                        .border_1()
-                                                        .border_color(crate::color::border_subtle())
-                                                        .text_size(px(12.))
-                                                        .text_color(rgb(danger))
-                                                        .cursor_pointer()
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.mutate_group_link(conv_id, false, cx);
-                                                        }))
-                                                        .child("Tắt link"),
-                                                )
-                                            })
-                                        }),
-                                )
-                                .into_any_element()
-                        }
-                    }),
-            )
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
-    fn toggle_group_setting(
+    /// Blocks a member from rejoining the group (`/api/group/blockedmems/add`).
+    pub(crate) fn block_group_member(
+        &mut self,
+        conv_id: u64,
+        uid: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| c.is_group) else {
+            return;
+        };
+        if cfg!(test) || !self.has_session || !crate::data::live_allowed(&conv.thread_id) {
+            self.set_note("Chưa đăng nhập — không thể chặn thành viên");
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let grid = conv.thread_id.clone();
+        let target_uid = uid.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.block_group_members(&grid, &[target_uid])
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => {
+                        if let Some(v) = view.members_view.as_mut().filter(|v| v.conv == conv_id) {
+                            v.list.retain(|m| m.0 != uid);
+                        }
+                        if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
+                            if d.conv_id == conv_id {
+                                d.members.retain(|m| m.0 != uid);
+                                d.admins.retain(|a| a != &uid);
+                                if !d.blocked_members.iter().any(|b| b.uid == uid) {
+                                    d.blocked_members.push(zalo_client::BlockedGroupMember {
+                                        uid: uid.clone(),
+                                        name: name.clone(),
+                                        avatar: String::new(),
+                                    });
+                                }
+                            }
+                        }
+                        view.set_note(format!("Đã chặn {name} tham gia lại nhóm"));
+                    }
+                    Err(err) => view.set_note(format!("Không chặn được {name}: {err}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Unblocks a member so they can rejoin the group (`/api/group/blockedmems/remove`).
+    pub(crate) fn unblock_group_member(
+        &mut self,
+        conv_id: u64,
+        uid: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| c.is_group) else {
+            return;
+        };
+        if cfg!(test) || !self.has_session || !crate::data::live_allowed(&conv.thread_id) {
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let grid = conv.thread_id.clone();
+        let target_uid = uid.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.unblock_group_members(&grid, &[target_uid])
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => {
+                        if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
+                            if d.conv_id == conv_id {
+                                d.blocked_members.retain(|m| m.uid != uid);
+                            }
+                        }
+                        view.set_note(format!("Đã bỏ chặn {name}"));
+                    }
+                    Err(err) => view.set_note(format!("Không bỏ chặn được: {err}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Clears the legacy group topic (`/api/group/topic/remove`).
+    pub(crate) fn remove_group_topic_now(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+        let Some(conv) = self.conv(conv_id).cloned().filter(|c| c.is_group) else {
+            return;
+        };
+        if cfg!(test) || !self.has_session || !crate::data::live_allowed(&conv.thread_id) {
+            self.set_note("Chưa đăng nhập — không thể xóa chủ đề nhóm");
+            return;
+        }
+        let Some(dir) = self.session_dir.clone() else {
+            return;
+        };
+        let grid = conv.thread_id.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.remove_group_topic_legacy(&grid)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => view.set_note("Đã xóa chủ đề nhóm"),
+                    Err(err) => view.set_note(format!("Không xóa được chủ đề nhóm: {err}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn toggle_group_setting(
         &mut self,
         conv_id: u64,
         key: GroupSettingKey,
@@ -3743,7 +3484,7 @@ impl ShellView {
         .detach();
     }
 
-    fn load_group_pending(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+    pub(crate) fn load_group_pending(&mut self, conv_id: u64, cx: &mut Context<Self>) {
         let Some((grid, admin)) = self.dialog.as_ref().and_then(|dlg| match dlg {
             Dialog::GroupManage(d) if d.conv_id == conv_id => Some((
                 d.thread_id.clone(),
@@ -3807,7 +3548,7 @@ impl ShellView {
         .detach();
     }
 
-    fn review_group_pending(
+    pub(crate) fn review_group_pending(
         &mut self,
         conv_id: u64,
         uid: String,
@@ -3867,70 +3608,7 @@ impl ShellView {
         .detach();
     }
 
-    fn load_group_link(&mut self, conv_id: u64, cx: &mut Context<Self>) {
-        let Some(grid) = self.dialog.as_ref().and_then(|dlg| match dlg {
-            Dialog::GroupManage(d) if d.conv_id == conv_id => Some(d.thread_id.clone()),
-            _ => None,
-        }) else {
-            return;
-        };
-        if cfg!(test) || !self.has_session || !crate::data::live_allowed(&grid) {
-            return;
-        }
-        let Some(dir) = self.session_dir.clone() else {
-            return;
-        };
-        if let Some(Dialog::GroupManage(d)) = self.dialog.as_mut() {
-            d.link_loading = true;
-        }
-        cx.spawn(async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    crate::bridge::block_api(&dir, |api| async move {
-                        api.get_group_link_detail(&grid)
-                            .await
-                            .map(|v| group_link_from(&v))
-                            .map_err(|e| e.to_string())
-                    })
-                })
-                .await;
-            let _ = this.update(cx, |view, cx| {
-                let stored = if let Some(Dialog::GroupManage(d)) = view.dialog.as_mut() {
-                    if d.conv_id == conv_id {
-                        d.link_loading = false;
-                        match res {
-                            Ok(link) => {
-                                let url = if link.enabled {
-                                    link.url.clone()
-                                } else {
-                                    String::new()
-                                };
-                                d.link = link;
-                                d.tab_note = None;
-                                Some(url)
-                            }
-                            Err(err) => {
-                                d.tab_note = Some(group_side_note(&err));
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                if let Some(url) = stored {
-                    view.info_join.insert(conv_id, url);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn mutate_group_link(&mut self, conv_id: u64, renew: bool, cx: &mut Context<Self>) {
+    pub(crate) fn mutate_group_link(&mut self, conv_id: u64, renew: bool, cx: &mut Context<Self>) {
         let Some(grid) = self.dialog.as_ref().and_then(|dlg| match dlg {
             Dialog::GroupManage(d) if d.conv_id == conv_id => Some(d.thread_id.clone()),
             _ => None,
@@ -4178,7 +3856,8 @@ mod tests {
         assert_eq!(safe_zdb4_entry_name("../../.."), None);
         assert_eq!(safe_zdb4_entry_name(""), None);
 
-        let err = decrypt_zdb4_to_dir(Path::new(""), "key", Path::new("/tmp/out")).unwrap_err();
+        let out_dir = std::env::temp_dir().join("zalo_zdb4_out");
+        let err = decrypt_zdb4_to_dir(Path::new(""), "key", &out_dir).unwrap_err();
         assert!(err.contains("khóa giải mã"));
     }
 

@@ -1594,21 +1594,25 @@ impl ShellView {
                     self.pinned_msgs.insert(msg.id);
                     true
                 };
-                if let Some(conv) = self.conv(msg.conv).cloned().filter(|c| c.is_group) {
-                    if let Some(global) = msg.global_msg_id {
-                        if pin {
-                            self.maybe_live(LiveAction::PinBoard {
-                                thread_id: conv.thread_id,
-                                topic_id: global.to_string(),
-                                item_type: 1,
-                            });
-                        } else {
-                            self.maybe_live(LiveAction::UnpinBoard {
-                                thread_id: conv.thread_id,
-                                topic_id: global.to_string(),
-                                board_version: 0,
-                            });
+                if let Some(conv) = self.conv(msg.conv).cloned() {
+                    if conv.is_group {
+                        if let Some(global) = msg.global_msg_id {
+                            if pin {
+                                self.maybe_live(LiveAction::PinBoard {
+                                    thread_id: conv.thread_id,
+                                    topic_id: global.to_string(),
+                                    item_type: 1,
+                                });
+                            } else {
+                                self.maybe_live(LiveAction::UnpinBoard {
+                                    thread_id: conv.thread_id,
+                                    topic_id: global.to_string(),
+                                    board_version: 0,
+                                });
+                            }
                         }
+                    } else {
+                        self.sync_friend_pin(conv.id, &msg, pin, cx);
                     }
                 }
             }
@@ -2023,9 +2027,22 @@ impl ShellView {
             if let Some(found) = list.iter_mut().find(|row| row.id == msg.id) {
                 found.recalled = true;
                 found.text = recalled.clone();
+                found.kind = crate::media::MsgKind::Text;
+                found.media_url.clear();
+                found.media_path = None;
+                found.href.clear();
+                found.group_layout_id = 0;
             }
         }
         if let Some(conv) = self.conv(msg.conv).cloned() {
+            if conv.live {
+                data::persist_recall_message(
+                    &conv.thread_id,
+                    msg.global_msg_id,
+                    msg.cli_msg_id,
+                    &recalled,
+                );
+            }
             if let (Some(global), Some(cli)) = (msg.global_msg_id, msg.cli_msg_id) {
                 self.maybe_live(LiveAction::Undo {
                     thread_id: conv.thread_id,

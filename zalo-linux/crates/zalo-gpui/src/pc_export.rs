@@ -890,6 +890,7 @@ impl ShellView {
                 self.display_name = Some(name);
             }
             self.uin = session.uin;
+            self.user_id = session.user_id;
             self.send2me_id = session.send2me_id;
         }
         self.profiles = crate::profiles::Profiles::load(Some(&dir.join("profiles.json")));

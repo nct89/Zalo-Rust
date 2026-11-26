@@ -326,6 +326,9 @@ impl ShellView {
         Some(
             div()
                 .id("quick-popup")
+                .occlude()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .flex()
                 .flex_col()
                 .w_full()

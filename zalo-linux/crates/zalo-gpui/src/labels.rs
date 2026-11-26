@@ -124,6 +124,96 @@ where
     })
 }
 
+/// Server-synced label mutation using Zalo 26.11.12 `/api/convlabel/manage/*` endpoints
+/// with automatic fallback to legacy `/api/convlabel/update`.
+#[derive(Clone, Debug)]
+pub enum ManageOp {
+    Add {
+        text: String,
+        color: String,
+        now_ms: i64,
+    },
+    Update {
+        id: i64,
+        text: String,
+        color: String,
+        offset: i64,
+    },
+    Delete {
+        id: i64,
+    },
+    Reorder {
+        /// Ordered `(id, new_offset)` pairs.
+        order: Vec<(i64, i64)>,
+    },
+}
+
+/// Applies one [`ManageOp`] via `/api/convlabel/manage/*` (falling back to legacy
+/// `/api/convlabel/update` if the server rejects the v2 path) and returns the refreshed list.
+pub fn run_manage(
+    dir: &std::path::Path,
+    op: ManageOp,
+) -> Result<Vec<zalo_client::ConversationLabel>, String> {
+    crate::bridge::block_api(dir, |api| async move {
+        let v2_ok = match &op {
+            ManageOp::Add { text, color, .. } => {
+                api.create_label_v2(text, color, "", &[]).await.is_ok()
+            }
+            ManageOp::Update {
+                id,
+                text,
+                color,
+                offset,
+            } => api
+                .update_label_v2(*id, text, color, *offset, &[], &[])
+                .await
+                .is_ok(),
+            ManageOp::Delete { id } => api.delete_labels_v2(&[*id]).await.is_ok(),
+            ManageOp::Reorder { order } => api.reorder_labels_v2(order).await.is_ok(),
+        };
+        if !v2_ok {
+            let current = api.get_labels().await.map_err(|e| e.to_string())?;
+            let (mut items, version) = raw_items(&current);
+            if items.is_empty() {
+                return Err(
+                    "chưa đọc được danh sách thẻ hiện tại — không ghi để tránh mất dữ liệu".into(),
+                );
+            }
+            match op {
+                ManageOp::Add {
+                    text,
+                    color,
+                    now_ms,
+                } => {
+                    add(&mut items, &text, &color, now_ms);
+                }
+                ManageOp::Update {
+                    id, text, color, ..
+                } => {
+                    edit(&mut items, id, &text, &color);
+                }
+                ManageOp::Delete { id } => {
+                    remove(&mut items, id);
+                }
+                ManageOp::Reorder { order } => {
+                    for (id, off) in order {
+                        if let Some(it) = items.iter_mut().find(|v| id_of(v) == Some(id)) {
+                            it["offset"] = Value::from(off);
+                        }
+                    }
+                    items.sort_by_key(|v| v.get("offset").and_then(Value::as_i64).unwrap_or(0));
+                }
+            }
+            let data = serde_json::to_string(&items).map_err(|e| e.to_string())?;
+            api.update_conversation_label(&data, version)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let after = api.get_labels().await.map_err(|e| e.to_string())?;
+        Ok(zalo_client::ConversationLabel::list_from(&after))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +367,63 @@ impl ShellView {
         }
     }
 
+    fn apply_label_manage(&mut self, done: &'static str, op: ManageOp, cx: &mut Context<Self>) {
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session) else {
+            self.set_note("Chưa đăng nhập — không ghi được thẻ phân loại");
+            return;
+        };
+        if let Some(Dialog::Labels(d)) = self.dialog.as_mut() {
+            d.busy = true;
+        }
+        cx.spawn(async move |this, cx| {
+            let got = cx
+                .background_executor()
+                .spawn(async move { run_manage(&dir, op) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match got {
+                    Ok(list) => {
+                        view.labels = list;
+                        view.conv_labels.clear();
+                        if let Some(Dialog::Labels(d)) = view.dialog.as_mut() {
+                            d.busy = false;
+                            d.form = None;
+                            d.delete_armed = None;
+                            d.error = None;
+                        }
+                        view.set_note(done);
+                    }
+                    Err(e) => {
+                        view.conv_labels.clear();
+                        if let Some(Dialog::Labels(d)) = view.dialog.as_mut() {
+                            d.busy = false;
+                            d.error = Some(e.clone());
+                        }
+                        view.set_note(format!("Không ghi được thẻ phân loại: {e}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn reorder_label_step(&mut self, idx: usize, delta: isize, cx: &mut Context<Self>) {
+        let target = idx as isize + delta;
+        if target < 0 || (target as usize) >= self.labels.len() {
+            return;
+        }
+        let target = target as usize;
+        self.labels.swap(idx, target);
+        let order: Vec<(i64, i64)> = self
+            .labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.id, (i + 1) as i64))
+            .collect();
+        self.apply_label_manage("Đã sắp xếp lại thẻ phân loại", ManageOp::Reorder { order }, cx);
+    }
+
     fn save_label_form(&mut self, cx: &mut Context<Self>) {
         let Some(Dialog::Labels(LabelsDlg {
             form: Some((id, input, color)),
@@ -296,15 +443,30 @@ impl ShellView {
         }
         let now = crate::data::now_ms();
         match id {
-            Some(id) => self.apply_label_change(
-                "Đã sửa thẻ phân loại",
-                move |items| edit(items, id, &name, &color),
-                cx,
-            ),
-            None => self.apply_label_change(
+            Some(id) => {
+                let offset = self
+                    .labels
+                    .iter()
+                    .position(|l| l.id == id)
+                    .map(|i| (i + 1) as i64)
+                    .unwrap_or(1);
+                self.apply_label_manage(
+                    "Đã sửa thẻ phân loại",
+                    ManageOp::Update {
+                        id,
+                        text: name,
+                        color,
+                        offset,
+                    },
+                    cx,
+                );
+            }
+            None => self.apply_label_manage(
                 "Đã tạo thẻ phân loại",
-                move |items| {
-                    add(items, &name, &color, now);
+                ManageOp::Add {
+                    text: name,
+                    color,
+                    now_ms: now,
                 },
                 cx,
             ),
@@ -330,7 +492,7 @@ impl ShellView {
                         .items_center()
                         .rounded(px(6.))
                         .border_1()
-                        .border_color(rgb(blue))
+                        .border_color(crate::color::border_subtle())
                         .text_size(px(15.))
                         .child(div().flex_1().child(input.clone())),
                 )
@@ -364,22 +526,52 @@ impl ShellView {
                 .when(self.labels.is_empty(), |el| {
                     el.child(div().p(px(16.)).text_size(px(14.)).text_color(rgb(muted)).child(self.labels_status()))
                 })
-                .children(self.labels.iter().map(|l| {
+                .children(self.labels.iter().enumerate().map(|(idx, l)| {
                     let (eid, did) = (l.id, l.id);
                     let armed = d.delete_armed == Some(l.id);
+                    let can_up = idx > 0 && !d.busy;
+                    let can_down = idx + 1 < self.labels.len() && !d.busy;
                     div()
                         .id(("label-row", l.id as u64))
                         .flex()
                         .flex_none()
                         .flex_row()
                         .items_center()
-                        .gap(px(12.))
+                        .gap(px(10.))
                         .h(px(48.))
                         .px(px(16.))
                         .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
                         .child(div().size(px(14.)).rounded(px(3.)).bg(rgb(crate::color::parse_hex(&l.color).unwrap_or(0x0068ff))))
                         .child(div().flex_1().min_w(px(0.)).text_size(px(15.)).truncate().child(l.text.clone()))
-                        .child(div().text_size(px(13.)).text_color(rgb(muted)).child(format!("{} hội thoại", l.conversations.len())))
+                        .child(div().text_size(px(12.)).text_color(rgb(muted)).child(format!("{} hội thoại", l.conversations.len())))
+                        .child(
+                            div()
+                                .id(("label-up", l.id as u64))
+                                .px(px(4.))
+                                .text_size(px(12.))
+                                .text_color(rgb(if can_up { ink } else { muted }))
+                                .when(can_up, |el| {
+                                    el.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.reorder_label_step(idx, -1, cx);
+                                        cx.notify();
+                                    }))
+                                })
+                                .child("▲"),
+                        )
+                        .child(
+                            div()
+                                .id(("label-down", l.id as u64))
+                                .px(px(4.))
+                                .text_size(px(12.))
+                                .text_color(rgb(if can_down { ink } else { muted }))
+                                .when(can_down, |el| {
+                                    el.cursor_pointer().on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.reorder_label_step(idx, 1, cx);
+                                        cx.notify();
+                                    }))
+                                })
+                                .child("▼"),
+                        )
                         .child(
                             div()
                                 .id(("label-edit", l.id as u64))
@@ -401,7 +593,11 @@ impl ShellView {
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     let armed = matches!(this.dialog.as_ref(), Some(Dialog::Labels(d)) if d.delete_armed == Some(did));
                                     if armed {
-                                        this.apply_label_change("Đã xóa thẻ phân loại", move |items| remove(items, did), cx);
+                                        this.apply_label_manage(
+                                            "Đã xóa thẻ phân loại",
+                                            ManageOp::Delete { id: did },
+                                            cx,
+                                        );
                                     } else if let Some(Dialog::Labels(d)) = this.dialog.as_mut() {
                                         d.delete_armed = Some(did);
                                     }

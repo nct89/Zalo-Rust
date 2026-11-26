@@ -9,6 +9,7 @@
 pub mod api;
 pub mod device;
 pub mod features;
+pub mod group3;
 pub mod listener;
 pub mod ops;
 pub mod qr;
@@ -25,6 +26,11 @@ pub use device::{Device, DeviceError};
 pub use features::{
     GroupSettingsPatch, ThreadMsgRef, BOARD_ALL, EVENT_ACCEPT, EVENT_NONE, EVENT_REJECT,
     REPORT_TYPE_GROUP, REPORT_TYPE_USER, TOPIC_REMINDER, TOPIC_TEXT,
+};
+pub use group3::{
+    block_sharing_ids, parse_blocked_group_members, parse_group_link_preview, parse_pin_topics,
+    parse_todo_list, BlockedGroupMember, GroupLinkPreview, PinTopicEntry, TodoCreateInput,
+    TodoItem, TODO_STATUS_DONE, TODO_STATUS_OPEN, TODO_TYPE_DEFAULT,
 };
 pub use listener::{
     run_listener, run_listener_with, Frame, ListenerConfig, ListenerError, ListenerEvent,

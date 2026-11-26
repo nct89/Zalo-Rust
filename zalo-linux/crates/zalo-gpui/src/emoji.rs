@@ -299,6 +299,16 @@ fn by_insert() -> &'static HashMap<&'static str, &'static EmojiItem> {
                 map.entry(item.tip.as_str()).or_insert(item);
             }
         }
+        // Ensure standard Unicode 👍 / ❤️ map to Zalo's full-color sprite tiles
+        // instead of falling back to monochrome Linux text glyphs.
+        if let Some(&strong) = map.get("/-strong") {
+            map.entry("👍").or_insert(strong);
+            map.entry("👍\u{FE0F}").or_insert(strong);
+        }
+        if let Some(&heart) = map.get("/-heart") {
+            map.entry("❤️").or_insert(heart);
+            map.entry("❤").or_insert(heart);
+        }
         map
     })
 }

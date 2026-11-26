@@ -27,6 +27,8 @@ pub enum RtEvent {
     Replaced,
     /// New messages (`live` false for gap-fill history).
     Messages(Vec<Incoming>, bool),
+    /// Incoming message recalls (`chat.undo` / `chat.delete.everyone` targeting an existing message).
+    Undo(Vec<UndoEvent>),
     /// `cmd 601` controls with `act_type: "voip"` (calls).
     Voip(Vec<serde_json::Value>),
     /// Read/seen marks (`clearUnreads`, `seens`, `groupSeens`, `delivereds`).
@@ -71,6 +73,19 @@ pub struct ReactionUpdate {
     pub r_type: i64,
     /// `true` when `cmd == 613` or `r_type < 0`.
     pub cleared: bool,
+}
+
+/// One incoming recall (`chat.undo`) targeting an existing message in `thread_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndoEvent {
+    /// `<uid>` or `g_<grid>`.
+    pub thread_id: String,
+    /// Group thread.
+    pub is_group: bool,
+    /// Recalled message server `msgId` (`content.globalMsgId` / `content.msgId`).
+    pub target_global_id: Option<i64>,
+    /// Recalled message client `cliMsgId` (`content.cliMsgId`).
+    pub target_cli_id: Option<i64>,
 }
 
 /// One parsed message.
@@ -517,11 +532,23 @@ async fn run(
                         .iter()
                         .filter_map(|item| parse_item(item, group, &self_uin))
                         .collect();
-                    if list.is_empty() {
-                        return true;
+                    let undos: Vec<UndoEvent> = items
+                        .iter()
+                        .filter_map(|item| parse_undo(item, group, &self_uin))
+                        .collect();
+                    if !list.is_empty() {
+                        store_all(&store_path_cb, &mut list);
+                        if tx2.unbounded_send(RtEvent::Messages(list, !history)).is_err() {
+                            return false;
+                        }
                     }
-                    store_all(&store_path_cb, &mut list);
-                    RtEvent::Messages(list, !history)
+                    if !undos.is_empty() {
+                        apply_undos_to_store(&store_path_cb, &undos);
+                        if tx2.unbounded_send(RtEvent::Undo(undos)).is_err() {
+                            return false;
+                        }
+                    }
+                    return true;
                 }
                 _ => return true,
             };
@@ -582,7 +609,8 @@ async fn startup_sync(
             }
             let root = last.get("data").filter(|v| v.is_object()).unwrap_or(&last);
             let mut synced = preload_messages(root, &self_uin);
-            if synced.is_empty() {
+            let mut undos = preload_undos(root, &self_uin);
+            if synced.is_empty() && undos.is_empty() {
                 if let Some(map) = zero_preload_map(root.get("clearUnreads")) {
                     if let Ok(again) = api.get_last_messages_for(&map).await {
                         let again_root = again
@@ -590,6 +618,7 @@ async fn startup_sync(
                             .filter(|v| v.is_object())
                             .unwrap_or(&again);
                         synced = preload_messages(again_root, &self_uin);
+                        undos = preload_undos(again_root, &self_uin);
                     }
                 }
             }
@@ -597,6 +626,10 @@ async fn startup_sync(
             if !synced.is_empty() {
                 store_all(&store_path, &mut synced);
                 let _ = tx.unbounded_send(RtEvent::Messages(synced, false));
+            }
+            if !undos.is_empty() {
+                apply_undos_to_store(&store_path, &undos);
+                let _ = tx.unbounded_send(RtEvent::Undo(undos));
             }
         }
         Err(err) => {
@@ -967,6 +1000,109 @@ pub(crate) fn preload_messages(root: &Value, self_uin: &str) -> Vec<Incoming> {
         }
     }
     synced
+}
+
+/// Extracts `chat.undo` recall events from a `getLastMsgs` preload payload.
+pub(crate) fn preload_undos(root: &Value, self_uin: &str) -> Vec<UndoEvent> {
+    let mut out = Vec::new();
+    for (key, group) in [("msgs", false), ("groupMsgs", true)] {
+        if let Some(items) = root.get(key).and_then(Value::as_array) {
+            out.extend(items.iter().filter_map(|v| parse_undo(v, group, self_uin)));
+        }
+    }
+    if out.is_empty() {
+        if let Some(items) = root.get("allmsgs").and_then(Value::as_array) {
+            out.extend(
+                items
+                    .iter()
+                    .filter_map(|v| parse_undo(v, json_flag(v, "isGroup"), self_uin)),
+            );
+        }
+    }
+    out
+}
+
+/// Parses a `chat.undo` message item (matching official Zalo PC `compact3043.js`)
+/// into an [`UndoEvent`] targeting the recalled message's `globalMsgId` / `cliMsgId`.
+pub fn parse_undo(value: &Value, is_group: bool, self_uin: &str) -> Option<UndoEvent> {
+    let msg_type = json_str(value, "msgType").unwrap_or_default();
+    if msg_type != "chat.undo" {
+        return None;
+    }
+    let uid_from = json_str(value, "uidFrom").unwrap_or_default();
+    let id_to = json_str(value, "idTo").unwrap_or_default();
+    let explicit_group_id = json_str(value, "groupId")
+        .or_else(|| json_str(value, "grid"))
+        .filter(|s| !s.is_empty() && s != "0");
+    let is_group = is_group || json_flag(value, "isGroup") || explicit_group_id.is_some();
+    let from_me = uid_from == "0" || (!self_uin.is_empty() && uid_from == self_uin);
+    let thread_id = if is_group {
+        let raw = explicit_group_id.as_deref().or_else(|| {
+            (!id_to.is_empty() && id_to != "0" && (self_uin.is_empty() || id_to != self_uin))
+                .then_some(id_to.as_str())
+        })?;
+        let clean = raw
+            .strip_prefix("g_")
+            .or_else(|| {
+                raw.strip_prefix('g')
+                    .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+            })
+            .unwrap_or(raw);
+        if clean.is_empty() {
+            return None;
+        }
+        format!("g_{clean}")
+    } else if from_me {
+        if id_to.is_empty() || id_to == "0" {
+            self_uin.to_owned()
+        } else {
+            id_to
+        }
+    } else {
+        uid_from
+    };
+    if thread_id.is_empty() {
+        return None;
+    }
+    let content = value.get("content").map(as_object).unwrap_or(Value::Null);
+    let target_global_id = content
+        .get("globalMsgId")
+        .or_else(|| content.get("msgId"))
+        .and_then(json_i64)
+        .filter(|&id| id > 0);
+    let target_cli_id = content
+        .get("cliMsgId")
+        .or_else(|| content.get("cliMsgIdUndo"))
+        .and_then(json_i64)
+        .filter(|&id| id > 0);
+    if target_global_id.is_none() && target_cli_id.is_none() {
+        return None;
+    }
+    Some(UndoEvent {
+        thread_id,
+        is_group,
+        target_global_id,
+        target_cli_id,
+    })
+}
+
+/// Persists incoming `chat.undo` recalls into `store.db` so recalled messages
+/// remain recalled (and stripped of attachments) across restarts.
+pub(crate) fn apply_undos_to_store(path: &Path, undos: &[UndoEvent]) {
+    if undos.is_empty() {
+        return;
+    }
+    let Ok(store) = LocalStore::open(path) else {
+        return;
+    };
+    for u in undos {
+        let _ = store.mark_recalled(
+            &u.thread_id,
+            u.target_global_id,
+            u.target_cli_id,
+            "Tin nhắn đã thu hồi",
+        );
+    }
 }
 
 fn json_flag(value: &Value, key: &str) -> bool {
@@ -1521,6 +1657,16 @@ pub(crate) fn store_all(path: &Path, list: &mut [Incoming]) {
             if store.has_global_id(&m.thread_id, gid).unwrap_or(false) {
                 // History saved before these kinds were parsed stays plain text
                 // until the same server row is seen again.
+                refresh_richer(&store, m);
+                continue;
+            }
+        }
+        if let Some(cid) = m.cli_msg_id.filter(|&c| c > 0) {
+            if let Ok(Some(existing_id)) = store.find_by_cli_id(&m.thread_id, cid) {
+                m.row_id = existing_id;
+                if m.global_msg_id.is_some_and(|g| g > 0) {
+                    let _ = store.set_server_ids(existing_id, m.global_msg_id, cid);
+                }
                 refresh_richer(&store, m);
                 continue;
             }
@@ -2081,5 +2227,36 @@ mod tests {
             "content": "orphan"
         });
         assert!(parse_item(&bad_group, true, "999").is_none());
+    }
+
+    #[test]
+    fn parses_chat_undo_for_direct_and_group_messages() {
+        let group_undo = serde_json::json!({
+            "uidFrom": "3337259403399208010",
+            "idTo": "8396170674393584543",
+            "msgType": "chat.undo",
+            "content": {
+                "globalMsgId": "8529709392579",
+                "cliMsgId": "1795654996390"
+            }
+        });
+        assert!(parse_item(&group_undo, true, "999").is_none());
+        let ev = parse_undo(&group_undo, true, "999").expect("group undo");
+        assert!(ev.is_group);
+        assert_eq!(ev.thread_id, "g_8396170674393584543");
+        assert_eq!(ev.target_global_id, Some(8_529_709_392_579));
+        assert_eq!(ev.target_cli_id, Some(1_795_654_996_390));
+
+        let direct_undo = serde_json::json!({
+            "uidFrom": "555",
+            "idTo": "0",
+            "msgType": "chat.undo",
+            "content": "{\"globalMsgId\": 0, \"cliMsgId\": 123456789}"
+        });
+        let ev2 = parse_undo(&direct_undo, false, "999").expect("direct undo");
+        assert!(!ev2.is_group);
+        assert_eq!(ev2.thread_id, "555");
+        assert_eq!(ev2.target_global_id, None);
+        assert_eq!(ev2.target_cli_id, Some(123_456_789));
     }
 }

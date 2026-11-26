@@ -239,7 +239,11 @@ impl ShellView {
                 cx.stop_propagation();
                 cx.notify();
             }
-        } else if e.keystroke.key == "l" && mods.control && !self.locked {
+        } else if e.keystroke.key.eq_ignore_ascii_case("l")
+            && (mods.control || mods.platform)
+            && !mods.alt
+            && !self.locked
+        {
             self.lock_now(window, cx);
             cx.stop_propagation();
             cx.notify();

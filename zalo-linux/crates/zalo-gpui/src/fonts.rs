@@ -763,6 +763,10 @@ pub mod ic {
     pub const TB_CHEVRON: char = '\u{EA8B}';
     /// `Chevron_Double_Down_32_Line` — official Zalo scroll-to-bottom double chevron.
     pub const CHEVRON_DOUBLE_DOWN: char = '\u{EA89}';
+    /// `Chevron_Double_Up_32_Line` — official Zalo scroll-to-unread double chevron.
+    pub const CHEVRON_DOUBLE_UP: char = '\u{EA8A}';
+    /// `Mention_24_Line` — official Zalo floating `@` mention jump icon.
+    pub const MENTION_24: char = '\u{EC58}';
     /// `chevron-left` — official Zalo horizontal scroll left arrow.
     pub const CHEVRON_LEFT: char = '\u{EA94}';
     /// `chevron-right` — official Zalo horizontal scroll right arrow.

@@ -94,6 +94,41 @@ pub enum Dialog {
     Contact,
     /// Warning modal shown when `/api/message/scanurl` flags an external URL as unsafe.
     UnsafeUrl(String),
+    /// Preview & join a group from a `zalo.me/g/...` invite link (`/api/group/link/ginfo|join`).
+    GroupLinkPreview(GroupLinkPreviewDlg),
+    /// Invite or kick one user across multiple groups at once (`/api/group/invite|kickout/multi`).
+    MultiGroupAction(MultiGroupActionDlg),
+    /// Zalo To-Do ("Giao việc", 9 `/api/board/personal/*` APIs).
+    Todo(crate::todo::TodoDlg),
+}
+
+/// State for previewing & joining a group via `zalo.me/g/...`.
+pub struct GroupLinkPreviewDlg {
+    pub input: Entity<LineInput>,
+    pub link: String,
+    pub loading: bool,
+    pub joining: bool,
+    pub preview: Option<zalo_client::GroupLinkPreview>,
+    pub error: Option<String>,
+}
+
+/// State for inviting or kicking one member across multiple groups (`/api/group/invite|kickout/multi`).
+pub struct MultiGroupActionDlg {
+    pub uid: String,
+    pub name: String,
+    pub picked: Vec<String>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+/// True when `url` is a Zalo group invite link (`https://zalo.me/g/...`).
+#[must_use]
+pub fn is_zalo_group_link(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    (lower.starts_with("https://zalo.me/g/")
+        || lower.starts_with("http://zalo.me/g/")
+        || lower.starts_with("zalo.me/g/"))
+        && lower.len() > "zalo.me/g/".len()
 }
 
 /// Paste Excel table / clipboard content containing both image and text.
@@ -652,6 +687,9 @@ impl ShellView {
             Some(Dialog::UpdateAvailable) => self.update_available_el(cx).into_any_element(),
             Some(Dialog::Contact) => self.contact_el(cx).into_any_element(),
             Some(Dialog::UnsafeUrl(url)) => self.unsafe_url_el(url, cx).into_any_element(),
+            Some(Dialog::GroupLinkPreview(d)) => self.group_link_preview_el(d, cx).into_any_element(),
+            Some(Dialog::MultiGroupAction(d)) => self.multi_group_action_el(d, cx).into_any_element(),
+            Some(Dialog::Todo(d)) => self.todo_el(d, cx).into_any_element(),
             None => return div().into_any_element(),
         };
         div()
@@ -1814,6 +1852,17 @@ impl ShellView {
         msgs: Vec<crate::data::ChatMsg>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(first) = msgs.first() {
+            if self.block_sharing.contains(&first.thread_id) {
+                self.menu = None;
+                self.set_note(crate::color::str_vi(
+                    "STR_BLOCK_SHARING_ACTION_BLOCKED",
+                    "Trò chuyện này đã bật Chặn chia sẻ",
+                ));
+                cx.notify();
+                return;
+            }
+        }
         let query = cx.new(|cx| LineInput::new(cx, "Tìm kiếm"));
         let note = cx.new(|cx| LineInput::new(cx, "Nhập tin nhắn..."));
         cx.subscribe(&query, |this, _, event: &LineEvent, cx| {
@@ -3194,6 +3243,587 @@ impl ShellView {
                                 cx.notify();
                             }))
                             .child(crate::color::str_vi("STR_CLOSE", "Đóng")),
+                    ),
+            )
+    }
+
+    /// Opens an empty "Join Group by Link" prompt so the user can paste any `zalo.me/g/...` link.
+    pub(crate) fn open_group_link_input(&mut self, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| LineInput::new(cx, "Dán link nhóm (ví dụ https://zalo.me/g/...)"));
+        self.dialog = Some(Dialog::GroupLinkPreview(GroupLinkPreviewDlg {
+            input,
+            link: String::new(),
+            loading: false,
+            joining: false,
+            preview: None,
+            error: None,
+        }));
+    }
+
+    /// Opens the preview & join dialog for `link` and fetches `/api/group/link/ginfo`.
+    pub(crate) fn open_group_link_preview(&mut self, link: String, cx: &mut Context<Self>) {
+        let normalized = if link.starts_with("http://") || link.starts_with("https://") {
+            link
+        } else {
+            format!("https://{link}")
+        };
+        let input = cx.new(|cx| {
+            let mut i = LineInput::new(cx, "Dán link nhóm (ví dụ https://zalo.me/g/...)");
+            i.set_text(normalized.clone(), cx);
+            i
+        });
+        let can_fetch = !cfg!(test) && self.has_session;
+        self.dialog = Some(Dialog::GroupLinkPreview(GroupLinkPreviewDlg {
+            input,
+            link: normalized.clone(),
+            loading: can_fetch,
+            joining: false,
+            preview: None,
+            error: (!can_fetch).then(|| "Chưa đăng nhập — không thể xem trước nhóm".to_owned()),
+        }));
+        if can_fetch {
+            self.fetch_group_link_preview(normalized, cx);
+        }
+    }
+
+    fn fetch_group_link_preview(&mut self, link: String, cx: &mut Context<Self>) {
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session) else {
+            return;
+        };
+        let normalized = if link.starts_with("http://") || link.starts_with("https://") {
+            link
+        } else {
+            format!("https://{link}")
+        };
+        if let Some(Dialog::GroupLinkPreview(d)) = self.dialog.as_mut() {
+            d.link = normalized.clone();
+            d.loading = true;
+            d.error = None;
+            d.preview = None;
+        }
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        let val = api
+                            .get_group_info_by_link(&normalized, 1)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        zalo_client::parse_group_link_preview(&val)
+                            .ok_or_else(|| "Không đọc được thông tin nhóm từ liên kết này".to_owned())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(Dialog::GroupLinkPreview(d)) = view.dialog.as_mut() {
+                    d.loading = false;
+                    match res {
+                        Ok(p) => d.preview = Some(p),
+                        Err(e) => d.error = Some(e),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn join_group_by_link_now(&mut self, link: String, cx: &mut Context<Self>) {
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session && !cfg!(test)) else {
+            return;
+        };
+        if let Some(Dialog::GroupLinkPreview(d)) = self.dialog.as_mut() {
+            d.joining = true;
+            d.error = None;
+        }
+        let lang = if crate::i18n::is_english() { "en" } else { "vi" }.to_owned();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        api.join_group_by_link(&link, &lang)
+                            .await
+                            .map_err(|e| e.to_string())
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => {
+                        view.dialog = None;
+                        view.set_note("Đã gửi yêu cầu tham gia nhóm thành công");
+                    }
+                    Err(err) => {
+                        if let Some(Dialog::GroupLinkPreview(d)) = view.dialog.as_mut() {
+                            d.joining = false;
+                            d.error = Some(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn group_link_preview_el(
+        &self,
+        d: &GroupLinkPreviewDlg,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let panel_bg = token_rgb("--layer-background-subtle", "#ebecf0");
+        let danger = token_rgb("--text-errors", "#d91b1b");
+        let primary_bg = token_rgb("--button-primary-normal", "#0068ff");
+        let primary_hover = token_rgb("--button-primary-hover", "#0045ad");
+        let primary_fg = token_rgb("--button-primary-text", "#ffffff");
+        let sec_bg = token_rgb("--button-neutral-normal", "#eaedf0");
+        let sec_hover = token_rgb("--button-neutral-hover", "#dfe2e7");
+        let link_join = d.link.clone();
+        let link_browser = d.link.clone();
+        let can_join = d.preview.is_some() && !d.joining && !d.loading;
+
+        modal_card(448.)
+            .child(self.dialog_title_bar("Tham gia nhóm bằng liên kết", cx))
+            .child(
+                div()
+                    .w_full()
+                    .p(px(16.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(36.))
+                                    .px(px(10.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(crate::color::border_subtle())
+                                    .flex()
+                                    .items_center()
+                                    .child(div().flex_1().child(d.input.clone())),
+                            )
+                            .child(
+                                div()
+                                    .id("glp-check-btn")
+                                    .h(px(36.))
+                                    .px(px(12.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(sec_bg))
+                                    .hover(move |s| s.bg(rgb(sec_hover)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(13.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let url = match this.dialog.as_ref() {
+                                            Some(Dialog::GroupLinkPreview(dlg)) => {
+                                                dlg.input.read(cx).text().trim().to_owned()
+                                            }
+                                            _ => String::new(),
+                                        };
+                                        if is_zalo_group_link(&url) {
+                                            this.fetch_group_link_preview(url, cx);
+                                        } else if let Some(Dialog::GroupLinkPreview(dlg)) =
+                                            this.dialog.as_mut()
+                                        {
+                                            dlg.error = Some(
+                                                "Vui lòng nhập đúng định dạng https://zalo.me/g/..."
+                                                    .into(),
+                                            );
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child("Xem trước"),
+                            ),
+                    )
+                    .when(d.loading, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(rgb(muted))
+                                .child("Đang tải thông tin nhóm…"),
+                        )
+                    })
+                    .when_some(d.error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .whitespace_normal()
+                                .text_size(px(13.))
+                                .text_color(rgb(danger))
+                                .child(err),
+                        )
+                    })
+                    .when_some(d.preview.clone(), |el, p| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .rounded(px(6.))
+                                .bg(rgb(panel_bg))
+                                .border_1()
+                                .border_color(crate::color::border_subtle())
+                                .p(px(12.))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(15.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(ink))
+                                        .child(p.name),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.5))
+                                        .text_color(rgb(muted))
+                                        .child(format!(
+                                            "{} thành viên{}",
+                                            p.total_member,
+                                            if p.join_approval {
+                                                " · Cần phê duyệt"
+                                            } else {
+                                                ""
+                                            }
+                                        )),
+                                )
+                                .when(!p.desc.is_empty(), |card| {
+                                    card.child(
+                                        div()
+                                            .whitespace_normal()
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(ink))
+                                            .child(p.desc),
+                                    )
+                                })
+                                .when(!p.sample_members.is_empty(), |card| {
+                                    card.child(
+                                        div()
+                                            .whitespace_normal()
+                                            .text_size(px(12.))
+                                            .text_color(rgb(muted))
+                                            .child(format!(
+                                                "Thành viên: {}",
+                                                p.sample_members.join(", ")
+                                            )),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(crate::color::border_subtle())
+                    .when(!link_browser.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .id("glp-browser-btn")
+                                .px(px(12.))
+                                .h(px(34.))
+                                .rounded(px(4.))
+                                .bg(rgb(sec_bg))
+                                .hover(move |s| s.bg(rgb(sec_hover)))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(13.))
+                                .text_color(rgb(ink))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    crate::os_util::open_url(&link_browser);
+                                    this.dialog = None;
+                                    cx.notify();
+                                }))
+                                .child("Mở trình duyệt"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("glp-join-btn")
+                            .px(px(16.))
+                            .h(px(34.))
+                            .rounded(px(4.))
+                            .bg(rgb(if can_join { primary_bg } else { sec_bg }))
+                            .when(can_join, |b| {
+                                b.hover(move |s| s.bg(rgb(primary_hover)))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.join_group_by_link_now(link_join.clone(), cx);
+                                        cx.notify();
+                                    }))
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(13.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if can_join { primary_fg } else { muted }))
+                            .child(if d.joining {
+                                "Đang tham gia…"
+                            } else {
+                                "Tham gia nhóm"
+                            }),
+                    ),
+            )
+    }
+
+    /// Opens the multi-group invite / kickout dialog for one user (`uid`).
+    pub(crate) fn open_multi_group_action(
+        &mut self,
+        uid: String,
+        name: String,
+        _cx: &mut Context<Self>,
+    ) {
+        self.dialog = Some(Dialog::MultiGroupAction(MultiGroupActionDlg {
+            uid,
+            name,
+            picked: Vec::new(),
+            busy: false,
+            error: None,
+        }));
+    }
+
+    fn run_multi_group_action(&mut self, invite: bool, cx: &mut Context<Self>) {
+        let Some((uid, name, grids)) = self.dialog.as_ref().and_then(|dlg| match dlg {
+            Dialog::MultiGroupAction(d) if !d.busy && !d.picked.is_empty() => {
+                Some((d.uid.clone(), d.name.clone(), d.picked.clone()))
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(dir) = self.session_dir.clone().filter(|_| self.has_session && !cfg!(test)) else {
+            self.set_note("Chưa đăng nhập — không thể thực hiện thao tác đa nhóm");
+            return;
+        };
+        if let Some(Dialog::MultiGroupAction(d)) = self.dialog.as_mut() {
+            d.busy = true;
+            d.error = None;
+        }
+        let lang = if crate::i18n::is_english() { "en" } else { "vi" }.to_owned();
+        let count = grids.len();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::bridge::block_api(&dir, |api| async move {
+                        if invite {
+                            api.invite_member_multi(&grids, &uid, -1, 0, &lang)
+                                .await
+                                .map_err(|e| e.to_string())
+                        } else {
+                            api.kickout_member_multi(&grids, &uid, 0)
+                                .await
+                                .map_err(|e| e.to_string())
+                        }
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                match res {
+                    Ok(_) => {
+                        view.dialog = None;
+                        view.set_note(if invite {
+                            format!("Đã mời {name} vào {count} nhóm")
+                        } else {
+                            format!("Đã mời {name} ra khỏi {count} nhóm")
+                        });
+                    }
+                    Err(err) => {
+                        if let Some(Dialog::MultiGroupAction(d)) = view.dialog.as_mut() {
+                            d.busy = false;
+                            d.error = Some(err);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn multi_group_action_el(
+        &self,
+        d: &MultiGroupActionDlg,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+        let danger = token_rgb("--text-errors", "#d91b1b");
+        let primary_bg = token_rgb("--button-primary-normal", "#0068ff");
+        let primary_hover = token_rgb("--button-primary-hover", "#0045ad");
+        let primary_fg = token_rgb("--button-primary-text", "#ffffff");
+        let sec_bg = token_rgb("--button-neutral-normal", "#eaedf0");
+        let sec_hover = token_rgb("--button-neutral-hover", "#dfe2e7");
+        let groups: Vec<(String, String)> = self
+            .convs
+            .iter()
+            .filter(|c| c.is_group && c.live && !self.removed.contains(&c.id))
+            .map(|c| (c.thread_id.clone(), c.name.clone()))
+            .collect();
+        let can_act = !d.picked.is_empty() && !d.busy;
+
+        modal_card(448.)
+            .child(self.dialog_title_bar(&format!("Nhóm cho {}", d.name), cx))
+            .child(
+                div()
+                    .id("mga-list")
+                    .w_full()
+                    .max_h(px(340.))
+                    .overflow_y_scroll()
+                    .p(px(12.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .when(groups.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .p(px(12.))
+                                .text_size(px(13.))
+                                .text_color(rgb(muted))
+                                .child("Chưa có nhóm nào khả dụng."),
+                        )
+                    })
+                    .children(groups.into_iter().enumerate().map(|(i, (tid, gname))| {
+                        let checked = d.picked.contains(&tid);
+                        let toggle_tid = tid.clone();
+                        div()
+                            .id(("mga-row", i as u64))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .px(px(10.))
+                            .h(px(40.))
+                            .rounded(px(4.))
+                            .hover(move |s| s.bg(rgb(hover)))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(Dialog::MultiGroupAction(dlg)) = this.dialog.as_mut() {
+                                    if let Some(pos) =
+                                        dlg.picked.iter().position(|x| x == &toggle_tid)
+                                    {
+                                        dlg.picked.remove(pos);
+                                    } else {
+                                        dlg.picked.push(toggle_tid.clone());
+                                    }
+                                }
+                                cx.notify();
+                            }))
+                            .child(crate::info::check_box(checked))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(14.))
+                                    .text_color(rgb(ink))
+                                    .child(gname),
+                            )
+                    })),
+            )
+            .when_some(d.error.clone(), |el, err| {
+                el.child(
+                    div()
+                        .px(px(16.))
+                        .pb(px(8.))
+                        .whitespace_normal()
+                        .text_size(px(12.5))
+                        .text_color(rgb(danger))
+                        .child(err),
+                )
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.))
+                    .py(px(12.))
+                    .border_t_1()
+                    .border_color(crate::color::border_subtle())
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(muted))
+                            .child(format!("Đã chọn {} nhóm", d.picked.len())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("mga-kick-btn")
+                                    .px(px(12.))
+                                    .h(px(34.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(sec_bg))
+                                    .when(can_act, |b| {
+                                        b.hover(move |s| s.bg(rgb(sec_hover)))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.run_multi_group_action(false, cx);
+                                                cx.notify();
+                                            }))
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(13.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(if can_act { danger } else { muted }))
+                                    .child("Mời ra khỏi nhóm"),
+                            )
+                            .child(
+                                div()
+                                    .id("mga-invite-btn")
+                                    .px(px(14.))
+                                    .h(px(34.))
+                                    .rounded(px(4.))
+                                    .bg(rgb(if can_act { primary_bg } else { sec_bg }))
+                                    .when(can_act, |b| {
+                                        b.hover(move |s| s.bg(rgb(primary_hover)))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.run_multi_group_action(true, cx);
+                                                cx.notify();
+                                            }))
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(13.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(if can_act { primary_fg } else { muted }))
+                                    .child("Mời vào nhóm"),
+                            ),
                     ),
             )
     }
@@ -4707,5 +5337,15 @@ mod tests {
         assert!(msg.contains("Chủ tài khoản: NGUYEN VAN A"));
         assert!(msg.contains("Số tiền: 200.000đ"));
         assert!(msg.contains("Nội dung: An trua"));
+    }
+
+    #[test]
+    fn recognizes_zalo_group_invite_links() {
+        assert!(is_zalo_group_link("https://zalo.me/g/abc123"));
+        assert!(is_zalo_group_link("http://zalo.me/g/xyz999"));
+        assert!(is_zalo_group_link("zalo.me/g/code1"));
+        assert!(!is_zalo_group_link("https://zalo.me/0909123456"));
+        assert!(!is_zalo_group_link("https://example.com/g/abc"));
+        assert!(!is_zalo_group_link("zalo.me/g/"));
     }
 }

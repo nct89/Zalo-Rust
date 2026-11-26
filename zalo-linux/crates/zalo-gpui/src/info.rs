@@ -330,6 +330,8 @@ pub struct MembersView {
     pub kicking: std::collections::HashSet<String>,
     /// Second-click confirmation target for transferring group ownership.
     pub owner_armed: Option<String>,
+    /// Member uid whose inline `«…»` admin action tray is currently open.
+    pub menu_uid: Option<String>,
     /// Fetch error.
     pub error: Option<String>,
 }
@@ -400,16 +402,24 @@ pub(crate) fn members_from(
         .collect();
     let creator = info
         .get("creatorId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_owned();
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+        .unwrap_or_default();
     let admins = info
         .get("adminIds")
         .and_then(serde_json::Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(str::to_owned)
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -426,6 +436,7 @@ enum InfoAct {
     CreateGroup,
     Manage,
     AutoDelete,
+    BlockSharing,
     Pending,
     Hide,
     Clear,
@@ -1021,19 +1032,64 @@ impl ShellView {
                         InfoAct::AutoDelete,
                         cx,
                     ))
-                    .when(is_group, |el| {
-                        el.child(self.info_stack_row(
-                            "info-block-share",
-                            g::SHARE,
-                            crate::color::str_vi("STR_BLOCK_SHARING_STATUS_TITLE", "Chặn chia sẻ"),
+                    .child({
+                        let block_on = self.block_sharing.contains(&conv.thread_id);
+                        let sub_text = if block_on {
+                            "Đang bật · Bảo vệ nội dung trò chuyện"
+                        } else {
                             crate::color::str_vi(
                                 "STR_BLOCK_SHARING_STATUS_DESC",
                                 "Bảo vệ nội dung trò chuyện",
-                            ),
-                            id,
-                            InfoAct::Manage,
-                            cx,
-                        ))
+                            )
+                        };
+                        div()
+                            .id("info-block-share")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(12.))
+                            .flex_none()
+                            .px(px(16.))
+                            .py(px(10.))
+                            .cursor_pointer()
+                            .hover(|st| {
+                                st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4")))
+                            })
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.info_action(id, InfoAct::BlockSharing, cx);
+                                cx.notify();
+                            }))
+                            .child(fonts::icon_el('\u{EA37}', "•", 20.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(15.))
+                                            .line_height(px(20.))
+                                            .truncate()
+                                            .child(crate::color::str_vi(
+                                                "STR_BLOCK_SHARING_STATUS_TITLE",
+                                                "Chặn chia sẻ",
+                                            )),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .line_height(px(16.))
+                                            .text_color(rgb(token_rgb(
+                                                "--text-secondary",
+                                                "#5a6981",
+                                            )))
+                                            .truncate()
+                                            .child(sub_text),
+                                    ),
+                            )
+                            .child(switch_pill(block_on))
                     })
                     .child({
                         let hidden_on = self.hidden.contains(&id);
@@ -1186,6 +1242,7 @@ impl ShellView {
             InfoAct::CreateGroup => self.open_group_picker(None, cx),
             InfoAct::Manage => self.open_group_manage(id, cx),
             InfoAct::AutoDelete => self.open_auto_delete(id, cx),
+            InfoAct::BlockSharing => self.toggle_block_sharing(id, cx),
             InfoAct::Pending => {
                 self.open_group_manage_tab(id, crate::account::GroupManageTab::Pending, cx)
             }
@@ -2684,7 +2741,11 @@ impl ShellView {
         let ink = token_rgb("--text-primary", "#081b3a");
         let muted = token_rgb("--text-secondary", "#5a6981");
         let id = conv.id;
-        let me = self.uin.clone().unwrap_or_default();
+        let me = self
+            .self_uid()
+            .or(self.uin.as_deref())
+            .unwrap_or_default()
+            .to_owned();
         let mut rows = view.list.clone();
         // Creator, then admins, then everyone else (Zalo PC order).
         rows.sort_by_key(|(uid, _)| {
@@ -2816,84 +2877,159 @@ impl ShellView {
                         let role_manageable = can_manage_group_roles(&mine, &view.creator, &uid);
                         let is_target_admin = view.admins.contains(&uid);
                         let owner_confirm = view.owner_armed.as_deref() == Some(uid.as_str());
+                        let menu_open = view.menu_uid.as_deref() == Some(uid.as_str());
                         let busy = view.kicking.contains(&uid);
                         let person = crate::dialogs::Person { uid: uid.clone(), name: shown.clone(), avatar: String::new(), note: String::new() };
                         let (open, open_name, kick_uid, kick_name) = (uid.clone(), shown.clone(), uid.clone(), shown.clone());
                         let (role_uid, role_name, own_uid, own_name) = (uid.clone(), shown.clone(), uid.clone(), shown.clone());
+                        let menu_toggle_uid = uid.clone();
+                        let hover_bg = token_rgb("--layer-background-hover", "#f1f2f4");
+                        let subtle_bg = token_rgb("--layer-background-subtle", "#ebecf0");
+                        let action_btn = |id: gpui::SharedString, label: &'static str, color: u32| {
+                            div()
+                                .id(id)
+                                .px(px(9.))
+                                .py(px(5.))
+                                .rounded(px(4.))
+                                .bg(rgb(subtle_bg))
+                                .hover(move |st| st.bg(rgb(hover_bg)))
+                                .text_size(px(12.))
+                                .text_color(rgb(color))
+                                .cursor_pointer()
+                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(label)
+                        };
                         div()
-                            .id(gpui::SharedString::from(format!("member-{uid}")))
+                            .id(gpui::SharedString::from(format!("member-wrap-{uid}")))
                             .flex()
                             .flex_none()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(12.))
-                            .h(px(56.))
-                            .px(px(16.))
-                            .cursor_pointer()
-                            .hover(|st| st.bg(rgb(token_rgb("--layer-background-hover", "#f1f2f4"))))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.open_chat_or_note(
-                                    &open,
-                                    &open_name,
-                                    false,
-                                    "Chưa có hội thoại 1-1 với người này",
-                                    window,
-                                    cx,
-                                );
-                                cx.notify();
-                            }))
-                            .child(self.dialog_avatar(&person, 40.))
+                            .flex_col()
                             .child(
                                 div()
+                                    .id(gpui::SharedString::from(format!("member-{uid}")))
                                     .flex()
-                                    .flex_col()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .child(div().text_size(px(15.)).truncate().child(shown))
-                                    .when_some(role, |el, r| {
-                                        el.child(div().flex().flex_row().items_center().gap(px(4.)).text_size(px(13.)).text_color(rgb(muted))
-                                            .child(div().text_color(rgb(0xe8_a3_17)).child(fonts::icon_el('\u{EC35}', "", 14.)))
-                                            .child(r))
+                                    .flex_none()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(12.))
+                                    .h(px(56.))
+                                    .px(px(16.))
+                                    .cursor_pointer()
+                                    .hover(move |st| st.bg(rgb(hover_bg)))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                        this.open_chat_or_note(
+                                            &open,
+                                            &open_name,
+                                            false,
+                                            "Chưa có hội thoại 1-1 với người này",
+                                            window,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    }))
+                                    .child(self.dialog_avatar(&person, 40.))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .child(div().text_size(px(15.)).truncate().child(shown))
+                                            .when_some(role, |el, r| {
+                                                let key_color = if r == "Trưởng nhóm" {
+                                                    0xe8_a3_17
+                                                } else {
+                                                    muted
+                                                };
+                                                el.child(
+                                                    div()
+                                                        .flex()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(4.))
+                                                        .text_size(px(13.))
+                                                        .text_color(rgb(muted))
+                                                        .child(
+                                                            div()
+                                                                .text_color(rgb(key_color))
+                                                                .child(fonts::icon_el('\u{EC35}', "", 14.)),
+                                                        )
+                                                        .child(r),
+                                                )
+                                            }),
+                                    )
+                                    .when(role_manageable || kickable, |el| {
+                                        el.child(
+                                            div()
+                                                .id(gpui::SharedString::from(format!("mem-more-{menu_toggle_uid}")))
+                                                .size(px(28.))
+                                                .rounded(px(14.))
+                                                .flex()
+                                                .flex_none()
+                                                .items_center()
+                                                .justify_center()
+                                                .cursor_pointer()
+                                                .text_color(rgb(muted))
+                                                .when(menu_open, |b| b.bg(rgb(subtle_bg)).text_color(rgb(ink)))
+                                                .hover(move |st| st.bg(rgb(subtle_bg)).text_color(rgb(ink)))
+                                                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(v) = this.members_view.as_mut().filter(|v| v.conv == conv_id) {
+                                                        if v.menu_uid.as_deref() == Some(menu_toggle_uid.as_str()) {
+                                                            v.menu_uid = None;
+                                                        } else {
+                                                            v.menu_uid = Some(menu_toggle_uid.clone());
+                                                            v.owner_armed = None;
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                                .child(fonts::icon_el(fonts::ic::MSG_MORE, "⋯", 16.)),
+                                        )
                                     }),
                             )
-                            .when(role_manageable || kickable, |el| {
-                                let action_btn = |id: gpui::SharedString, label: &'static str, color: u32| {
-                                    div()
-                                        .id(id)
-                                        .px(px(7.))
-                                        .py(px(3.))
-                                        .rounded(px(4.))
-                                        .bg(rgb(token_rgb("--layer-background-subtle", "#ebecf0")))
-                                        .text_size(px(11.5))
-                                        .text_color(rgb(color))
-                                        .cursor_pointer()
-                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                        .child(label)
-                                };
+                            .when(menu_open && (role_manageable || kickable), |el| {
                                 el.child(
                                     div()
                                         .flex()
                                         .flex_row()
                                         .flex_wrap()
-                                        .justify_end()
-                                        .gap(px(4.))
+                                        .gap(px(6.))
+                                        .pl(px(68.))
+                                        .pr(px(16.))
+                                        .pb(px(10.))
                                         .when(role_manageable && !busy, |row| {
                                             let next_role = if is_target_admin {
                                                 GroupRoleAction::DemoteAdmin
                                             } else {
                                                 GroupRoleAction::PromoteAdmin
                                             };
-                                            let role_label = if is_target_admin { "Bỏ P.nhóm" } else { "+ Phó nhóm" };
-                                            let own_label = if owner_confirm { "Xác nhận?" } else { "Trưởng nhóm" };
+                                            let role_label = if is_target_admin {
+                                                "Gỡ phó nhóm"
+                                            } else {
+                                                "Thêm phó nhóm"
+                                            };
+                                            let own_label = if owner_confirm {
+                                                "Xác nhận chuyển?"
+                                            } else {
+                                                "Chuyển trưởng nhóm"
+                                            };
                                             row.child(
                                                 action_btn(
                                                     gpui::SharedString::from(format!("role-{role_uid}")),
                                                     role_label,
-                                                    token_rgb("--B55", "#0068ff"),
+                                                    ink,
                                                 )
                                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                                     cx.stop_propagation();
-                                                    this.set_group_member_role(conv_id, role_uid.clone(), role_name.clone(), next_role, cx);
+                                                    this.set_group_member_role(
+                                                        conv_id,
+                                                        role_uid.clone(),
+                                                        role_name.clone(),
+                                                        next_role,
+                                                        cx,
+                                                    );
                                                 })),
                                             )
                                             .child(
@@ -2903,13 +3039,19 @@ impl ShellView {
                                                     if owner_confirm {
                                                         token_rgb("--R60", "#c31818")
                                                     } else {
-                                                        muted
+                                                        ink
                                                     },
                                                 )
                                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                                     cx.stop_propagation();
                                                     if owner_confirm {
-                                                        this.set_group_member_role(conv_id, own_uid.clone(), own_name.clone(), GroupRoleAction::TransferOwner, cx);
+                                                        this.set_group_member_role(
+                                                            conv_id,
+                                                            own_uid.clone(),
+                                                            own_name.clone(),
+                                                            GroupRoleAction::TransferOwner,
+                                                            cx,
+                                                        );
                                                     } else if let Some(v) = this.members_view.as_mut().filter(|v| v.conv == conv_id) {
                                                         v.owner_armed = Some(own_uid.clone());
                                                         this.set_note("Bấm lại để xác nhận chuyển trưởng nhóm");
@@ -2919,10 +3061,24 @@ impl ShellView {
                                             )
                                         })
                                         .when(kickable, |row| {
+                                            let block_uid = kick_uid.clone();
+                                            let block_name = kick_name.clone();
                                             row.child(
                                                 action_btn(
+                                                    gpui::SharedString::from(format!("block-{block_uid}")),
+                                                    "Chặn khỏi nhóm",
+                                                    muted,
+                                                )
+                                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.block_group_member(conv_id, block_uid.clone(), block_name.clone(), cx);
+                                                    cx.notify();
+                                                })),
+                                            )
+                                            .child(
+                                                action_btn(
                                                     gpui::SharedString::from(format!("kick-{kick_uid}")),
-                                                    if busy { "Đang xóa…" } else { "Xóa" },
+                                                    if busy { "Đang xóa…" } else { "Xóa khỏi nhóm" },
                                                     token_rgb("--R60", "#c31818"),
                                                 )
                                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
