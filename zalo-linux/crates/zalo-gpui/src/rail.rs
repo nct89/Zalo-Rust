@@ -932,7 +932,9 @@ fn starred_msg_preview(msg: &crate::data::ChatMsg) -> String {
         crate::media::MsgKind::Call | crate::media::MsgKind::MissedCall => {
             format!("[{}]", str_vi("STR_CALL", "Cuộc gọi"))
         }
-        crate::media::MsgKind::Text => String::new(),
+        crate::media::MsgKind::Reminder => "[Nhắc hẹn]".to_owned(),
+        crate::media::MsgKind::Todo => "[Giao việc]".to_owned(),
+        crate::media::MsgKind::System | crate::media::MsgKind::Text => String::new(),
     }
 }
 

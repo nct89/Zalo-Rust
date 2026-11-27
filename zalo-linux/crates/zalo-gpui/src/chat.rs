@@ -234,6 +234,7 @@ impl ShellView {
             )
             .child(self.header(Some(&conv), cx))
             .child(self.stranger_banner(&conv, cx))
+            .child(self.status_banners(&conv, cx))
             .child(self.pinned_bar(&conv, cx))
             .child(self.message_view(Some(&conv), cx))
             .map(
@@ -387,6 +388,159 @@ impl ShellView {
                     .into_any_element()
             })
             .into_any_element()
+    }
+
+    /// Conversation status banners below header/stranger strip:
+    /// - Active auto-delete TTL notice (`⏱ Tin nhắn tự xóa sau ...`)
+    /// - Blocked 1:1 user notice with instant "Bỏ chặn" button
+    fn status_banners(&self, conv: &ChatConv, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let ttl = self
+            .auto_delete_ttl
+            .get(&conv.thread_id)
+            .copied()
+            .unwrap_or(0);
+        let blocked = !conv.is_group && self.is_uid_blocked(&conv.thread_id);
+        if ttl <= 0 && !blocked {
+            return div().into_any_element();
+        }
+        let dark = crate::color::is_dark();
+        let paper = token_rgb("--layer-background", "#ffffff");
+        let subtle = token_rgb("--layer-background-subtle", "#eef0f3");
+        let hover_bg = token_rgb("--layer-background-hover", "#e5e7eb");
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let line = crate::color::border_subtle();
+        let danger = token_rgb("--R60", "#c31818");
+        let mut stack = div().flex().flex_col().flex_none().w_full();
+        if ttl > 0 {
+            let ttl_label = crate::shell::format_auto_delete_ttl(ttl);
+            stack = stack.child(
+                div()
+                    .id("autodelete-banner")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .px(px(16.))
+                    .py(px(7.))
+                    .bg(rgb(paper))
+                    .border_b_1()
+                    .border_color(line)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .min_w(px(0.))
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(muted))
+                                    .child("⏱"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(ink))
+                                    .truncate()
+                                    .child(format!(
+                                        "Tin nhắn tự xóa đang bật · Tự xóa sau {ttl_label}"
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("autodelete-banner-btn")
+                            .flex_none()
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(4.))
+                            .bg(rgb(subtle))
+                            .hover(move |st| st.bg(rgb(hover_bg)))
+                            .text_size(px(12.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if dark { ink } else { crate::color::link_fg() }))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.info_open = true;
+                                this.info_pref = true;
+                                cx.notify();
+                            }))
+                            .child("Cài đặt"),
+                    ),
+            );
+        }
+        if blocked {
+            let unblock_uid = conv.thread_id.clone();
+            let busy = self.privacy.unblocking.contains(&conv.thread_id);
+            stack = stack.child(
+                div()
+                    .id("blocked-user-banner")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(10.))
+                    .px(px(16.))
+                    .py(px(8.))
+                    .bg(rgb(paper))
+                    .border_b_1()
+                    .border_color(line)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.))
+                            .min_w(px(0.))
+                            .flex_1()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(danger))
+                                    .child("⊘"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.5))
+                                    .text_color(rgb(ink))
+                                    .truncate()
+                                    .child(format!(
+                                        "Bạn đã chặn tin nhắn và cuộc gọi từ {}",
+                                        conv.name
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("blocked-unblock-btn")
+                            .flex_none()
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(4.))
+                            .bg(rgb(subtle))
+                            .when(!busy, move |el| {
+                                el.cursor_pointer().hover(move |st| st.bg(rgb(hover_bg)))
+                            })
+                            .text_size(px(12.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if busy { muted } else { ink }))
+                            .when(!busy, |el| {
+                                el.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.unblock_uid(unblock_uid.clone(), cx);
+                                    cx.notify();
+                                }))
+                            })
+                            .child(if busy { "Đang bỏ chặn…" } else { "Bỏ chặn" }),
+                    ),
+            );
+        }
+        stack.into_any_element()
     }
 
     fn pinned_bar(&self, conv: &ChatConv, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -2425,10 +2579,12 @@ enum HeaderAction {
 
 #[derive(Clone)]
 pub(crate) enum MsgRowItem {
+    IntroCard,
     LoadOlder(usize),
     LoadOlderCloud,
     DateChip(String),
     UnreadDivider(u32),
+    SystemEvent(usize),
     Bubble {
         msg_idx: usize,
         album_start: usize,
@@ -2461,15 +2617,21 @@ impl ShellView {
             && !self.cloud_history_exhausted.contains(&row.thread_id)
         {
             items.push(MsgRowItem::LoadOlderCloud);
+            if msgs.is_empty() {
+                items.push(MsgRowItem::IntroCard);
+            }
+        } else {
+            items.push(MsgRowItem::IntroCard);
         }
         let last_own_id = msgs
             .iter()
             .rev()
-            .find(|m| m.from_me && !m.recalled)
+            .find(|m| m.from_me && !m.recalled && m.kind != MsgKind::System)
             .map(|m| m.id);
         let mut last_day: Option<i64> = None;
         let now_ms = data::now_ms();
         let mut i = 0;
+        let mut prev_was_system = false;
         while i < msgs.len() {
             let msg = &msgs[i];
             let day = (msg.at_ms > 0).then(|| data::vn_day(msg.at_ms));
@@ -2483,6 +2645,24 @@ impl ShellView {
                 items.push(MsgRowItem::DateChip(chip));
                 last_day = day;
             }
+            let is_sys = msg.kind == MsgKind::System
+                || (msg.kind == MsgKind::Text
+                    && !msg.recalled
+                    && media::is_system_event_text(&msg.text));
+            if is_sys {
+                if let Some((first_unread_id, unread_total)) = unread_marker {
+                    if divider_row.is_none() && msg.id == first_unread_id {
+                        divider_row = Some(items.len());
+                        items.push(MsgRowItem::UnreadDivider(unread_total));
+                    }
+                }
+                let row_ix = items.len();
+                row_ids.push((row_ix, msg.id));
+                items.push(MsgRowItem::SystemEvent(hidden + i));
+                prev_was_system = true;
+                i += 1;
+                continue;
+            }
             let album_end = data::photo_album_end(msgs, i);
             let span = if album_end > i + 1 { album_end } else { i + 1 };
             let mut starts_unread = false;
@@ -2495,13 +2675,21 @@ impl ShellView {
             }
             let head = &msgs[i];
             let tail = &msgs[span - 1];
-            let prev = if new_day || starts_unread {
+            let prev = if new_day || starts_unread || prev_was_system {
                 None
             } else {
                 i.checked_sub(1).and_then(|j| msgs.get(j))
             };
-            let next = msgs.get(span);
-            let first = prev.is_none_or(|p| !same_block(p, head)) || i == 0 || starts_unread;
+            let next = msgs.get(span).filter(|n| {
+                n.kind != MsgKind::System
+                    && !(n.kind == MsgKind::Text
+                        && !n.recalled
+                        && media::is_system_event_text(&n.text))
+            });
+            let first = prev.is_none_or(|p| !same_block(p, head))
+                || i == 0
+                || starts_unread
+                || prev_was_system;
             let last = next.is_none_or(|n| !same_block(tail, n));
             let has_status_pill = row.live && tail.from_me && Some(tail.id) == last_own_id;
             let bubble_row_ix = items.len();
@@ -2516,6 +2704,7 @@ impl ShellView {
                 last,
                 has_status_pill,
             });
+            prev_was_system = false;
             i = span;
         }
         if !msgs.is_empty() {
@@ -2785,6 +2974,9 @@ impl ShellView {
                             return div().into_any_element();
                         };
                         let inner = match item {
+                            MsgRowItem::IntroCard => {
+                                this.intro_card(&row_owned).into_any_element()
+                            }
                             MsgRowItem::LoadOlder(hidden_n) => div()
                                 .id("load-older")
                                 .flex()
@@ -2858,6 +3050,13 @@ impl ShellView {
                             MsgRowItem::UnreadDivider(count) => {
                                 unread_separator_row(*count).into_any_element()
                             }
+                            MsgRowItem::SystemEvent(msg_idx) => {
+                                let all = this.messages_of(conv_id);
+                                match all.get(*msg_idx) {
+                                    Some(shown) => system_event_row(shown).into_any_element(),
+                                    None => div().into_any_element(),
+                                }
+                            }
                             MsgRowItem::Bubble {
                                 msg_idx,
                                 album_start,
@@ -2893,11 +3092,14 @@ impl ShellView {
                                 div().h(px(48.)).w_full().flex_none().into_any_element()
                             }
                         };
-                        let row_hl = matches!(item, MsgRowItem::Bubble { msg_idx, .. } if {
-                            this.messages_of(conv_id)
-                                .get(*msg_idx)
-                                .is_some_and(|m| this.is_msg_highlighted(m.id))
-                        });
+                        let row_hl = match item {
+                            MsgRowItem::Bubble { msg_idx, .. } | MsgRowItem::SystemEvent(msg_idx) => {
+                                this.messages_of(conv_id)
+                                    .get(*msg_idx)
+                                    .is_some_and(|m| this.is_msg_highlighted(m.id))
+                            }
+                            _ => false,
+                        };
                         let hl_bg = if crate::color::is_dark() {
                             gpui::rgba(0xFFFFFF18)
                         } else {
@@ -3008,6 +3210,88 @@ impl ShellView {
                         ),
                 )
             })
+            .when_some(
+                self.unread_reacts
+                    .get(&conv_id)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| (v.len(), v.last().map(|&(_, idx)| idx).unwrap_or(0))),
+                |el, (react_count, preset_idx)| {
+                    let dark = crate::color::is_dark();
+                    let paper = token_rgb("--layer-background", "#ffffff");
+                    let hover = token_rgb("--layer-background-hover", "#f1f2f4");
+                    let icon_col = token_rgb("--icon-secondary", "#5a6981");
+                    let ink = token_rgb("--text-primary", "#081b3a");
+                    let line = crate::color::border_subtle();
+                    let top_px = if self.unread_above_count(conv_id) > 0 {
+                        78.0
+                    } else {
+                        14.0
+                    };
+                    let tip_txt = format!("{react_count} cảm xúc mới — Nhấn để xem");
+                    let react_icon = match media::reaction_icon_by_index(preset_idx) {
+                        Some(image) => img(image)
+                            .size(px(18.))
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        None => div()
+                            .text_size(px(14.))
+                            .child(
+                                crate::read_sync::REACTION_PRESETS
+                                    .get(preset_idx)
+                                    .map(|p| p.0)
+                                    .unwrap_or("❤️"),
+                            )
+                            .into_any_element(),
+                    };
+                    el.child(
+                        div()
+                            .id("chat-jump-react")
+                            .absolute()
+                            .top(px(top_px))
+                            .right(px(16.))
+                            .h(px(36.))
+                            .px(px(10.))
+                            .rounded(px(18.))
+                            .bg(rgb(paper))
+                            .border_1()
+                            .border_color(line)
+                            .shadow_md()
+                            .occlude()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .cursor_pointer()
+                            .hover(move |st| st.bg(rgb(hover)))
+                            .tooltip(move |_, cx| tip(&tip_txt, cx))
+                            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.jump_to_unread_react(conv_id, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_color(rgb(icon_col))
+                                    .child(fonts::icon_el(ic::CHEVRON_DOUBLE_UP, "⌃", 16.)),
+                            )
+                            .child(div().w(px(1.)).h(px(16.)).bg(line))
+                            .child(react_icon)
+                            .when(react_count > 1, |pill| {
+                                pill.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_family(FAMILY_SEMIBOLD)
+                                        .text_color(rgb(if dark { 0xff_ffff } else { ink }))
+                                        .child(format_nav_counter(react_count as u32)),
+                                )
+                            }),
+                    )
+                },
+            )
             .when(
                 self.chat_scrolled_up
                     || !self.new_below_ids.is_empty()
@@ -3943,13 +4227,14 @@ impl ShellView {
                 div()
                     .id(key)
                     .flex()
+                    .flex_none()
                     .flex_row()
                     .items_center()
-                    .gap(px(6.))
-                    .h(px(36.))
-                    .px(px(14.))
+                    .gap(px(5.))
+                    .h(px(32.))
+                    .px(px(10.))
                     .rounded(px(4.))
-                    .text_size(px(14.))
+                    .text_size(px(13.))
                     .font_family(FAMILY_SEMIBOLD)
                     .text_color(if enabled {
                         rgb(color)
@@ -3968,7 +4253,7 @@ impl ShellView {
                             )))
                         })
                     })
-                    .child(fonts::icon_el(icon, "", 18.))
+                    .child(fonts::icon_el(icon, "", 15.))
                     .child(crate::i18n::t(&label))
             };
         let any = count > 0;
@@ -3976,10 +4261,12 @@ impl ShellView {
             .flex()
             .flex_none()
             .flex_row()
+            .flex_wrap()
             .items_center()
-            .gap(px(8.))
-            .h(px(COMPOSER_INPUT_H + COMPOSER_BAR_H))
-            .px(px(16.))
+            .gap(px(6.))
+            .min_h(px(COMPOSER_INPUT_H + COMPOSER_BAR_H))
+            .px(px(12.))
+            .py(px(8.))
             .bg(rgb(paper))
             .border_t_1()
             .border_color(crate::color::border_subtle())
@@ -3987,8 +4274,10 @@ impl ShellView {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(15.))
+                    .min_w(px(68.))
+                    .text_size(px(13.5))
                     .font_family(FAMILY_SEMIBOLD)
+                    .truncate()
                     .child(format!("Đã chọn {count}")),
             )
             .child(
@@ -4019,6 +4308,31 @@ impl ShellView {
                     },
                 )),
             )
+            .child({
+                let has_media = picked(self).iter().any(|m| {
+                    !m.recalled
+                        && matches!(
+                            m.kind,
+                            MsgKind::Photo
+                                | MsgKind::Video
+                                | MsgKind::File
+                                | MsgKind::Voice
+                                | MsgKind::Doodle
+                                | MsgKind::Gif
+                        )
+                });
+                btn("sel-save-media", '\u{EAC4}', "Lưu", ink, has_media)
+                    .tooltip(|_, cx| tip("Lưu hàng loạt ảnh, video, tệp đã chọn", cx))
+                    .on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        let msgs = picked(this);
+                        if !msgs.is_empty() {
+                            this.bulk_save_selected_media(msgs, cx);
+                        }
+                        cx.notify();
+                    }),
+                )
+            })
             .child({
                 let can_recall = picked(self).iter().any(|m| m.from_me && !m.recalled);
                 btn("sel-undo", '\u{ECF6}', "Thu hồi", red, can_recall).on_click(cx.listener(
@@ -6942,62 +7256,176 @@ impl ShellView {
                     .into_any_element()
             }
             MsgKind::Voice => {
-                // Zalo PC voice bubble: round play button, bars, length.
+                // Upgraded Zalo PC voice bubble: neutral dark-mode safe play button,
+                // 24-bar interactive clickable waveform (real PCM RMS once decoded),
+                // live elapsed/total clock, and clickable `1x / 1.5x / 2x` speed pill.
+                let dark = crate::color::is_dark();
                 let playing = self
                     .voice_playing
                     .as_ref()
                     .is_some_and(|(id, _)| *id == msg.id);
-                let play = msg.clone();
-                let bars = [
-                    6., 12., 18., 10., 22., 14., 8., 16., 20., 12., 6., 14., 18., 10., 8., 12.,
-                ];
+                let (pos_ms, dur_ms) = self
+                    .voice_progress
+                    .get(&msg.id)
+                    .copied()
+                    .unwrap_or((0, msg.file_size));
+                let eff_dur = dur_ms.max(msg.file_size);
+                let progress = if eff_dur > 0 {
+                    (pos_ms as f32 / eff_dur as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let bars: Vec<f32> = self
+                    .voice_waveforms
+                    .get(&msg.id)
+                    .cloned()
+                    .unwrap_or_else(|| fallback_voice_bars(msg.id, 24));
+                let n_bars = bars.len().max(1);
+                let play_bg = if dark {
+                    0xf0_f0_f0
+                } else {
+                    token_rgb("--B55", "#0068ff")
+                };
+                let play_fg = if dark { 0x11_11_11 } else { 0xff_ffff };
+                let active_bar_col = if dark { 0xf0_f0_f0 } else { blue };
+                let idle_bar_col = if dark { 0x55_55_55 } else { muted };
+                let spd_bg = if dark {
+                    0x26_26_26
+                } else {
+                    token_rgb("--layer-background-subtle", "#eef0f3")
+                };
+                let spd_hover = if dark {
+                    0x34_34_34
+                } else {
+                    token_rgb("--layer-background-hover", "#e2e6ec")
+                };
+                let play_msg = msg.clone();
+                let spd_msg = msg.clone();
+                let clock_txt = if playing && eff_dur > 0 {
+                    format!(
+                        "{} / {}",
+                        crate::links::clock(pos_ms),
+                        crate::links::clock(eff_dur)
+                    )
+                } else if eff_dur > 0 {
+                    crate::links::clock(eff_dur)
+                } else {
+                    "Thoại".to_owned()
+                };
+                let speed_txt = crate::shell::voice_speed_label(self.voice_speed);
                 div()
                     .id(("voice", msg.id))
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.))
-                    .w(px(metrics.compact_card_w))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_voice(&play, cx);
-                        cx.notify();
-                    }))
+                    .flex_col()
+                    .gap(px(6.))
+                    .w(px(metrics.compact_card_w.max(230.0).min(metrics.bubble_inner_w)))
                     .child(
                         div()
-                            .flex_none()
-                            .size(px(32.))
-                            .rounded(px(16.))
-                            .bg(rgb(token_rgb("--B55", "#0068ff")))
                             .flex()
+                            .flex_row()
                             .items_center()
-                            .justify_center()
-                            .text_color(rgb(crate::color::on_accent_fg()))
-                            .text_size(px(13.))
-                            .child(if playing { "■" } else { "▶" }),
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .id(("voice-play", msg.id))
+                                    .flex_none()
+                                    .size(px(32.))
+                                    .rounded(px(16.))
+                                    .bg(rgb(play_bg))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(rgb(play_fg))
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_voice(&play_msg, cx);
+                                        cx.notify();
+                                    }))
+                                    .child(if playing { "■" } else { "▶" }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .h(px(26.))
+                                    .flex_1()
+                                    .gap(px(2.))
+                                    .children(bars.into_iter().enumerate().map(|(bi, amp)| {
+                                        let h = (5.0 + amp.clamp(0.15, 1.0) * 19.0).round();
+                                        let bar_frac = (bi as f32) / (n_bars as f32);
+                                        let filled = (playing || pos_ms > 0) && bar_frac <= progress;
+                                        let seek_msg = msg.clone();
+                                        let bar_id =
+                                            msg.id.wrapping_mul(31).wrapping_add(bi as u64);
+                                        div()
+                                            .id(("voice-bar", bar_id))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .h(px(26.))
+                                            .px(px(1.))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.play_voice_from(&seek_msg, bar_frac, cx);
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(
+                                                div()
+                                                    .w(px(3.))
+                                                    .h(px(h))
+                                                    .rounded(px(1.5))
+                                                    .bg(rgb(if filled {
+                                                        active_bar_col
+                                                    } else {
+                                                        idle_bar_col
+                                                    })),
+                                            )
+                                    })),
+                            ),
                     )
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(2.))
-                            .flex_1()
-                            .children(bars.into_iter().map(move |h| {
-                                div().w(px(3.)).h(px(h)).rounded(px(1.5)).bg(if playing {
-                                    rgb(blue)
-                                } else {
-                                    rgb(muted)
-                                })
-                            })),
+                            .justify_between()
+                            .pl(px(42.))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(muted))
+                                    .child(clock_txt),
+                            )
+                            .child(
+                                div()
+                                    .id(("voice-speed", msg.id))
+                                    .px(px(7.))
+                                    .h(px(20.))
+                                    .rounded(px(10.))
+                                    .bg(rgb(spd_bg))
+                                    .hover(move |st| st.bg(rgb(spd_hover)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(11.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(ink))
+                                    .cursor_pointer()
+                                    .tooltip(|_, cx| tip("Đổi tốc độ phát (1x / 1.5x / 2x)", cx))
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.cycle_voice_speed(&spd_msg, cx);
+                                    }))
+                                    .child(speed_txt),
+                            ),
                     )
-                    .child(div().text_size(px(13.)).text_color(rgb(muted)).child(
-                        if msg.file_size > 0 {
-                            crate::links::clock(msg.file_size)
-                        } else {
-                            "Thoại".to_owned()
-                        },
-                    ))
                     .into_any_element()
             }
             MsgKind::Video => {
@@ -7155,6 +7583,9 @@ impl ShellView {
                 metrics.compact_card_w,
                 cx,
             ),
+            MsgKind::Reminder => self.reminder_card(msg, ink, muted, metrics, cx),
+            MsgKind::Todo => self.todo_card(msg, ink, muted, metrics, cx),
+            MsgKind::System => wrapped_text(&msg.text, muted),
             MsgKind::Text => {
                 if is_standalone_like(&msg.text) {
                     let tier = self.big_like_sizes.get(&msg.id).copied().unwrap_or(1);
@@ -8262,6 +8693,457 @@ impl ShellView {
             )
             .into_any_element()
     }
+
+    /// Top-of-chat / empty-conversation profile intro card matching Zalo PC.
+    fn intro_card(&self, conv: &ChatConv) -> gpui::AnyElement {
+        let dark = crate::color::is_dark();
+        let ink = token_rgb("--text-primary", "#081b3a");
+        let muted = token_rgb("--text-secondary", "#5a6981");
+        let card_bg = if dark { 0x16_16_16 } else { 0xff_ffff };
+        let line = crate::color::border_subtle();
+        let is_cloud = self.send2me_id.as_deref() == Some(conv.thread_id.as_str())
+            || conv.name == "My Documents";
+        let subtitle = if is_cloud {
+            "Cloud của tôi · Lưu trữ tin nhắn, ảnh và tệp cá nhân".to_owned()
+        } else if conv.is_group {
+            let n = self
+                .profile_ref(&conv.thread_id)
+                .map(|p| p.members as usize)
+                .filter(|&c| c > 0)
+                .unwrap_or_else(|| self.group_member_uid_names(conv).len());
+            if n > 0 {
+                format!("Nhóm · {n} thành viên")
+            } else {
+                "Nhóm trò chuyện Zalo".to_owned()
+            }
+        } else {
+            format!("Hãy bắt đầu trò chuyện cùng {}", conv.name)
+        };
+        let avatar = if let Some(img_av) = self.shown_photo(&conv.thread_id) {
+            img(img_av)
+                .size(px(56.))
+                .rounded(px(28.))
+                .object_fit(ObjectFit::Cover)
+                .into_any_element()
+        } else {
+            crate::sidebar::letter_disc(
+                &crate::sidebar::avatar_initials(&conv.name),
+                crate::sidebar::avatar_color(&conv.thread_id),
+                56.,
+            )
+            .into_any_element()
+        };
+        div()
+            .id(("intro-card", conv.id))
+            .w_full()
+            .py(px(18.))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .max_w(px(360.))
+                    .px(px(22.))
+                    .py(px(16.))
+                    .rounded(px(12.))
+                    .bg(rgb(card_bg))
+                    .border_1()
+                    .border_color(line)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(avatar)
+                    .child(
+                        div()
+                            .text_size(px(16.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(ink))
+                            .child(conv.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(muted))
+                            .child(subtitle),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Inline Reminder card (`MsgKind::Reminder`) rendered inside the chat stream.
+    fn reminder_card(
+        &self,
+        msg: &ChatMsg,
+        ink: u32,
+        muted: u32,
+        metrics: ChatLayoutMetrics,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let dark = crate::color::is_dark();
+        let subtle = if dark {
+            0x26_26_26
+        } else {
+            token_rgb("--layer-background-subtle", "#eef0f3")
+        };
+        let hover_bg = if dark {
+            0x33_33_33
+        } else {
+            token_rgb("--layer-background-hover", "#e2e6ec")
+        };
+        let active_bg = if dark { 0xf0_f0_f0 } else { token_rgb("--B55", "#0068ff") };
+        let active_fg = if dark { 0x11_11_11 } else { 0xff_ffff };
+        let title = if !msg.file_name.trim().is_empty() {
+            msg.file_name.trim().to_owned()
+        } else {
+            msg.text
+                .trim()
+                .trim_start_matches("[Nhắc hẹn]")
+                .trim_start_matches("[Reminder]")
+                .trim()
+                .to_owned()
+        };
+        let title = if title.is_empty() {
+            "Nhắc hẹn".to_owned()
+        } else {
+            title
+        };
+        let when = if msg.file_size > 1_000_000_000 {
+            crate::todo::format_todo_due(msg.file_size as i64)
+        } else if msg.at_ms > 0 {
+            crate::todo::format_todo_due(msg.at_ms)
+        } else {
+            msg.time.clone()
+        };
+        let rsvp = self.inline_rem_rsvp.get(&msg.id).copied().unwrap_or(0);
+        let msg_id = msg.id;
+        let conv_id = msg.conv;
+        let card_w = metrics.compact_card_w.max(240.0).min(metrics.bubble_inner_w);
+        div()
+            .flex()
+            .flex_col()
+            .w(px(card_w))
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().text_size(px(14.)).child("⏰"))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(muted))
+                            .child("Nhắc hẹn"),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(14.5))
+                    .line_height(px(20.))
+                    .font_family(FAMILY_SEMIBOLD)
+                    .text_color(rgb(ink))
+                    .child(title),
+            )
+            .when(!when.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(rgb(muted))
+                        .child(format!("Thời gian: {when}")),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .pt(px(4.))
+                    .border_t_1()
+                    .border_color(crate::color::border_vanish())
+                    .child(
+                        div()
+                            .id(("rem-join", msg_id))
+                            .flex_1()
+                            .h(px(28.))
+                            .rounded(px(5.))
+                            .bg(rgb(if rsvp == 1 { active_bg } else { subtle }))
+                            .hover(move |st| {
+                                st.bg(rgb(if rsvp == 1 { active_bg } else { hover_bg }))
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if rsvp == 1 { active_fg } else { ink }))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.inline_rem_rsvp.insert(msg_id, 1);
+                                this.set_note("Đã xác nhận tham gia nhắc hẹn");
+                                cx.notify();
+                            }))
+                            .child(if rsvp == 1 { "✓ Tham gia" } else { "Tham gia" }),
+                    )
+                    .child(
+                        div()
+                            .id(("rem-decline", msg_id))
+                            .flex_1()
+                            .h(px(28.))
+                            .rounded(px(5.))
+                            .bg(rgb(if rsvp == 2 { active_bg } else { subtle }))
+                            .hover(move |st| {
+                                st.bg(rgb(if rsvp == 2 { active_bg } else { hover_bg }))
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if rsvp == 2 { active_fg } else { ink }))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.inline_rem_rsvp.insert(msg_id, 2);
+                                this.set_note("Đã từ chối nhắc hẹn");
+                                cx.notify();
+                            }))
+                            .child(if rsvp == 2 { "✓ Từ chối" } else { "Từ chối" }),
+                    )
+                    .child(
+                        div()
+                            .id(("rem-detail", msg_id))
+                            .px(px(8.))
+                            .h(px(28.))
+                            .rounded(px(5.))
+                            .bg(rgb(subtle))
+                            .hover(move |st| st.bg(rgb(hover_bg)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_board_dialog(
+                                    conv_id,
+                                    crate::board::BoardTab::Reminders,
+                                    cx,
+                                );
+                                cx.notify();
+                            }))
+                            .child("Chi tiết"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Inline To-Do ("Giao việc") card (`MsgKind::Todo`) rendered inside the chat stream.
+    fn todo_card(
+        &self,
+        msg: &ChatMsg,
+        ink: u32,
+        muted: u32,
+        metrics: ChatLayoutMetrics,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let dark = crate::color::is_dark();
+        let subtle = if dark {
+            0x26_26_26
+        } else {
+            token_rgb("--layer-background-subtle", "#eef0f3")
+        };
+        let hover_bg = if dark {
+            0x33_33_33
+        } else {
+            token_rgb("--layer-background-hover", "#e2e6ec")
+        };
+        let ok = token_rgb("--G60", "#15a85f");
+        let done = self.inline_todo_done.contains(&msg.id);
+        let title = if !msg.file_name.trim().is_empty() {
+            msg.file_name.trim().to_owned()
+        } else {
+            msg.text
+                .trim()
+                .trim_start_matches("[Giao việc]")
+                .trim_start_matches("[To-Do]")
+                .trim()
+                .to_owned()
+        };
+        let title = if title.is_empty() {
+            "Công việc được giao".to_owned()
+        } else {
+            title
+        };
+        let due = if msg.file_size > 1_000_000_000 {
+            crate::todo::format_todo_due(msg.file_size as i64)
+        } else {
+            String::new()
+        };
+        let msg_id = msg.id;
+        let card_w = metrics.compact_card_w.max(240.0).min(metrics.bubble_inner_w);
+        div()
+            .flex()
+            .flex_col()
+            .w(px(card_w))
+            .gap(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().text_size(px(13.)).child("☑"))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_family(FAMILY_SEMIBOLD)
+                                    .text_color(rgb(muted))
+                                    .child("Giao việc"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .bg(rgb(subtle))
+                            .text_size(px(11.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if done { ok } else { muted }))
+                            .child(if done { "Hoàn thành" } else { "Đang làm" }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(14.5))
+                    .line_height(px(20.))
+                    .font_family(FAMILY_SEMIBOLD)
+                    .text_color(rgb(if done { muted } else { ink }))
+                    .child(title),
+            )
+            .when(!due.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(rgb(muted))
+                        .child(format!("Hạn: {due}")),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .pt(px(4.))
+                    .border_t_1()
+                    .border_color(crate::color::border_vanish())
+                    .child(
+                        div()
+                            .id(("todo-toggle", msg_id))
+                            .flex_1()
+                            .h(px(28.))
+                            .rounded(px(5.))
+                            .bg(rgb(subtle))
+                            .hover(move |st| st.bg(rgb(hover_bg)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.))
+                            .font_family(FAMILY_SEMIBOLD)
+                            .text_color(rgb(if done { ok } else { ink }))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if !this.inline_todo_done.remove(&msg_id) {
+                                    this.inline_todo_done.insert(msg_id);
+                                    this.set_note("Đã đánh dấu hoàn thành công việc");
+                                } else {
+                                    this.set_note("Đã mở lại công việc");
+                                }
+                                cx.notify();
+                            }))
+                            .child(if done { "Mở lại" } else { "✓ Hoàn thành" }),
+                    )
+                    .child(
+                        div()
+                            .id(("todo-open-all", msg_id))
+                            .px(px(10.))
+                            .h(px(28.))
+                            .rounded(px(5.))
+                            .bg(rgb(subtle))
+                            .hover(move |st| st.bg(rgb(hover_bg)))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(12.))
+                            .text_color(rgb(muted))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open_todo(cx);
+                                cx.notify();
+                            }))
+                            .child("Quản lý"),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+/// Deterministic fallback 24-bar voice waveform curve before a voice file is decoded.
+fn fallback_voice_bars(seed: u64, count: usize) -> Vec<f32> {
+    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    (0..count.max(1))
+        .map(|i| {
+            x = x.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let env = ((i as f32 / count.max(1) as f32) * std::f32::consts::PI).sin();
+            let rnd = ((x >> 33) as f32) / (u32::MAX as f32);
+            (0.22 + 0.50 * rnd + 0.28 * env).clamp(0.20, 0.98)
+        })
+        .collect()
+}
+
+/// Centered Zalo PC `event-message` pill for system / group event rows.
+fn system_event_row(msg: &ChatMsg) -> impl IntoElement {
+    let dark = crate::color::is_dark();
+    let pill_bg = if dark { 0x1c_1c_1c } else { 0xe8_ec_f2 };
+    let text_col = if dark { 0xb8_b8_b8 } else { 0x44_54_6f };
+    let body = msg.text.trim();
+    let label = if body.is_empty() {
+        msg.file_name.trim().to_owned()
+    } else {
+        body.to_owned()
+    };
+    div()
+        .id(("sys-event", msg.id))
+        .w_full()
+        .py(px(6.))
+        .flex()
+        .justify_center()
+        .child(
+            div()
+                .max_w(px(520.))
+                .px(px(14.))
+                .py(px(5.))
+                .rounded(px(12.))
+                .bg(rgb(pill_bg))
+                .text_size(px(12.))
+                .line_height(px(17.))
+                .text_color(rgb(text_col))
+                .child(label),
+        )
 }
 
 fn receipt_heading(text: &str, color: u32) -> gpui::AnyElement {
@@ -8959,5 +9841,40 @@ mod tests {
             crate::chat_select::interactive_span_at("0868656872", 3, &[]),
             Some(crate::chat_select::InlineHit::Phone("0868656872".to_owned()))
         );
+    }
+
+    #[test]
+    fn phase2_system_events_voice_dsp_and_ttl_helpers() {
+        assert!(media::is_system_event_text("Trường đã thêm Minh vào nhóm"));
+        assert!(media::is_system_event_text("An đã rời khỏi nhóm"));
+        assert!(media::is_system_event_text("Trường đã ghim một tin nhắn"));
+        assert!(media::is_system_event_text("Các bạn đã trở thành bạn bè"));
+        assert!(!media::is_system_event_text("Hôm nay trời đẹp quá"));
+        assert!(!media::is_system_event_text("Anh đã thêm đường vào cà phê rồi"));
+
+        assert_eq!(crate::shell::next_voice_speed(1.0), 1.5);
+        assert_eq!(crate::shell::next_voice_speed(1.5), 2.0);
+        assert_eq!(crate::shell::next_voice_speed(2.0), 1.0);
+        assert_eq!(crate::shell::voice_speed_label(1.0), "1x");
+        assert_eq!(crate::shell::voice_speed_label(1.5), "1.5x");
+        assert_eq!(crate::shell::voice_speed_label(2.0), "2x");
+
+        assert_eq!(crate::shell::format_auto_delete_ttl(86_400_000), "1 ngày");
+        assert_eq!(
+            crate::shell::format_auto_delete_ttl(7 * 86_400_000),
+            "7 ngày"
+        );
+        assert_eq!(crate::shell::format_auto_delete_ttl(3_600_000), "1 giờ");
+
+        let sine: Vec<i16> = (0..1600)
+            .map(|i| ((i as f32 * 0.1).sin() * 12000.0) as i16)
+            .collect();
+        let bars = crate::audio_play::compute_waveform_bars(&sine, 1, 24);
+        assert_eq!(bars.len(), 24);
+        assert!(bars.iter().all(|&v| (0.18..=1.0).contains(&v)));
+        let fast = crate::audio_play::resample_speed(&sine, 1, 2.0);
+        assert_eq!(fast.len(), 800);
+        let fb = fallback_voice_bars(42, 24);
+        assert_eq!(fb.len(), 24);
     }
 }

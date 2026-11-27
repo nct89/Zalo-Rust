@@ -332,6 +332,10 @@ enum MenuAction {
     ReportConv(u64),
     /// Create reminder from message content.
     CreateReminder(ChatMsg),
+    /// Create To-Do ("Giao việc") task from message content.
+    CreateTodo(ChatMsg),
+    /// Reveal downloaded/cached photo, video, or file in the OS file manager.
+    RevealMedia(ChatMsg),
     /// Set alias for friend.
     RenameAlias {
         uid: String,
@@ -1870,6 +1874,22 @@ impl ShellView {
             MenuAction::CreateReminder(msg) => {
                 self.open_board_reminder_with_text(msg.conv, &msg.text, cx);
             }
+            MenuAction::CreateTodo(msg) => {
+                let body = if !msg.text.trim().is_empty() {
+                    msg.text.clone()
+                } else {
+                    msg.file_name.clone()
+                };
+                self.open_todo_with_text(&body, cx);
+            }
+            MenuAction::RevealMedia(msg) => {
+                let local = crate::media::local_media_file(
+                    msg.media_path.as_deref(),
+                    &msg.media_url,
+                    &msg.href,
+                );
+                self.reveal_file(&msg.file_name, local.as_deref(), cx);
+            }
             MenuAction::RenameAlias { uid, name } => self.open_alias(uid, name, cx),
             MenuAction::RemoveFriend { uid, name } => self.open_remove_friend(uid, name),
             MenuAction::OpenUrl(url) => self.open_url_checked(url.to_owned(), cx),
@@ -2417,6 +2437,24 @@ fn message_rows(
                 "Lưu vào My Documents",
                 MenuAction::SaveToCloud(msg.clone()),
             ));
+            if crate::media::local_media_file(
+                msg.media_path.as_deref(),
+                &msg.media_url,
+                &msg.href,
+            )
+            .is_some()
+            {
+                sub.push(icon_item(
+                    mi::DOCS,
+                    "Hiển thị trong thư mục",
+                    MenuAction::RevealMedia(msg.clone()),
+                ));
+            }
+            sub.push(icon_item(
+                mi::REMINDER,
+                "Giao việc",
+                MenuAction::CreateTodo(msg.clone()),
+            ));
             sub
         }
         MsgKind::File => {
@@ -2425,11 +2463,27 @@ fn message_rows(
                 "Lưu về máy",
                 MenuAction::SaveFile(msg.clone()),
             ));
-            vec![icon_item(
+            let mut sub = vec![icon_item(
                 mi::DOCS,
                 "Lưu vào My Documents",
                 MenuAction::SaveToCloud(msg.clone()),
-            )]
+            )];
+            if msg.media_path.as_ref().is_some_and(|p| p.is_file())
+                || (!msg.file_name.is_empty()
+                    && crate::media::find_downloaded(&msg.file_name).is_some())
+            {
+                sub.push(icon_item(
+                    mi::DOCS,
+                    "Hiển thị trong thư mục",
+                    MenuAction::RevealMedia(msg.clone()),
+                ));
+            }
+            sub.push(icon_item(
+                mi::REMINDER,
+                "Giao việc",
+                MenuAction::CreateTodo(msg.clone()),
+            ));
+            sub
         }
         MsgKind::Link => {
             rows.push(icon_item(
@@ -2437,11 +2491,18 @@ fn message_rows(
                 "Copy link",
                 MenuAction::Copy(msg.href.clone()),
             ));
-            vec![icon_item(
-                mi::REMINDER,
-                "Tạo nhắc hẹn",
-                MenuAction::CreateReminder(msg.clone()),
-            )]
+            vec![
+                icon_item(
+                    mi::REMINDER,
+                    "Tạo nhắc hẹn",
+                    MenuAction::CreateReminder(msg.clone()),
+                ),
+                icon_item(
+                    mi::MULTI,
+                    "Giao việc",
+                    MenuAction::CreateTodo(msg.clone()),
+                ),
+            ]
         }
         _ => {
             let link = crate::media::first_link(&msg.text);
@@ -2453,11 +2514,18 @@ fn message_rows(
                     MenuAction::Copy(msg.text.clone()),
                 )),
             }
-            vec![icon_item(
-                mi::REMINDER,
-                "Tạo nhắc hẹn",
-                MenuAction::CreateReminder(msg.clone()),
-            )]
+            vec![
+                icon_item(
+                    mi::REMINDER,
+                    "Tạo nhắc hẹn",
+                    MenuAction::CreateReminder(msg.clone()),
+                ),
+                icon_item(
+                    mi::MULTI,
+                    "Giao việc",
+                    MenuAction::CreateTodo(msg.clone()),
+                ),
+            ]
         }
     };
     rows.push(Row::Sep);

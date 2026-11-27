@@ -590,7 +590,15 @@ impl ShellView {
                 (None, text)
             }
             MsgKind::Card => (None, "Danh thiếp".to_owned()),
-            MsgKind::Link | MsgKind::Text => (None, last.text.replace('\n', " ")),
+            MsgKind::Reminder => (
+                None,
+                preview_marked(&last.text, &last.file_name, "Nhắc hẹn"),
+            ),
+            MsgKind::Todo => (
+                None,
+                preview_marked(&last.text, &last.file_name, "Giao việc"),
+            ),
+            MsgKind::System | MsgKind::Link | MsgKind::Text => (None, last.text.replace('\n', " ")),
         };
         let text = if last.recalled {
             str_vi("STR_UNDO_MESSAGE", "Tin nhắn đã thu hồi").to_owned()

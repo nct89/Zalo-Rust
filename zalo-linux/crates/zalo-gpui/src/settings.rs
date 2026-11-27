@@ -2608,7 +2608,7 @@ impl ShellView {
         .detach();
     }
 
-    fn unblock_uid(&mut self, uid: String, cx: &mut Context<Self>) {
+    pub(crate) fn unblock_uid(&mut self, uid: String, cx: &mut Context<Self>) {
         if cfg!(test) || !self.has_session || !self.privacy.unblocking.insert(uid.clone()) {
             return;
         }

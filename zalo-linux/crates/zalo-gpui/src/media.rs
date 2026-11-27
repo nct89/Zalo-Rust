@@ -62,6 +62,12 @@ pub enum MsgKind {
     Doodle,
     /// `chat.ecard`.
     Ecard,
+    /// Group / conversation system event (`group.event`, member join/leave, pin notice…).
+    System,
+    /// Inline reminder card (`group.reminder` / `chat.reminder`).
+    Reminder,
+    /// Inline task / to-do card (`chat.todo` / `group.todo`).
+    Todo,
 }
 
 /// One choice on a `group.poll` card.
@@ -293,6 +299,25 @@ fn fill_from_attach(meta: &mut MediaMeta, json: &str) {
                 meta.href = href;
             }
             meta.url = text("thumb");
+            return;
+        }
+        "system" | "event" => {
+            meta.kind = MsgKind::System;
+            meta.title = text("title");
+            return;
+        }
+        "reminder" => {
+            meta.kind = MsgKind::Reminder;
+            meta.title = text("title");
+            meta.href = text("id");
+            meta.size = num("start_time").max(num("time")).max(num("size"));
+            return;
+        }
+        "todo" => {
+            meta.kind = MsgKind::Todo;
+            meta.title = text("title");
+            meta.href = text("id");
+            meta.size = num("due_time").max(num("time")).max(num("size"));
             return;
         }
         "card" => {
@@ -563,6 +588,46 @@ fn fill_from_server_message(meta: &mut MediaMeta, value: &serde_json::Value) {
         "group.poll" => {
             let body = poll_from_message(&content);
             apply_poll(meta, &body);
+        }
+        "group.reminder" | "chat.reminder" => {
+            meta.kind = MsgKind::Reminder;
+            meta.title = text(&content, "title");
+            if meta.title.is_empty() {
+                meta.title = text(&params, "title");
+            }
+            meta.href = text(&content, "id");
+            if meta.href.is_empty() {
+                meta.href = text(&params, "id");
+            }
+            meta.size = u64::from(num(&params, "startTime"))
+                .max(u64::from(num(&content, "startTime")))
+                .max(
+                    params
+                        .get("startTime")
+                        .or_else(|| content.get("startTime"))
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
+                        .unwrap_or(0),
+                );
+        }
+        "chat.todo" | "group.todo" => {
+            meta.kind = MsgKind::Todo;
+            meta.title = text(&content, "title");
+            if meta.title.is_empty() {
+                meta.title = text(&params, "title");
+            }
+            meta.href = text(&content, "id");
+            if meta.href.is_empty() {
+                meta.href = text(&params, "id");
+            }
+            meta.size = params
+                .get("dueDate")
+                .or_else(|| content.get("dueDate"))
+                .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
+                .unwrap_or(0);
+        }
+        "group.event" | "chat.sys" | "group.sys" | "event" => {
+            meta.kind = MsgKind::System;
+            meta.title = text(&content, "title");
         }
         "chat.recommended" | "chat.link" => match action {
             "recommened.misscall" => {
@@ -915,6 +980,25 @@ fn fill_from_body(meta: &mut MediaMeta, body: &str) {
         _ if is_group_call_body(trimmed) => {
             meta.kind = MsgKind::Call;
             meta.title = "Cuộc gọi nhóm".to_owned();
+        }
+        _ if trimmed.starts_with("[Nhắc hẹn]") || trimmed.starts_with("[Reminder]") => {
+            meta.kind = MsgKind::Reminder;
+            meta.title = trimmed
+                .trim_start_matches("[Nhắc hẹn]")
+                .trim_start_matches("[Reminder]")
+                .trim()
+                .to_owned();
+        }
+        _ if trimmed.starts_with("[Giao việc]") || trimmed.starts_with("[To-Do]") => {
+            meta.kind = MsgKind::Todo;
+            meta.title = trimmed
+                .trim_start_matches("[Giao việc]")
+                .trim_start_matches("[To-Do]")
+                .trim()
+                .to_owned();
+        }
+        _ if is_system_event_text(trimmed) => {
+            meta.kind = MsgKind::System;
         }
         _ => {
             if let Some(url) = first_link(trimmed) {
@@ -1874,7 +1958,44 @@ pub fn clock_below_card(kind: MsgKind) -> bool {
             | MsgKind::Video
             | MsgKind::Poll
             | MsgKind::Card
+            | MsgKind::Reminder
+            | MsgKind::Todo
     )
+}
+
+/// True when a plain-text line matches an official Zalo PC centered system event
+/// (`event-message`: group membership/settings updates, pin notices, auto-delete,
+/// or friend-added notices).
+#[must_use]
+pub fn is_system_event_text(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.contains('\n') || t.len() > 220 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "đã thêm ",
+        "đã rời khỏi nhóm",
+        "đã xóa ",
+        "đã đổi tên nhóm",
+        "đã thay đổi ảnh đại diện nhóm",
+        "đã bổ nhiệm ",
+        "đã gỡ quyền phó nhóm",
+        "đã ghim một tin nhắn",
+        "đã bỏ ghim một tin nhắn",
+        "đã bật tin nhắn tự xóa",
+        "đã tắt tin nhắn tự xóa",
+        "các bạn đã trở thành bạn bè",
+        "đã tham gia nhóm qua link",
+        "đã thay đổi cài đặt nhóm",
+    ];
+    if lower.contains("đã thêm ") && !lower.contains("vào nhóm") {
+        return false;
+    }
+    if lower.contains("đã xóa ") && !lower.contains("khỏi nhóm") {
+        return false;
+    }
+    PATTERNS.iter().any(|p| lower.contains(p))
 }
 
 /// True when `text` is a raw mobile/local file URI (e.g. Android
@@ -1913,8 +2034,9 @@ pub fn hide_marker_text(kind: MsgKind, text: &str) -> bool {
                 || t.is_empty()
                 || is_local_media_uri(t)
         }
-        MsgKind::Location | MsgKind::Ecard => true,
+        MsgKind::Location | MsgKind::Ecard | MsgKind::Reminder | MsgKind::Todo => true,
         MsgKind::Call | MsgKind::MissedCall | MsgKind::Card | MsgKind::Link => true,
+        MsgKind::System => false,
         MsgKind::Text => false,
     }
 }

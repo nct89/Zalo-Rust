@@ -3850,6 +3850,9 @@ impl ShellView {
             MsgKind::Link => "Liên kết",
             MsgKind::Call | MsgKind::MissedCall => "Cuộc gọi",
             MsgKind::Voice => "Tin nhắn thoại",
+            MsgKind::Reminder => "Nhắc hẹn",
+            MsgKind::Todo => "Giao việc",
+            MsgKind::System => "Thông báo hệ thống",
             _ => "Tin nhắn",
         };
         let mut rows: Vec<(&'static str, String)> = vec![

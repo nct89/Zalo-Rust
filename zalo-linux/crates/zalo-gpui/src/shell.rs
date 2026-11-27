@@ -508,6 +508,20 @@ pub struct ShellView {
     pub(crate) like_hold: Option<(std::time::Instant, gpui::Point<gpui::Pixels>)>,
     /// Sent big-like scale tier (`2` = medium 54 px, `3` = large 74 px) keyed by `ChatMsg.id`.
     pub(crate) big_like_sizes: HashMap<u64, u8>,
+    /// Unread incoming reactions per conversation `(msg_id, preset_idx)` for `[↑↑ | ❤️]`.
+    pub(crate) unread_reacts: HashMap<u64, Vec<(u64, usize)>>,
+    /// Saved top-visible `ChatMsg.id` per conversation so switching chats restores scroll position.
+    pub(crate) conv_scroll_anchor: HashMap<u64, u64>,
+    /// Active voice message playback speed (`1.0`, `1.5`, `2.0`).
+    pub(crate) voice_speed: f32,
+    /// Cached 24-bar normalized RMS waveform amplitudes per voice `ChatMsg.id`.
+    pub(crate) voice_waveforms: HashMap<u64, Vec<f32>>,
+    /// Cached `(pos_ms, dur_ms)` playback progress per voice `ChatMsg.id`.
+    pub(crate) voice_progress: HashMap<u64, (u64, u64)>,
+    /// Local completion toggle cache for inline Todo cards (`ChatMsg.id`).
+    pub(crate) inline_todo_done: HashSet<u64>,
+    /// Local RSVP status cache (`1` = Tham gia, `2` = Từ chối) for inline Reminder cards.
+    pub(crate) inline_rem_rsvp: HashMap<u64, i64>,
     /// Cached last window title pushed via `window.set_window_title` (avoids per-frame X11 IPC).
     last_window_title: String,
     /// Cache key for `warm_links`/`warm_polls`/`warm_info_media` so scroll frames skip rescanning messages.
@@ -986,6 +1000,13 @@ impl ShellView {
             react_hold_gen: 0,
             like_hold: None,
             big_like_sizes: HashMap::new(),
+            unread_reacts: HashMap::new(),
+            conv_scroll_anchor: HashMap::new(),
+            voice_speed: 1.0,
+            voice_waveforms: HashMap::new(),
+            voice_progress: HashMap::new(),
+            inline_todo_done: HashSet::new(),
+            inline_rem_rsvp: HashMap::new(),
             last_window_title: String::new(),
             last_warm_key: None,
             presence: crate::presence::Presence::default(),
@@ -1789,14 +1810,68 @@ impl ShellView {
         .detach();
     }
 
-    /// Voice bubble ▶ / ■: download once to the media cache, play in-process
-    /// via `symphonia` + `CardSpeaker` (AMR goes through Zalo's `/mp3?url=` like Zalo PC).
+    /// Voice bubble ▶ / ■: toggle play/pause from saved position or start.
     pub(crate) fn toggle_voice(&mut self, msg: &ChatMsg, cx: &mut Context<Self>) {
         if let Some((id, handle)) = self.voice_playing.take() {
+            let pos = handle.position_ms();
+            let dur = handle.duration_ms();
             handle.stop();
+            if dur > 0 {
+                self.voice_progress.insert(id, (pos, dur));
+            }
             if id == msg.id {
                 cx.notify();
                 return;
+            }
+        }
+        let start_frac = self
+            .voice_progress
+            .get(&msg.id)
+            .and_then(|&(pos, dur)| {
+                (dur > 0 && pos + 250 < dur).then_some((pos as f32) / (dur as f32))
+            })
+            .unwrap_or(0.0);
+        self.play_voice_from(msg, start_frac, cx);
+    }
+
+    /// Cycles voice playback speed `1x → 1.5x → 2x → 1x` and seamlessly restarts
+    /// playback at the current playhead if this voice message is currently playing.
+    pub(crate) fn cycle_voice_speed(&mut self, msg: &ChatMsg, cx: &mut Context<Self>) {
+        self.voice_speed = next_voice_speed(self.voice_speed);
+        let playing_this = self
+            .voice_playing
+            .as_ref()
+            .is_some_and(|(id, _)| *id == msg.id);
+        if playing_this {
+            let frac = self
+                .voice_playing
+                .as_ref()
+                .map(|(_, h)| {
+                    let dur = h.duration_ms().max(1);
+                    (h.position_ms() as f32 / dur as f32).clamp(0.0, 0.98)
+                })
+                .unwrap_or(0.0);
+            self.play_voice_from(msg, frac, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Starts (or seeks) in-process voice playback from `start_frac` (`0.0..=1.0`)
+    /// at `self.voice_speed`, caching the decoded 24-bar RMS waveform and ticking
+    /// live progress updates at ~15 FPS.
+    pub(crate) fn play_voice_from(
+        &mut self,
+        msg: &ChatMsg,
+        start_frac: f32,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((old_id, handle)) = self.voice_playing.take() {
+            let pos = handle.position_ms();
+            let dur = handle.duration_ms();
+            handle.stop();
+            if dur > 0 {
+                self.voice_progress.insert(old_id, (pos, dur));
             }
         }
         let local = msg.media_path.clone().filter(|p| p.is_file());
@@ -1812,6 +1887,8 @@ impl ShellView {
         };
         let dir = self.session_dir.clone().filter(|_| self.has_session);
         let id = msg.id;
+        let speed = self.voice_speed;
+        let frac = start_frac.clamp(0.0, 0.98);
         if !path.is_file() {
             self.set_note("Đang tải tin nhắn thoại…");
         }
@@ -1828,34 +1905,42 @@ impl ShellView {
                         })?;
                         std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
                     }
-                    crate::audio_play::play_file(path, None, false, None)
+                    crate::audio_play::play_voice(path, None, frac, speed)
                 })
                 .await;
             let _ = this.update(cx, |view, cx| {
                 match ready {
-                    Ok(handle) => {
+                    Ok((handle, bars, dur_ms)) => {
+                        let pos_ms = handle.position_ms();
+                        view.voice_waveforms.insert(id, bars);
+                        view.voice_progress.insert(id, (pos_ms, dur_ms));
                         view.voice_playing = Some((id, handle));
                         view.note = None;
-                        // Clear the ■ state once in-process playback finishes.
                         cx.spawn(async move |this, cx| loop {
-                            gpui::Timer::after(std::time::Duration::from_millis(250)).await;
+                            gpui::Timer::after(std::time::Duration::from_millis(65)).await;
                             let done = this
                                 .update(cx, |view, cx| {
-                                    let finished = match view.voice_playing.as_ref() {
-                                        Some((pid, handle)) if *pid == id => handle.is_finished(),
-                                        _ => true,
-                                    };
-                                    if finished {
-                                        if view
-                                            .voice_playing
-                                            .as_ref()
-                                            .is_some_and(|(pid, _)| *pid == id)
-                                        {
-                                            view.voice_playing = None;
+                                    let state = view.voice_playing.as_ref().and_then(|(pid, h)| {
+                                        (*pid == id).then(|| {
+                                            (h.is_finished(), h.position_ms(), h.duration_ms())
+                                        })
+                                    });
+                                    match state {
+                                        Some((false, pos, dur)) => {
+                                            view.voice_progress.insert(id, (pos, dur));
+                                            cx.notify();
+                                            false
                                         }
-                                        cx.notify();
+                                        Some((true, _, dur)) => {
+                                            view.voice_playing = None;
+                                            if dur > 0 {
+                                                view.voice_progress.insert(id, (0, dur));
+                                            }
+                                            cx.notify();
+                                            true
+                                        }
+                                        None => true,
                                     }
-                                    finished
                                 })
                                 .unwrap_or(true);
                             if done {
@@ -3225,6 +3310,28 @@ impl ShellView {
             if let Some(msgs) = self.messages.get_mut(&conv_id) {
                 if let Some(msg) = msgs.iter_mut().find(|m| m.id == msg_id) {
                     msg.liked = has_any;
+                }
+            }
+            if !r.from_me && !r.cleared {
+                let preset_idx = crate::read_sync::reaction_preset_index(&r.r_icon, r.r_type);
+                let is_visible_now = if self.selected == Some(conv_id) {
+                    let (vis_s, vis_e) = self.last_visible_range.get();
+                    self.row_ix_of_msg(msg_id)
+                        .is_some_and(|ix| ix >= vis_s && ix < vis_e)
+                } else {
+                    false
+                };
+                if !is_visible_now {
+                    let queue = self.unread_reacts.entry(conv_id).or_default();
+                    if let Some(existing) = queue.iter_mut().find(|(id, _)| *id == msg_id) {
+                        existing.1 = preset_idx;
+                    } else {
+                        queue.push((msg_id, preset_idx));
+                    }
+                }
+            } else if r.cleared {
+                if let Some(queue) = self.unread_reacts.get_mut(&conv_id) {
+                    queue.retain(|(id, _)| *id != msg_id);
                 }
             }
         }
@@ -4848,7 +4955,7 @@ impl ShellView {
     }
 
     /// Profile stored under `key` or its `g_` / bare twin.
-    fn profile_ref(&self, key: &str) -> Option<&crate::profiles::Profile> {
+    pub(crate) fn profile_ref(&self, key: &str) -> Option<&crate::profiles::Profile> {
         self.profiles
             .map
             .get(key)
@@ -5072,6 +5179,149 @@ impl ShellView {
             Ok(_) => self.set_note(format!("Đã lưu {}", dest.display())),
             Err(err) => self.set_note(err.to_string()),
         }
+    }
+
+    /// Saves all selected media/file messages in bulk into a user-chosen folder.
+    pub(crate) fn bulk_save_selected_media(&mut self, msgs: Vec<ChatMsg>, cx: &mut Context<Self>) {
+        use crate::media::MsgKind;
+        let media_msgs: Vec<ChatMsg> = msgs
+            .into_iter()
+            .filter(|m| {
+                !m.recalled
+                    && matches!(
+                        m.kind,
+                        MsgKind::Photo
+                            | MsgKind::Video
+                            | MsgKind::File
+                            | MsgKind::Voice
+                            | MsgKind::Doodle
+                            | MsgKind::Gif
+                    )
+            })
+            .collect();
+        if media_msgs.is_empty() {
+            self.set_note("Không có ảnh, video hoặc tệp nào trong các tin đã chọn");
+            return;
+        }
+        let session_dir = self.session_dir.clone().filter(|_| self.has_session);
+        let fallback_dir = self.download_dir();
+        self.set_note("Đang chọn thư mục lưu hàng loạt…");
+        cx.spawn(async move |this, cx| {
+            let dest_dir = cx
+                .background_executor()
+                .spawn(async move {
+                    match zalo_shell::pick_folder("Chọn thư mục lưu media đã chọn") {
+                        Ok(Some(p)) => Some(p),
+                        Ok(None) => None,
+                        Err(_) => Some(fallback_dir),
+                    }
+                })
+                .await;
+            let Some(dest_dir) = dest_dir else {
+                let _ = this.update(cx, |view, cx| {
+                    view.note = None;
+                    cx.notify();
+                });
+                return;
+            };
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let _ = std::fs::create_dir_all(&dest_dir);
+                    let mut saved = 0usize;
+                    let mut failed = 0usize;
+                    for m in &media_msgs {
+                        let local = crate::media::local_media_file(
+                            m.media_path.as_deref(),
+                            &m.media_url,
+                            &m.href,
+                        )
+                        .or_else(|| {
+                            (!m.file_name.is_empty())
+                                .then(|| crate::media::find_downloaded(&m.file_name))
+                                .flatten()
+                        });
+                        let bytes = if let Some(ref src) = local {
+                            std::fs::read(src).ok()
+                        } else if let Some(ref dir) = session_dir {
+                            let url = if !m.href.is_empty() && m.href.starts_with("http") {
+                                m.href.clone()
+                            } else if !m.media_url.is_empty() && m.media_url.starts_with("http") {
+                                m.media_url.clone()
+                            } else {
+                                String::new()
+                            };
+                            if url.is_empty() {
+                                None
+                            } else {
+                                crate::bridge::block_api(dir, |api| async move {
+                                    api.fetch_limited(&url, 40 << 20)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                })
+                                .ok()
+                            }
+                        } else {
+                            None
+                        };
+                        let Some(data) = bytes else {
+                            failed += 1;
+                            continue;
+                        };
+                        let file_name = if !m.file_name.is_empty() && m.kind == MsgKind::File {
+                            m.file_name.clone()
+                        } else {
+                            let ext = match m.kind {
+                                MsgKind::Video => "mp4",
+                                MsgKind::Voice => "m4a",
+                                _ => image::guess_format(&data)
+                                    .ok()
+                                    .and_then(|f| f.extensions_str().first().copied())
+                                    .unwrap_or("jpg"),
+                            };
+                            format!("zalo-{}.{ext}", m.id)
+                        };
+                        let mut out_path = dest_dir.join(&file_name);
+                        if out_path.exists() {
+                            out_path = dest_dir.join(format!("{}-{file_name}", m.id));
+                        }
+                        if std::fs::write(&out_path, data).is_ok() {
+                            saved += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    (saved, failed, dest_dir)
+                })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                let (saved, failed, dir) = outcome;
+                if saved > 0 && failed == 0 {
+                    view.set_note(format!("Đã lưu {saved} tệp vào {}", dir.display()));
+                } else if saved > 0 {
+                    view.set_note(format!(
+                        "Đã lưu {saved} tệp ({failed} tệp chưa tải được) vào {}",
+                        dir.display()
+                    ));
+                } else {
+                    view.set_note("Không lưu được tệp nào từ các tin đã chọn");
+                }
+                view.select_msgs = None;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// True when `uid` is present in the loaded privacy block list.
+    #[must_use]
+    pub(crate) fn is_uid_blocked(&self, uid: &str) -> bool {
+        !uid.is_empty()
+            && self
+                .privacy
+                .blocked
+                .as_ref()
+                .is_some_and(|list| list.iter().any(|(u, _)| u == uid))
     }
 
     /// Open the folder that holds a file bubble (`STR_VIEW_IN_FOLDER`).
@@ -5597,6 +5847,35 @@ impl ShellView {
             }
         }
 
+        // 2b. Clear any unread-reaction markers that scrolled into view, and
+        // persist the top-visible message id so switching chats restores position.
+        if let Some(queue) = self.unread_reacts.get_mut(&conv_id) {
+            if !queue.is_empty() {
+                let before = queue.len();
+                let row_map = self.msg_row_ids.borrow();
+                queue.retain(|&(mid, _)| {
+                    row_map
+                        .iter()
+                        .find_map(|&(ix, id)| (id == mid).then_some(ix))
+                        .is_none_or(|ix| ix < visible.start || ix >= visible.end)
+                });
+                if queue.len() != before {
+                    changed = true;
+                }
+            }
+        }
+        if scrolled_up {
+            let row_map = self.msg_row_ids.borrow();
+            if let Some(anchor_mid) = row_map
+                .iter()
+                .find_map(|&(ix, id)| (ix >= visible.start && ix < visible.end).then_some(id))
+            {
+                self.conv_scroll_anchor.insert(conv_id, anchor_mid);
+            }
+        } else {
+            self.conv_scroll_anchor.remove(&conv_id);
+        }
+
         // 3. Synchronize sidebar unread badge + `/seenv2` read receipt.
         let above = self.unread_above_count(conv_id);
         let below = self.new_below_ids.len() as u32;
@@ -5670,6 +5949,7 @@ impl ShellView {
         self.new_mention_below_ids.clear();
         self.chat_unread_below = 0;
         if let Some(conv_id) = self.selected {
+            self.conv_scroll_anchor.remove(&conv_id);
             let above = self.unread_above_count(conv_id);
             if above == 0 {
                 self.clear_open_unread_and_mark_read(conv_id);
@@ -5678,6 +5958,16 @@ impl ShellView {
             }
         }
         self.scroll_msgs_to_bottom();
+    }
+
+    /// Jumps to the newest unread reaction target in `conv_id` (`[↑↑ | ❤️]`) and flashes it.
+    pub(crate) fn jump_to_unread_react(&mut self, conv_id: u64, cx: &mut Context<Self>) {
+        let target = self.unread_reacts.get_mut(&conv_id).and_then(|q| q.pop());
+        let Some((msg_id, _)) = target else {
+            return;
+        };
+        self.jump_to_msg_id(conv_id, msg_id);
+        self.flash_msg(msg_id, cx);
     }
 
     /// Jumps to the oldest unseen `@mention` message below the viewport.
@@ -5836,6 +6126,31 @@ impl ShellView {
             self.clear_open_unread_and_mark_read(id);
         }
         self.warm_media(id);
+        if !anchored_unread {
+            if let Some(&saved_mid) = self.conv_scroll_anchor.get(&id) {
+                if let Some((new_window, _)) =
+                    crate::chat::id_scroll_index(self.messages_of(id), self.msg_window, saved_mid)
+                {
+                    if new_window > self.msg_window {
+                        self.msg_window = new_window;
+                        self.warm_media(id);
+                    }
+                    if let Some(conv) = self.conv(id).cloned() {
+                        let (hidden, items) = self.build_msg_rows(&conv);
+                        self.sync_msg_list(conv.id, items.len(), hidden);
+                    }
+                    if let Some(row_ix) = self.row_ix_of_msg(saved_mid) {
+                        self.msg_list.scroll_to(gpui::ListOffset {
+                            item_ix: row_ix,
+                            offset_in_item: gpui::px(0.),
+                        });
+                        self.chat_scrolled_up = true;
+                        return;
+                    }
+                }
+                self.conv_scroll_anchor.remove(&id);
+            }
+        }
         self.scroll_msgs_to_bottom();
     }
 
@@ -6822,6 +7137,46 @@ impl ShellView {
         if handled == 0 && skipped_dirs > 0 {
             self.set_note("Chưa hỗ trợ kéo thả thư mục — hãy chọn tập tin hoặc hình ảnh");
         }
+    }
+}
+
+/// Next voice message playback speed in the `1x → 1.5x → 2x → 1x` cycle.
+#[must_use]
+pub(crate) fn next_voice_speed(current: f32) -> f32 {
+    if current < 1.25 {
+        1.5
+    } else if current < 1.75 {
+        2.0
+    } else {
+        1.0
+    }
+}
+
+/// Human-readable label for a voice speed multiplier (`1x`, `1.5x`, `2x`).
+#[must_use]
+pub(crate) fn voice_speed_label(speed: f32) -> &'static str {
+    if speed >= 1.75 {
+        "2x"
+    } else if speed >= 1.25 {
+        "1.5x"
+    } else {
+        "1x"
+    }
+}
+
+/// Human-readable label for an auto-delete TTL in milliseconds.
+#[must_use]
+pub(crate) fn format_auto_delete_ttl(ttl_ms: i64) -> String {
+    let secs = (ttl_ms / 1000).max(0);
+    if secs >= 86_400 {
+        let days = (secs + 43_200) / 86_400;
+        format!("{days} ngày")
+    } else if secs >= 3_600 {
+        let hours = (secs + 1_800) / 3_600;
+        format!("{hours} giờ")
+    } else {
+        let mins = (secs / 60).max(1);
+        format!("{mins} phút")
     }
 }
 

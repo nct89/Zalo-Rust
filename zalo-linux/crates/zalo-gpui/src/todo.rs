@@ -144,6 +144,27 @@ impl ShellView {
         self.reload_todo(cx);
     }
 
+    /// Opens the To-Do ("Giao việc") modal with the creation form expanded and
+    /// pre-filled from a chat message's text.
+    pub(crate) fn open_todo_with_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.open_todo(cx);
+        let initial: String = text
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        if let Some(Dialog::Todo(d)) = self.dialog.as_mut() {
+            d.show_form = true;
+            if !initial.is_empty() {
+                d.title_input
+                    .update(cx, |input, cx| input.set_text(initial, cx));
+            }
+        }
+    }
+
     /// Reloads personal To-Do tasks (`/api/board/personal/list`), verifies sync
     /// (`/api/board/personal/todo/verify`), and acknowledges pending dings
     /// (`/api/board/personal/todo/dingack`).
